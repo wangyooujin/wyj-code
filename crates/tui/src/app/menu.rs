@@ -240,3 +240,54 @@ impl<T, A> ActionMenu<T, A> {
         self.items.get(self.selected)
     }
 }
+
+/// 底部确认类弹层共用的「↑↓ 选择 + Enter 确认 + Esc 取消」列表状态。
+///
+/// 权限 / 信任 / exec-mode / Memory 清空 / shell 终止等原先靠 y/n/a/d 的弹层
+/// 都改走这里，避免各写一套字母快捷键。
+#[derive(Clone, Debug)]
+pub struct SelectConfirm<A> {
+    pub items: Vec<SelectConfirmItem<A>>,
+    pub selected: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct SelectConfirmItem<A> {
+    pub label: String,
+    pub action: A,
+}
+
+impl<A> SelectConfirm<A> {
+    pub fn new(items: Vec<SelectConfirmItem<A>>) -> Self {
+        Self { items, selected: 0 }
+    }
+
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn move_down(&mut self) {
+        let len = self.items.len();
+        self.selected = (self.selected + 1).min(len.saturating_sub(1));
+    }
+
+    pub fn selected_action(&self) -> Option<&A> {
+        self.items.get(self.selected).map(|item| &item.action)
+    }
+}
+
+/// ActionMenu / SelectConfirm 危险确认态只认 Enter 确认、Esc 取消。
+pub(super) fn confirm_key_outcome(code: KeyCode) -> Option<bool> {
+    match code {
+        KeyCode::Enter => Some(true),
+        KeyCode::Esc => Some(false),
+        _ => None,
+    }
+}
+
+/// 后台 shell 面板操作菜单动作。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShellMenuAction {
+    ToggleDetail,
+    Kill,
+}

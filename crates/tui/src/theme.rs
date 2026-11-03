@@ -415,11 +415,12 @@ impl Theme {
     pub const CODE_STRING: Color = Color::Rgb(152, 195, 121); // #98C379
     pub const CODE_NUMBER: Color = Color::Rgb(209, 154, 102); // #D19A66
     pub const CODE_COMMENT: Color = Color::Rgb(107, 114, 128); // #6B7280
-    /// 列表/管理面板里"当前选中行"的通用背景色：中深灰，与终端默认底色拉开
-    /// 足够对比度，在黑色/深色终端背景下能清楚看到选中条，同时不像饱和色（原先
-    /// 部分面板用的 Color::Blue）那样过于刺眼。全应用统一用这一个值（而非各面板
-    /// 各自选色），是 v0.2.4 为解决"选中态视觉语言不一致导致不好辨认"问题引入的。
-    pub const SELECTED_BG: Color = Color::Rgb(42, 49, 64); // #2A3140
+    /// 列表选中行与鼠标拖选共用的背景色：偏蓝的中灰，在黑色/深色终端底上能清楚
+    /// 看出选区边界，同时不像饱和 `Color::Blue` 那样刺眼。旧值 `#2A3140` 太贴近
+    /// 常见终端底色，拖选时几乎看不见；提到 `#3D5A80` 后对比足够。全应用统一用
+    /// 这一个值（而非各面板各自选色），是 v0.2.4 为解决"选中态视觉语言不一致"
+    /// 问题引入的。
+    pub const SELECTED_BG: Color = Color::Rgb(61, 90, 128); // #3D5A80
 
     pub fn success_color() -> Color {
         active_palette().read().unwrap().success

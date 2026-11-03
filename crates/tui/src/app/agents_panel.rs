@@ -41,6 +41,8 @@ pub enum ExtensionAction {
     Enable,
     Disable,
     Remove,
+    Refresh,
+    ToggleDetail,
 }
 
 /// Unified Skill/MCP/Plugin inventory panel.  The specialized `/mcp`,
@@ -53,6 +55,7 @@ pub struct ExtensionsDialog {
     pub detail_open: bool,
     pub detail_scroll: u16,
     pub confirm: Option<ExtensionAction>,
+    pub menu: Option<ActionMenu<usize, ExtensionAction>>,
     pub error: Option<String>,
 }
 
@@ -64,10 +67,58 @@ impl ExtensionsDialog {
             detail_open: true,
             detail_scroll: 0,
             confirm: None,
+            menu: None,
             error: None,
         };
         dialog.refresh(cwd);
         dialog
+    }
+
+    pub fn build_menu(&self) -> Option<ActionMenu<usize, ExtensionAction>> {
+        let record = self.selected_record()?;
+        let mut items = vec![ActionMenuItem {
+            label: wyj_i18n::tr(if self.detail_open {
+                "extensions.menu.hide_detail"
+            } else {
+                "extensions.menu.show_detail"
+            }),
+            action: ExtensionAction::ToggleDetail,
+            dangerous: false,
+            disabled: false,
+            disabled_reason: None,
+        }];
+        if record.enabled {
+            items.push(ActionMenuItem {
+                label: wyj_i18n::tr("extensions.menu.disable"),
+                action: ExtensionAction::Disable,
+                dangerous: false,
+                disabled: false,
+                disabled_reason: None,
+            });
+        } else {
+            items.push(ActionMenuItem {
+                label: wyj_i18n::tr("extensions.menu.enable"),
+                action: ExtensionAction::Enable,
+                dangerous: false,
+                disabled: false,
+                disabled_reason: None,
+            });
+        }
+        items.push(ActionMenuItem {
+            label: wyj_i18n::tr("extensions.menu.remove"),
+            action: ExtensionAction::Remove,
+            dangerous: true,
+            disabled: false,
+            disabled_reason: None,
+        });
+        items.push(ActionMenuItem {
+            label: wyj_i18n::tr("extensions.menu.refresh"),
+            action: ExtensionAction::Refresh,
+            dangerous: false,
+            disabled: false,
+            disabled_reason: None,
+        });
+        Some(ActionMenu::new(self.selected, items))
     }
 
     pub fn refresh(&mut self, cwd: &Path) {
@@ -102,6 +153,8 @@ impl ExtensionsDialog {
             ExtensionAction::Enable => "enable",
             ExtensionAction::Disable => "disable",
             ExtensionAction::Remove => "remove",
+            ExtensionAction::Refresh => "refresh",
+            ExtensionAction::ToggleDetail => "detail",
         }
     }
 }

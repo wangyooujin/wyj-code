@@ -631,6 +631,48 @@ pub struct ExecModeConfirmDialog {
     pub pending_attachments: Vec<Attachment>,
     /// 聊天区展示文本（附件占位符已按输入框位置展开，见 `OutgoingMessage`）
     pub pending_display: String,
+    /// 0 = 切换执行模式并发送 / 1 = 保持规划模式发送 / 2 = 取消
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecModeConfirmChoice {
+    SwitchAndSend,
+    KeepPlanAndSend,
+    Cancel,
+}
+
+impl ExecModeConfirmDialog {
+    pub const OPTIONS: usize = 3;
+
+    pub fn new(
+        pending_message: String,
+        pending_attachments: Vec<Attachment>,
+        pending_display: String,
+    ) -> Self {
+        Self {
+            pending_message,
+            pending_attachments,
+            pending_display,
+            selected: 0,
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        self.selected = (self.selected + Self::OPTIONS - 1) % Self::OPTIONS;
+    }
+
+    pub fn move_down(&mut self) {
+        self.selected = (self.selected + 1) % Self::OPTIONS;
+    }
+
+    pub fn selected_choice(&self) -> ExecModeConfirmChoice {
+        match self.selected {
+            0 => ExecModeConfirmChoice::SwitchAndSend,
+            1 => ExecModeConfirmChoice::KeepPlanAndSend,
+            _ => ExecModeConfirmChoice::Cancel,
+        }
+    }
 }
 
 /// 会话选择器状态（/sessions 命令触发）
@@ -687,25 +729,23 @@ impl SessionConflictDialog {
     }
 
     /// 处理一个按键。`None` 表示按键只是移动光标，或与本弹窗无关。
+    /// 只认 ↑↓ / Enter / Esc——数字与字母快捷键已统一去掉。
     pub fn handle_key(&mut self, key: KeyCode) -> Option<SessionConflictChoice> {
         match key {
-            KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Left => {
                 self.selected = (self.selected + Self::OPTIONS - 1) % Self::OPTIONS;
                 None
             }
-            KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Right => {
                 self.selected = (self.selected + 1) % Self::OPTIONS;
                 None
             }
-            // 数字键直达对应选项，省掉方向键。
-            KeyCode::Char('1') | KeyCode::Char('t') => Some(SessionConflictChoice::TakeOver),
-            KeyCode::Char('2') | KeyCode::Char('r') => Some(SessionConflictChoice::ReadOnly),
-            KeyCode::Char('3') | KeyCode::Esc => Some(SessionConflictChoice::Abort),
             KeyCode::Enter | KeyCode::Char(' ') => Some(match self.selected {
                 0 => SessionConflictChoice::TakeOver,
                 1 => SessionConflictChoice::ReadOnly,
                 _ => SessionConflictChoice::Abort,
             }),
+            KeyCode::Esc => Some(SessionConflictChoice::Abort),
             _ => None,
         }
     }

@@ -144,11 +144,11 @@ impl AppState {
                 action_summary,
                 response_tx,
             } => {
-                self.permission_dialog = Some(PermissionDialog {
+                self.permission_dialog = Some(PermissionDialog::new(
                     tool_name,
                     action_summary,
                     response_tx,
-                });
+                ));
             }
 
             AgentEvent::TurnDone { truncated } => {

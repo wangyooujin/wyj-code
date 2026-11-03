@@ -5187,7 +5187,7 @@ mod cli_tests {
                 assert!(dry_run, "规约裁剪必须默认只预览");
                 assert!(!yes);
                 assert!(!json);
-                assert!(!(yes || !dry_run), "默认不该写盘");
+                assert!(!yes && dry_run, "默认不该写盘");
             }
             other => panic!("expected Rules subcommand, got {other:?}"),
         }

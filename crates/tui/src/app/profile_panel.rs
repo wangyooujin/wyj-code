@@ -719,6 +719,14 @@ impl ProfileDialog {
                         disabled_reason: None,
                     },
                     ActionMenuItem {
+                        label: wyj_i18n::tr("profile.menu.save"),
+                        action: ProfileMenuAction::Header(ProfileHeaderAction::Save),
+                        dangerous: false,
+                        disabled: !self.is_dirty(),
+                        disabled_reason: (!self.is_dirty())
+                            .then(|| wyj_i18n::tr("profile.menu.nothing_to_save")),
+                    },
+                    ActionMenuItem {
                         label: wyj_i18n::tr("profile.menu.activate"),
                         action: ProfileMenuAction::Header(ProfileHeaderAction::Activate),
                         dangerous: false,
@@ -794,6 +802,8 @@ pub enum ProfileHeaderAction {
     UseForSession,
     /// 取消会话级覆盖，恢复跟随全局默认分组。
     FollowGlobal,
+    /// 把当前草稿写盘，面板继续留着（取代旧的 Ctrl+S）。
+    Save,
     Rename,
     Delete,
 }
@@ -828,11 +838,10 @@ pub enum ProfileSessionAction {
     Use(String),
     /// 取消会话级覆盖，恢复跟随全局默认分组。
     FollowGlobal,
-    /// 草稿已改好（如「设为当前」），请主循环走 `profile_try_save` 落盘。
-    /// 菜单函数拿不到 `rebuild_fn`/`session_store`，只能把意图交回主循环——
-    /// 与上面两个变体同一条通道。这样「设为当前」选中即保存，用户不再需要
-    /// 记住 Ctrl+S。
+    /// 草稿已改好（如「设为当前」），请主循环走 `profile_try_save` 落盘并关闭面板。
     Save,
+    /// 显式「保存更改」：落盘后面板继续留着。
+    SaveStay,
 }
 
 /// `/model` 面板操作菜单的按键分发，结构与 `mcp_handle_menu_key` 完全对称。
@@ -861,10 +870,10 @@ pub(super) fn profile_handle_menu_key(
         };
         let target = menu.target;
         if let Some(confirming) = menu.confirming {
-            match code {
-                KeyCode::Enter | KeyCode::Char('y') => Step::Execute(confirming, target),
-                KeyCode::Esc | KeyCode::Char('n') => Step::Cancel,
-                _ => Step::None,
+            match confirm_key_outcome(code) {
+                Some(true) => Step::Execute(confirming, target),
+                Some(false) => Step::Cancel,
+                None => Step::None,
             }
         } else {
             match code {
@@ -930,11 +939,11 @@ pub(super) fn profile_handle_menu_key(
                 ProfileMenuAction::Header(ProfileHeaderAction::FollowGlobal) => {
                     return Some(ProfileSessionAction::FollowGlobal);
                 }
+                ProfileMenuAction::Header(ProfileHeaderAction::Save) => {
+                    return Some(ProfileSessionAction::SaveStay);
+                }
                 ProfileMenuAction::Header(ProfileHeaderAction::Activate) => {
-                    // 「设为当前」选完即保存：旧流程只改 active_idx 草稿、还要求
-                    // 用户再记一次 Ctrl+S，忘按就静默丢失。这里执行后就把保存
-                    // 意图交回主循环走 `profile_try_save`（含名字/Key 校验，失败
-                    // 留在面板展示 error）。注意它保存的是全局默认值，与
+                    // 「设为当前」选完即保存并关面板。注意它保存的是全局默认值，与
                     // UseForSession「仅本会话、不写盘」的语义仍是两条路径。
                     profile_execute_menu_action(state, action, target, agent_tx);
                     return Some(ProfileSessionAction::Save);
@@ -1093,14 +1102,15 @@ pub(super) fn profile_execute_menu_action(
                 }
             }
         }
-        // 会话级动作在 `profile_handle_menu_key` 里先行拦截（需要重建 Agent），
+        // 会话级 / 保存动作在 `profile_handle_menu_key` 里先行拦截（需要重建 Agent），
         // 不会走到这里。
         ProfileMenuAction::Header(ProfileHeaderAction::UseForSession)
-        | ProfileMenuAction::Header(ProfileHeaderAction::FollowGlobal) => {}
+        | ProfileMenuAction::Header(ProfileHeaderAction::FollowGlobal)
+        | ProfileMenuAction::Header(ProfileHeaderAction::Save) => {}
     }
 }
 
-/// Ctrl+S 与"保存并关闭"菜单选项共用的保存逻辑：校验 → 写盘 → 重建 agent。
+/// 「保存更改」与 Esc 未保存确认共用的保存逻辑：校验 → 写盘 → 重建 agent。
 /// 返回 `true` 表示已成功保存（调用方据此决定是否关闭面板）。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn profile_try_save(
@@ -1921,7 +1931,7 @@ mod profile_dialog_onboarding_tests {
                 .as_ref()
                 .map(|d| d.entries[0].text_value(api_key_idx)),
             Some("sk-half-typed"),
-            "面板必须留下，用户才有地方按 Ctrl+S 保住这次编辑"
+            "面板必须留下，用户才有地方从菜单保存这次编辑"
         );
     }
 

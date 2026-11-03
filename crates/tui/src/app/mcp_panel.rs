@@ -303,7 +303,7 @@ impl McpDialog {
 }
 
 /// `/mcp` 面板操作菜单的按键分发：Up/Down 选、Enter 确认/二次确认、Esc 逐级返回。
-/// 危险操作（卸载/删除源）先进 `confirming` 二级确认，再次 Enter/y 才真正执行。
+/// 危险操作（卸载/删除源）先进 `confirming` 二级确认，再次 Enter 才真正执行。
 pub(super) fn mcp_handle_menu_key(
     state: &mut AppState,
     code: KeyCode,
@@ -326,10 +326,10 @@ pub(super) fn mcp_handle_menu_key(
         };
         let target = menu.target;
         if let Some(confirming) = menu.confirming {
-            match code {
-                KeyCode::Enter | KeyCode::Char('y') => Step::Execute(confirming, target),
-                KeyCode::Esc | KeyCode::Char('n') => Step::Cancel,
-                _ => Step::None,
+            match confirm_key_outcome(code) {
+                Some(true) => Step::Execute(confirming, target),
+                Some(false) => Step::Cancel,
+                None => Step::None,
             }
         } else {
             match code {

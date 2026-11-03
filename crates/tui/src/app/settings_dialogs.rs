@@ -65,7 +65,7 @@ pub const SETTINGS_FIELD_SPECS: &[SettingsFieldSpec] = &[
 
 pub const SETTINGS_FIELD_COUNT: usize = SETTINGS_FIELD_SPECS.len();
 
-/// 设置表单草稿（/config 命令触发时从 AppState.config 初始化，Ctrl+S 时写回）
+/// 设置表单草稿（/config 命令触发时从 AppState.config 初始化，选中「保存」时写回）
 pub struct SettingsDraft {
     /// 对应 LOG_LEVELS 下标
     pub log_level_idx: usize,
@@ -95,7 +95,7 @@ impl SettingsDraft {
             language_idx,
             search_provider: cfg.effective_search_provider().to_string(),
             // 只展示**配置文件里**的 key，不展示环境变量那份：env 是运行期槽位，
-            // 一旦在面板里显示并随 Ctrl+S 落盘，就违背了「env 不进 config.toml」。
+            // 一旦在面板里显示并随保存落盘，就违背了「env 不进 config.toml」。
             search_api_key: cfg.search.api_key.clone().unwrap_or_default(),
             search_max_results: cfg.search.max_results.to_string(),
         }
@@ -216,24 +216,129 @@ impl SettingsDraft {
     }
 }
 
+/// `/config` 面板 Esc 关闭时的未保存确认。
+pub enum SettingsOverlay {
+    None,
+    UnsavedChanges { selected: usize },
+}
+
 /// 设置面板状态（/config 命令触发）
 pub struct SettingsDialog {
     pub draft: SettingsDraft,
-    /// 0..SETTINGS_FIELD_COUNT，当前高亮字段
+    /// 打开面板时的基线，用于判定 dirty
+    pub baseline: SettingsDraft,
+    /// 0..=SETTINGS_FIELD_COUNT：字段行 + 末尾「保存」行
     pub selected: usize,
     /// 底部主输入框借用态下 Text/Secret 字段的草稿（`InputOwner::Settings` 生效期间）
     pub live_input: InputBox,
     /// 校验失败时的提示，保存成功后清空
     pub error: Option<String>,
+    pub overlay: SettingsOverlay,
 }
 
 impl SettingsDialog {
+    /// 字段行数 + 末尾「保存更改」行。
+    pub const SAVE_ROW: usize = SETTINGS_FIELD_COUNT;
+
     pub(super) fn new(cfg: &Config) -> Self {
+        let draft = SettingsDraft::from_config(cfg);
         Self {
-            draft: SettingsDraft::from_config(cfg),
+            baseline: SettingsDraft::from_config(cfg),
+            draft,
             selected: 0,
             live_input: InputBox::new(),
             error: None,
+            overlay: SettingsOverlay::None,
+        }
+    }
+
+    pub fn row_count(&self) -> usize {
+        Self::SAVE_ROW + 1
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.draft.log_level_idx != self.baseline.log_level_idx
+            || self.draft.language_idx != self.baseline.language_idx
+            || self.draft.search_provider != self.baseline.search_provider
+            || self.draft.search_api_key != self.baseline.search_api_key
+            || self.draft.search_max_results != self.baseline.search_max_results
+    }
+
+    pub fn mark_clean(&mut self) {
+        self.baseline = SettingsDraft {
+            log_level_idx: self.draft.log_level_idx,
+            language_idx: self.draft.language_idx,
+            search_provider: self.draft.search_provider.clone(),
+            search_api_key: self.draft.search_api_key.clone(),
+            search_max_results: self.draft.search_max_results.clone(),
+        };
+    }
+}
+
+/// 「保存更改」与 Esc 未保存确认共用的写盘逻辑。成功返回 true（面板可继续留着）。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn settings_try_save(
+    state: &mut AppState,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    rebuild_fn: &RebuildFn,
+    system_prompt_extra: &str,
+    todo_store: &Arc<std::sync::Mutex<TodoStore>>,
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    session_store: Option<&Arc<SessionStore>>,
+    current_session_id: &str,
+) -> bool {
+    let Some(dialog) = &mut state.settings_dialog else {
+        return false;
+    };
+    if let Some((key, args)) = dialog.draft.validate() {
+        let refs: Vec<(&str, &str)> = args.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        dialog.error = Some(wyj_i18n::tr_fmt(key, &refs));
+        return false;
+    }
+    let new_cfg = dialog.draft.to_config(&state.config);
+    match new_cfg.save() {
+        Ok(()) => {
+            state.config = new_cfg.clone();
+            let lang = wyj_i18n::resolve_locale(state.config.language.as_deref());
+            wyj_i18n::set_locale(&lang);
+            let model_for_mode = state.config.model_for_mode(&state.mode).to_string();
+            match rebuild_fn(&state.config, &model_for_mode) {
+                Ok(new_agent) => {
+                    let new_agent =
+                        new_agent.append_system(system_prompt_extra.trim_start().to_string());
+                    let new_agent =
+                        attach_agent_session(new_agent, session_store, current_session_id);
+                    let new_agent =
+                        wire_tool_callback(new_agent, agent_tx.clone(), todo_store.clone());
+                    *shared_agent.write().unwrap() = Arc::new(new_agent);
+                    state.model_name = model_for_mode;
+                    state.context_window = state.config.active_profile().context_window;
+                    state
+                        .messages
+                        .push(ChatMessage::system(wyj_i18n::tr("settings.saved")));
+                }
+                Err(e) => {
+                    state
+                        .messages
+                        .push(ChatMessage::assistant_err(wyj_i18n::tr_fmt(
+                            "settings.rebuild_failed",
+                            &[("err", &e.to_string())],
+                        )));
+                }
+            }
+            if let Some(dialog) = &mut state.settings_dialog {
+                dialog.mark_clean();
+                dialog.error = None;
+                dialog.overlay = SettingsOverlay::None;
+            }
+            true
+        }
+        Err(e) => {
+            dialog.error = Some(wyj_i18n::tr_fmt(
+                "settings.save_failed",
+                &[("err", &e.to_string())],
+            ));
+            false
         }
     }
 }
@@ -344,7 +449,7 @@ mod settings_dialog_tests {
     }
 
     /// 面板只展示/回写**配置文件**里的 key，不展示环境变量那份——否则一次
-    /// Ctrl+S 就把 env 里的 key 物化进了 config.toml。
+    /// 保存就把 env 里的 key 物化进了 config.toml。
     #[test]
     fn dialog_ignores_the_runtime_env_key_when_initialising() {
         let cfg = Config {
@@ -383,7 +488,7 @@ mod settings_dialog_tests {
 }
 
 /// 记忆面板里的一行：AGENTS.md 系候选文件 / auto-memory 开关 / auto-memory 索引入口
-/// / Memory v3 clear-all 一键清空入口（按 y 二次确认执行）。
+/// / Memory v3 clear-all 一键清空入口（二次确认后执行）。
 pub enum MemoryRow {
     File(DiscoveredFile),
     AutoMemoryToggle,
@@ -402,8 +507,8 @@ pub struct MemoryDialog {
     pub selected: usize,
     pub auto_memory_enabled: bool,
     pub error: Option<String>,
-    /// 用户在 ClearAll 行上按 Enter 一次后置 Some，再按 y/Enter 才真正执行
-    /// store.clear_all()；按 Esc/n 关闭。这与最终设计 §11 "AI 不能静默触发" 一致：
+    /// 用户在 ClearAll 行上按 Enter 一次后置 true，再按 Enter 才真正执行
+    /// store.clear_all()；按 Esc 取消。这与最终设计 §11 "AI 不能静默触发" 一致：
     /// 用户必须显式二次确认才执行破坏性批操作。
     pub pending_clear_all: bool,
 }
@@ -518,6 +623,20 @@ pub enum EvolutionConfirmAction {
     RollbackCandidate(String),
 }
 
+/// `/evolve` 行操作菜单动作（取代原先的字母快捷键）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvolutionMenuAction {
+    Approve,
+    Reject,
+    Forget,
+    Rollback,
+    Pin,
+    AcceptEpisode,
+    RejectEpisode,
+    IncludeEpisode,
+    SkillFromEpisode,
+}
+
 pub struct EvolutionDialog {
     pub store: Arc<EvolutionStore>,
     pub view: EvolutionView,
@@ -526,6 +645,7 @@ pub struct EvolutionDialog {
     pub detail_scroll: u16,
     pub error: Option<String>,
     pub confirm: Option<EvolutionConfirmAction>,
+    pub menu: Option<ActionMenu<usize, EvolutionMenuAction>>,
 }
 
 impl EvolutionDialog {
@@ -538,9 +658,109 @@ impl EvolutionDialog {
             detail_scroll: 0,
             error: None,
             confirm: None,
+            menu: None,
         };
         dialog.reload();
         dialog
+    }
+
+    /// 当前行可执行的操作菜单；Health 行与空行不产生菜单。
+    pub fn build_menu(&self) -> Option<ActionMenu<usize, EvolutionMenuAction>> {
+        let row = self.rows.get(self.selected)?;
+        let mut items = Vec::new();
+        match row {
+            EvolutionRow::Memory(memory) => {
+                if memory.status != MemoryStatus::Active {
+                    items.push(ActionMenuItem {
+                        label: wyj_i18n::tr("evolve.menu.approve"),
+                        action: EvolutionMenuAction::Approve,
+                        dangerous: true,
+                        disabled: false,
+                        disabled_reason: None,
+                    });
+                }
+                items.push(ActionMenuItem {
+                    label: if memory.pinned {
+                        wyj_i18n::tr("evolve.menu.unpin")
+                    } else {
+                        wyj_i18n::tr("evolve.menu.pin")
+                    },
+                    action: EvolutionMenuAction::Pin,
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                });
+                items.push(ActionMenuItem {
+                    label: wyj_i18n::tr("evolve.menu.forget"),
+                    action: EvolutionMenuAction::Forget,
+                    dangerous: true,
+                    disabled: false,
+                    disabled_reason: None,
+                });
+            }
+            EvolutionRow::Candidate(candidate) => {
+                if candidate.status != CandidateStatus::Active {
+                    items.push(ActionMenuItem {
+                        label: wyj_i18n::tr("evolve.menu.approve"),
+                        action: EvolutionMenuAction::Approve,
+                        dangerous: true,
+                        disabled: false,
+                        disabled_reason: None,
+                    });
+                    items.push(ActionMenuItem {
+                        label: wyj_i18n::tr("evolve.menu.reject"),
+                        action: EvolutionMenuAction::Reject,
+                        dangerous: true,
+                        disabled: false,
+                        disabled_reason: None,
+                    });
+                } else {
+                    items.push(ActionMenuItem {
+                        label: wyj_i18n::tr("evolve.menu.rollback"),
+                        action: EvolutionMenuAction::Rollback,
+                        dangerous: true,
+                        disabled: false,
+                        disabled_reason: None,
+                    });
+                }
+            }
+            EvolutionRow::Episode(_) => {
+                items.push(ActionMenuItem {
+                    label: wyj_i18n::tr("evolve.menu.accept_episode"),
+                    action: EvolutionMenuAction::AcceptEpisode,
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                });
+                items.push(ActionMenuItem {
+                    label: wyj_i18n::tr("evolve.menu.reject_episode"),
+                    action: EvolutionMenuAction::RejectEpisode,
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                });
+                items.push(ActionMenuItem {
+                    label: wyj_i18n::tr("evolve.menu.include"),
+                    action: EvolutionMenuAction::IncludeEpisode,
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                });
+                items.push(ActionMenuItem {
+                    label: wyj_i18n::tr("evolve.menu.skill_from_episode"),
+                    action: EvolutionMenuAction::SkillFromEpisode,
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                });
+            }
+            EvolutionRow::Health { .. } => return None,
+        }
+        if items.is_empty() {
+            None
+        } else {
+            Some(ActionMenu::new(self.selected, items))
+        }
     }
 
     pub(super) fn reload(&mut self) {

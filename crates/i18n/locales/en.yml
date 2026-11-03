@@ -73,9 +73,13 @@ subagents:
   handoff_conclusion: "conclusion: {text}"
 
 shell:
+  menu:
+    show_detail: "Show output"
+    hide_detail: "Hide output"
+    kill: "Kill task"
   panel_title: " shells [{count}] "
-  focus_hint: "↑↓ select   Enter/Space view output   k kill   Esc back to composer"
-  detail_hint: "↑↓ scroll   PageUp/PageDown page   k kill   Enter/Esc back to list"
+  focus_hint: "↑↓ select   Enter action menu   Esc back to composer"
+  detail_hint: "↑↓ scroll   PageUp/PageDown page   Enter action menu   Esc back to list"
   no_output: "(no output yet)"
   exited: "exited ({code})"
 
@@ -379,10 +383,31 @@ help:
     Domestic model compatibility analysis (DeepSeek/GLM/Kimi/Qwen/Doubao/MiniMax vs Claude Code/Codex) with pitfalls and best practices: [doc/analysis/domestic-models-vs-claude-code.md](https://github.com/wangyooujin/wyj-code/blob/master/doc/analysis/domestic-models-vs-claude-code.md)
   custom_commands_header: "Custom Commands"
 
+extensions:
+  title: " Extensions "
+  hint: "  ↑↓ select  Enter action menu  Esc close"
+  menu:
+    show_detail: "Show detail"
+    hide_detail: "Hide detail"
+    enable: "Enable"
+    disable: "Disable"
+    remove: "Remove"
+    refresh: "Refresh"
 evolve:
+  menu:
+    approve: "Approve"
+    reject: "Reject"
+    forget: "Forget"
+    rollback: "Rollback"
+    pin: "Pin"
+    unpin: "Unpin"
+    accept_episode: "Accept episode"
+    reject_episode: "Reject episode"
+    include: "Include evidence"
+    skill_from_episode: "Create Skill candidate from episode"
   desc: "Open evidence-backed local evolution governance to approve, reject, roll back, or forget experience"
   title: " Evolution Governance "
-  hint: "←/→ views  ↑/↓ select  a approve  r reject  p pin  f forget  b rollback  Esc close"
+  hint: "←/→ switch view  ↑/↓ select  Enter action menu  Esc close"
   unavailable: "Evolution is disabled or failed to initialize"
 
 hyperlink:
@@ -537,7 +562,7 @@ memory:
     editor_failed: "Failed to open editor: {err}"
     clear_all_label: "[Clear Memory v3] currently {active} active, {superseded} superseded (press y to confirm, Esc to cancel)"
     clear_all_hint: "This will move all Global / Project claims, jobs, audit to backups/<ts>/; rejected_history.json is preserved. Cannot be undone."
-    clear_all_confirm: "Press y/Enter again to confirm, Esc/n to cancel."
+    clear_all_confirm: "Press Enter again to confirm, Esc to cancel."
     clear_all_done: "Memory v3 cleared, backed up to {dir}."
 
 mcp:
@@ -597,7 +622,7 @@ mcp:
     scope_label: "Scope: "
     command_label: "Command to be written:"
     confirm_warning: "This command will run automatically every time wyj-code starts."
-    confirm_hint: "  ←→ toggle scope  [y/Enter] confirm install  [n/Esc] cancel"
+    confirm_hint: "  ←→ toggle scope  Enter confirm install  Esc cancel"
     done: "Installed — applies at the next agent turn boundary"
   upgrade:
     in_progress: "Upgrading…"
@@ -659,7 +684,7 @@ skills:
     scope_label: "Scope: "
     path_label: "Source path: "
     version_label: "Version: "
-    confirm_hint: "  ←→ toggle scope  [y/Enter] confirm install  [n/Esc] cancel"
+    confirm_hint: "  ←→ toggle scope  Enter confirm install  Esc cancel"
     done: "Installed — applies at the next agent turn boundary"
     registry_done: "Installed {name} — applies at the next agent turn boundary"
   registry:
@@ -725,7 +750,7 @@ plugins:
     confirm_title: " Confirm Plugin Install "
     name_label: "Name: "
     scope_label: "Scope: "
-    confirm_hint: "  ←→ toggle scope  [y/Enter] confirm install  [n/Esc] cancel"
+    confirm_hint: "  ←→ toggle scope  Enter confirm install  Esc cancel"
     in_progress: "Installing…"
     report_title: " Plugin Installed "
     resource_counts: "Installed: {cmd} command(s) / {agent} agent(s) / {mcp} MCP server(s)"
@@ -881,7 +906,7 @@ status:
   # headless REPL / `-p` / ACP stdio / daemon TCP exit hint when API Key
   # is missing: point users at the TUI onboarding flow or env var fallback.
   api_key_missing_onboarding_headless: |-
-    Run `wyj-code` to open the interactive setup, fill in your API key in the /profile panel, then press Ctrl+S to save (no restart required). Alternatively, set the `WYJ_CODE_API_KEY` environment variable and retry.
+    Run `wyj-code` to open the interactive setup, fill in your API key in the /profile panel, then choose Save from the menu (no restart required). Alternatively, set the `WYJ_CODE_API_KEY` environment variable and retry.
 
 model:
   desc: "Switch the model of the current profile: /model opens the model picker, /model <name> switches directly (session-only, not written to config)"
@@ -987,25 +1012,25 @@ quit:
 dialog:
   permission_title: " ⚑ Permission Confirm "
   permission_tool_label: "Tool: "
-  permission_hint: "  [y] Allow once   [a] Always allow this   [d] Deny   (Esc to deny)"
+  permission_hint: "  ↑↓ select  Enter confirm  Esc deny"
   session_conflict_title: "Session in use by another wyj-code process"
   session_conflict_body: "Session {id} is being used by process {pid}. Resuming it here means both instances write to the same file — whoever saves last overwrites the other."
   session_conflict_take_over: "Take over (their unsaved messages may be lost)"
   session_conflict_read_only: "Read only (load history, never write back)"
   session_conflict_abort: "Abort and exit"
-  session_conflict_hint: "  [1/2/3] or arrows+Enter   (default: read only)"
+  session_conflict_hint: "  ↑↓ select  Enter confirm  Esc abort   (default: read-only)"
   session_conflict_taken_over: "Took over session {id} from process {pid}. Its unsaved messages may be lost."
   session_conflict_read_only_applied: "Read-only view of session {id} (owned by process {pid}). This instance will not write to the session file."
   session_conflict_abort_applied: "Aborted: session {id} was left untouched."
-  permission_hint_once: "  [y] Allow once, no sandboxing   [d] Deny   (cannot be persisted)"
-  permission_hint_project_once: "  [y/a] Allow for this project (won't ask again)   [d] Deny   (Esc to deny)"
+  permission_hint_once: "  ↑↓ select  Enter confirm  Esc deny"
+  permission_hint_project_once: "  ↑↓ select  Enter confirm  Esc deny"
   project_trust_title: " ⚠ Project MCP Servers Need Trust "
   project_trust_intro: "The following project-scoped MCP servers will be run as subprocesses — confirm you trust them before connecting:"
-  project_trust_hint: "  [y] Trust and connect   [n/Esc] Skip for now (asked again on next launch)"
+  project_trust_hint: "  ↑↓ select  Enter confirm  Esc skip"
   skill_trust_title: " ⚠ Project Skills Need Trust "
   skill_trust_intro: "The following slash commands come from this repository's .wyj-code/skills/ and were written by the repo author. Until trusted they are absent from completions and unknown to the model. Once trusted, running one hands its entire body to the model as instructions:"
   skill_trust_changed: "⚠ You approved these before; {count} entries changed since ({items}…). Re-approving stops the prompt until the content changes again."
-  skill_trust_hint: "  [y] Trust and enable   [n/Esc] Skip for now (asked again on next launch)"
+  skill_trust_hint: "  ↑↓ select  Enter confirm  Esc skip"
   ask_question_title: " ◆ Agent Question "
   ask_question_overview_title: " ◆ Interview Overview "
   ask_question_other_label: "Other…"
@@ -1034,13 +1059,29 @@ dialog:
     profile_field: "[Profile] Edit {field} (Enter to submit / Esc to cancel)"
     model_manual: "[Model] Type the model name (Enter to submit / Esc to cancel)"
     settings_field: "[Config] Edit {field} (Enter to submit / Esc to cancel)"
+
+  permission_choice_once: "Allow once"
+  permission_choice_always: "Always allow this"
+  permission_choice_project: "Allow for this project (won't ask again)"
+  permission_choice_deny: "Deny"
+  project_trust_approve: "Trust and connect"
+  project_trust_skip: "Skip for now"
+  skill_trust_approve: "Trust and enable"
+  skill_trust_skip: "Skip for now"
+  exec_mode_title: " ⚠ Plan already approved "
+  exec_mode_pending: "Pending: "
+  exec_mode_switch_send: "Switch to exec mode and send"
+  exec_mode_keep_plan: "Keep planning mode and send"
+  exec_mode_cancel: "Cancel send"
   action_menu:
     confirm_question: "Are you sure you want to \"{action}\"?"
-    confirm_hint: "Enter/y confirm   Esc/n cancel"
+    confirm_hint: "Enter confirm   Esc cancel"
 
 settings:
+  save_row: "Save changes"
+  save_row_dirty: "Save changes *"
   title: "Settings"
-  hint: "  ↑↓ Move  Enter Edit/Toggle  ←→ Toggle  Ctrl+S Save  Esc Cancel"
+  hint: "  ↑↓ Move  Enter Edit/Toggle/Save  ←→ Toggle  Esc Close (asks if unsaved)"
   saved: "Settings saved"
   save_failed: "Failed to save settings: {err}"
   rebuild_failed: "Settings saved, but reconnecting failed: {err} (this session still uses the old config; the new config takes effect after restart)"
@@ -1077,7 +1118,7 @@ profile:
   # missing, guiding users to focus on the api_key field.
   onboarding:
     title: "First-time setup — enter your API key"
-    hint: "Cursor is on the API Key field — paste and press Ctrl+S to save. Other fields can also be tweaked."
+    hint: "Cursor is on the API Key field — paste, then open the group menu and choose Save."
     success: "API key saved. Model: {provider} / {model}. You can start chatting now."
   saved: "Profile saved"
   # Empty-value rendering for bool/enum fields in the profile field column.
@@ -1093,10 +1134,12 @@ profile:
   headless_unsupported: "[headless mode doesn't support /profile management, use TUI mode instead]"
   dialog:
     hint1: "  ↑↓ Move  Enter Edit/Fetch models/Toggle  ←→ Cycle enum values"
-    hint2: "  Ctrl+S Save (auto-saved after \"Set active\")  Esc Close (asks if unsaved)"
+    hint2: "  Enter opens menu (includes Save; Set active auto-saves)  Esc Close (asks if unsaved)"
     editing_placeholder: "Editing, see the input box below"
     add_new_row: "New profile"
   menu:
+    save: "Save changes"
+    nothing_to_save: "No unsaved changes"
     expand: "Expand fields"
     collapse: "Collapse fields"
     activate: "Set as active"

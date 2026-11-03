@@ -292,10 +292,10 @@ pub(super) fn plugins_handle_menu_key(
         };
         let target = menu.target;
         if let Some(confirming) = menu.confirming {
-            match code {
-                KeyCode::Enter | KeyCode::Char('y') => Step::Execute(confirming, target),
-                KeyCode::Esc | KeyCode::Char('n') => Step::Cancel,
-                _ => Step::None,
+            match confirm_key_outcome(code) {
+                Some(true) => Step::Execute(confirming, target),
+                Some(false) => Step::Cancel,
+                None => Step::None,
             }
         } else {
             match code {

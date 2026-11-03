@@ -21,8 +21,8 @@ use crate::app::{
     PermissionDialog, PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab,
     ProfileDialog, ProfileFieldKind, ProfileInputField, ProfileOverlay, ProfileRow,
     SessionConflictDialog, SessionPickerState, SettingsDialog, SettingsFieldKind,
-    SettingsInputField, SkillsBrowseSource, SkillsDialog, SkillsDialogTab, SkillsOverlay,
-    SubAgentStatus, SubAgentUiState, TodoExecutionEntry, TodoRuntimeStats, UiFocus,
+    SettingsInputField, SettingsOverlay, SkillsBrowseSource, SkillsDialog, SkillsDialogTab,
+    SkillsOverlay, SubAgentStatus, SubAgentUiState, TodoExecutionEntry, TodoRuntimeStats, UiFocus,
     PROFILE_FIELD_SPECS, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_SPECS,
 };
 use crate::input::{is_atomic_marker, InputBox, ATTACHMENT_MARKER, PASTE_MARKER};
@@ -761,12 +761,18 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         }
         BottomPanel::ProjectTrust => {
             if let Some(servers) = &state.pending_mcp_trust {
-                draw_project_trust_panel(f, servers, chunks[1]);
+                draw_project_trust_panel(f, servers, state.pending_mcp_trust_selected, chunks[1]);
             }
         }
         BottomPanel::SkillTrust => {
             if let Some(infos) = &state.pending_skill_trust {
-                draw_skill_trust_panel(f, infos, &state.pending_skill_trust_changes, chunks[1]);
+                draw_skill_trust_panel(
+                    f,
+                    infos,
+                    &state.pending_skill_trust_changes,
+                    state.pending_skill_trust_selected,
+                    chunks[1],
+                );
             }
         }
         BottomPanel::ExecModeConfirm => {
@@ -1058,7 +1064,8 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
         return (rows.min(area_height), BottomPanel::SkillTrust);
     }
     if state.exec_mode_confirm.is_some() {
-        return (4u16.min(area_height), BottomPanel::ExecModeConfirm);
+        // 待发送预览 + 三个选项 + hint
+        return (8u16.min(area_height), BottomPanel::ExecModeConfirm);
     }
     if state.plan_dialog.is_some() {
         // 计划正文已作为普通消息并入应用内聊天流，
@@ -3385,10 +3392,23 @@ fn draw_shell_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
             ),
         ]));
     }
-    if state.ui_focus == UiFocus::Shells && !detail_open {
+    if state.ui_focus == UiFocus::Shells && !detail_open && state.shell_menu.is_none() {
         lines.push(Line::from(Span::styled(
             format!("  {}", wyj_i18n::tr("shell.focus_hint")),
             Theme::dim(),
+        )));
+    }
+    if let Some(menu) = &state.shell_menu {
+        for (idx, item) in menu.items.iter().enumerate() {
+            lines.push(choice_row(
+                idx == menu.selected,
+                &item.label,
+                max_content_width,
+            ));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  {}", wyj_i18n::tr("dialog.hint_nav_select_cancel")),
+            Theme::highlight(),
         )));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), list_area);
@@ -4795,11 +4815,11 @@ mod tool_result_fold_tests {
     fn skill_trust_outranks_exec_mode_confirm() {
         let mut state = make_state();
         state.pending_skill_trust = Some(vec![skill_info("review", "Review code")]);
-        state.exec_mode_confirm = Some(ExecModeConfirmDialog {
-            pending_message: "go".to_string(),
-            pending_attachments: Vec::new(),
-            pending_display: "go".to_string(),
-        });
+        state.exec_mode_confirm = Some(ExecModeConfirmDialog::new(
+            "go".to_string(),
+            Vec::new(),
+            "go".to_string(),
+        ));
 
         let (_, panel) = bottom_panel_size(&state, 40);
 
@@ -4811,11 +4831,11 @@ mod tool_result_fold_tests {
         let mut state = make_state();
         state.pending_mcp_trust = Some(vec![]);
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        state.permission_dialog = Some(PermissionDialog {
-            tool_name: "Bash".to_string(),
-            action_summary: "ls".to_string(),
-            response_tx: tx,
-        });
+        state.permission_dialog = Some(PermissionDialog::new(
+            "Bash".to_string(),
+            "ls".to_string(),
+            tx,
+        ));
 
         let (_, panel) = bottom_panel_size(&state, 40);
 
@@ -5700,11 +5720,11 @@ mod tool_result_fold_tests {
         let mut state = make_state();
         let (tx, _rx) = tokio::sync::oneshot::channel();
         state.current_op = Some("Bash(cargo test)".to_string());
-        state.permission_dialog = Some(PermissionDialog {
-            tool_name: "Bash".to_string(),
-            action_summary: "cargo test".to_string(),
-            response_tx: tx,
-        });
+        state.permission_dialog = Some(PermissionDialog::new(
+            "Bash".to_string(),
+            "cargo test".to_string(),
+            tx,
+        ));
         assert_eq!(
             thinking_status_label(&state),
             wyj_i18n::tr("spinner.waiting_approval"),

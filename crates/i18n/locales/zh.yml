@@ -72,9 +72,13 @@ subagents:
   handoff_conclusion: "结论：{text}"
 
 shell:
+  menu:
+    show_detail: "查看输出"
+    hide_detail: "收起输出"
+    kill: "终止任务"
   panel_title: " 后台任务 [{count}] "
-  focus_hint: "↑↓ 选择   Enter/Space 查看输出   k 终止   Esc 返回输入框"
-  detail_hint: "↑↓ 滚动   PageUp/PageDown 翻页   k 终止   Enter/Esc 返回列表"
+  focus_hint: "↑↓ 选择   Enter 操作菜单   Esc 返回输入框"
+  detail_hint: "↑↓ 滚动   PageUp/PageDown 翻页   Enter 操作菜单   Esc 返回列表"
   no_output: "(暂无输出)"
   exited: "已退出 ({code})"
 
@@ -376,10 +380,31 @@ help:
     国产模型适配体验对比、踩坑与最佳实践（DeepSeek/GLM/Kimi/Qwen/豆包/MiniMax vs Claude Code/Codex）：[doc/analysis/domestic-models-vs-claude-code.md](https://github.com/wangyooujin/wyj-code/blob/master/doc/analysis/domestic-models-vs-claude-code.md)
   custom_commands_header: "自定义命令"
 
+extensions:
+  title: " Extensions "
+  hint: "  ↑↓ 选择  Enter 操作菜单  Esc 关闭"
+  menu:
+    show_detail: "查看详情"
+    hide_detail: "收起详情"
+    enable: "启用"
+    disable: "禁用"
+    remove: "移除"
+    refresh: "刷新列表"
 evolve:
+  menu:
+    approve: "批准"
+    reject: "拒绝"
+    forget: "遗忘"
+    rollback: "回滚"
+    pin: "固定"
+    unpin: "取消固定"
+    accept_episode: "采纳本轮经验"
+    reject_episode: "拒绝本轮经验"
+    include: "纳入证据"
+    skill_from_episode: "从本轮生成 Skill 候选"
   desc: "打开证据化自进化治理中心，查看并批准、拒绝、回滚或遗忘本地经验"
   title: " 自进化治理中心 "
-  hint: "←/→ 切换视图  ↑/↓ 选择  a 批准  r 拒绝  p pin  f 遗忘  b 回滚  Esc 关闭"
+  hint: "←/→ 切换视图  ↑/↓ 选择  Enter 操作菜单  Esc 关闭"
   unavailable: "Evolution 未启用或初始化失败"
 
 hyperlink:
@@ -534,7 +559,7 @@ memory:
     editor_failed: "打开编辑器失败: {err}"
     clear_all_label: "[清空 Memory v3] 当前 {active} active、{superseded} superseded（按 y 确认，Esc 取消）"
     clear_all_hint: "此操作将搬走所有 Global / Project claims、jobs、audit 到 backups/<ts>/，`rejected_history.json` 保留。无法撤销。"
-    clear_all_confirm: "再次按 y/Enter 确认清空，按 Esc/n 取消。"
+    clear_all_confirm: "再次按 Enter 确认清空，按 Esc 取消。"
     clear_all_done: "Memory v3 已清空，已备份到 {dir}。"
 
 mcp:
@@ -594,7 +619,7 @@ mcp:
     scope_label: "作用域: "
     command_label: "即将写入命令:"
     confirm_warning: "该命令会在以后每次启动 wyj-code 时自动执行。"
-    confirm_hint: "  ←→ 切换作用域  [y/Enter] 确认安装  [n/Esc] 取消"
+    confirm_hint: "  ←→ 切换作用域  Enter 确认安装  Esc 取消"
     done: "安装成功，将在下一次 Agent 回合边界应用"
   upgrade:
     in_progress: "升级中…"
@@ -656,7 +681,7 @@ skills:
     scope_label: "作用域: "
     path_label: "来源路径: "
     version_label: "版本: "
-    confirm_hint: "  ←→ 切换作用域  [y/Enter] 确认安装  [n/Esc] 取消"
+    confirm_hint: "  ←→ 切换作用域  Enter 确认安装  Esc 取消"
     done: "安装成功，将在下一次 Agent 回合边界应用"
     registry_done: "已安装 {name}，将在下一次 Agent 回合边界应用"
   registry:
@@ -722,7 +747,7 @@ plugins:
     confirm_title: " 确认安装插件 "
     name_label: "名称: "
     scope_label: "作用域: "
-    confirm_hint: "  ←→ 切换作用域  [y/Enter] 确认安装  [n/Esc] 取消"
+    confirm_hint: "  ←→ 切换作用域  Enter 确认安装  Esc 取消"
     in_progress: "安装中…"
     report_title: " 插件安装成功 "
     resource_counts: "已安装: {cmd} 个命令 / {agent} 个 agent / {mcp} 个 MCP server"
@@ -878,7 +903,7 @@ status:
   # headless REPL / `-p` / ACP stdio / daemon TCP 四个非 UI 入口在缺 Key 时
   # 退出的附加提示:引导用户去 TUI 完成首次配置,或设置环境变量后重试。
   api_key_missing_onboarding_headless: |-
-    运行 `wyj-code` 打开交互界面,在 /profile 面板里填写 API Key,Ctrl+S 保存即可生效,无需重启。也可设置环境变量 `WYJ_CODE_API_KEY` 后重试。
+    运行 `wyj-code` 打开交互界面,在 /profile 面板里填写 API Key，打开菜单选择「保存更改」即可生效，无需重启。也可设置环境变量 `WYJ_CODE_API_KEY` 后重试。
 
 model:
   desc: "切换当前分组的模型：/model 打开模型选择器，/model <模型名> 直接切换（仅本次会话生效，不写配置）"
@@ -982,25 +1007,25 @@ quit:
 dialog:
   permission_title: " ⚑ 权限确认 "
   permission_tool_label: "工具: "
-  permission_hint: "  [y] 允许一次   [a] 始终允许此类   [d] 拒绝并说明   (Esc 拒绝)"
+  permission_hint: "  ↑↓ 选择  Enter 确认  Esc 拒绝"
   session_conflict_title: "会话正被另一个 wyj-code 进程使用"
   session_conflict_body: "会话 {id} 正被进程 {pid} 使用。在此恢复意味着两个实例写同一个文件 —— 谁后保存谁覆盖谁。"
   session_conflict_take_over: "接管（对方未保存的消息可能丢失）"
   session_conflict_read_only: "只读（载入历史，绝不写回）"
   session_conflict_abort: "放弃并退出"
-  session_conflict_hint: "  [1/2/3] 或 方向键+回车   （默认：只读）"
+  session_conflict_hint: "  ↑↓ 选择  Enter 确认  Esc 放弃   （默认：只读）"
   session_conflict_taken_over: "已从进程 {pid} 接管会话 {id}，对方未保存的消息可能丢失。"
   session_conflict_read_only_applied: "以只读方式查看会话 {id}（属进程 {pid}）。本实例不会写入该会话文件。"
   session_conflict_abort_applied: "已放弃：会话 {id} 未被改动。"
-  permission_hint_once: "  [y] 仅本次无隔离执行   [d] 拒绝   (不可持久授权)"
-  permission_hint_project_once: "  [y/a] 允许本项目（后续不再询问）   [d] 拒绝并说明   (Esc 拒绝)"
+  permission_hint_once: "  ↑↓ 选择  Enter 确认  Esc 拒绝"
+  permission_hint_project_once: "  ↑↓ 选择  Enter 确认  Esc 拒绝"
   project_trust_title: " ⚠ 项目级 MCP server 待信任确认 "
   project_trust_intro: "以下项目级 MCP server 会被当作子进程执行，请确认信任后再连接："
-  project_trust_hint: "  [y] 信任并连接   [n/Esc] 本次跳过（下次启动会再次询问）"
+  project_trust_hint: "  ↑↓ 选择  Enter 确认  Esc 跳过"
   skill_trust_title: " ⚠ 项目级 skill 待信任确认 "
   skill_trust_intro: "以下斜杠命令来自本仓库的 .wyj-code/skills/，由仓库作者编写。未信任前它们不会出现在补全里，模型也不知道它们存在。信任后每次执行都会把整段正文作为指令交给模型："
   skill_trust_changed: "⚠ 你上次已批准过，之后有 {count} 个条目变化（{items}…）。重新批准后不再询问，直到内容再变。"
-  skill_trust_hint: "  [y] 信任并启用   [n/Esc] 本次跳过（下次启动会再次询问）"
+  skill_trust_hint: "  ↑↓ 选择  Enter 确认  Esc 跳过"
   ask_question_title: " ◆ Agent 提问 "
   ask_question_overview_title: " ◆ 访谈总览 "
   ask_question_other_label: "其他…"
@@ -1029,13 +1054,30 @@ dialog:
     profile_field: "[分组] 编辑 {field} (Enter 提交 / Esc 取消)"
     model_manual: "[模型] 输入模型名 (Enter 提交 / Esc 取消)"
     settings_field: "[Config] 编辑 {field} (Enter 提交 / Esc 取消)"
+
+  permission_choice_once: "允许一次"
+  permission_choice_always: "始终允许此类"
+  permission_choice_project: "允许本项目（后续不再询问）"
+  permission_choice_deny: "拒绝"
+  project_trust_approve: "信任并连接"
+  project_trust_skip: "本次跳过"
+  skill_trust_approve: "信任并启用"
+  skill_trust_skip: "本次跳过"
+  exec_mode_title: " ⚠ 检测到计划已批准 "
+  exec_mode_pending: "待发送："
+  exec_mode_switch_send: "切换执行模式并发送"
+  exec_mode_keep_plan: "保持规划模式发送"
+  exec_mode_cancel: "取消发送"
   action_menu:
     confirm_question: "确定要「{action}」吗？"
-    confirm_hint: "Enter/y 确认   Esc/n 取消"
+    confirm_hint: "Enter 确认   Esc 取消"
 
 settings:
+
+  save_row: "保存更改"
+  save_row_dirty: "保存更改 *"
   title: "配置设置"
-  hint: "  ↑↓ 移动  Enter 编辑/切换  ←→ 切换  Ctrl+S 保存  Esc 取消"
+  hint: "  ↑↓ 移动  Enter 编辑/切换/保存  ←→ 切换  Esc 关闭（有未保存修改时会询问）"
   saved: "配置已保存"
   save_failed: "配置保存失败: {err}"
   rebuild_failed: "配置已保存，但重建连接失败: {err}（当前会话仍使用旧配置，重启后生效）"
@@ -1072,7 +1114,7 @@ profile:
   # 引导用户聚焦到 api_key 字段填写。
   onboarding:
     title: "首次启动 — 请填写 API Key"
-    hint: "光标已停在 API Key,粘贴后 Ctrl+S 保存即可。其它字段也可顺手调整。"
+    hint: "光标已停在 API Key，粘贴后打开分组菜单选择「保存更改」。其它字段也可顺手调整。"
     success: "API Key 已保存,模型: {provider} / {model}。现在可以开始对话。"
   saved: "分组已保存"
   # 布尔/枚举字段的空值展示（分组面板字段列）
@@ -1088,10 +1130,12 @@ profile:
   headless_unsupported: "[headless 模式不支持 /profile 管理分组，请在 TUI 模式下使用]"
   dialog:
     hint1: "  ↑↓ 移动  Enter 编辑/拉取模型列表/切换  ←→ 循环切换枚举"
-    hint2: "  Ctrl+S 保存（菜单「设为当前」后自动保存）  Esc 关闭（有未保存修改时会询问）"
+    hint2: "  Enter 打开菜单（含「保存更改」；「设为当前」后自动保存）  Esc 关闭（有未保存修改时会询问）"
     editing_placeholder: "编辑中，见下方输入框"
     add_new_row: "新建分组"
   menu:
+    save: "保存更改"
+    nothing_to_save: "没有未保存的修改"
     expand: "展开查看字段"
     collapse: "收起字段"
     activate: "设为当前"

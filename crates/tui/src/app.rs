@@ -625,6 +625,64 @@ pub struct PermissionDialog {
     pub action_summary: String,
     /// 决策回传通道（AllowOnce / AllowAlways / Deny）
     pub response_tx: tokio::sync::oneshot::Sender<wyj_tools::PermissionDecision>,
+    /// ↑↓ 选中的选项下标（对应 [`Self::choices`]）
+    pub selected: usize,
+}
+
+impl PermissionDialog {
+    pub fn new(
+        tool_name: String,
+        action_summary: String,
+        response_tx: tokio::sync::oneshot::Sender<wyj_tools::PermissionDecision>,
+    ) -> Self {
+        Self {
+            tool_name,
+            action_summary,
+            response_tx,
+            selected: 0,
+        }
+    }
+
+    /// 可选决策与 i18n label key。项目级工具只给「允许本项目 / 拒绝」两项。
+    pub fn choices(&self) -> Vec<(wyj_tools::PermissionDecision, &'static str)> {
+        use wyj_tools::PermissionDecision;
+        if wyj_tools::ctx::is_project_approve_once_tool(&self.tool_name) {
+            vec![
+                (
+                    PermissionDecision::AllowAlways,
+                    "dialog.permission_choice_project",
+                ),
+                (PermissionDecision::Deny, "dialog.permission_choice_deny"),
+            ]
+        } else {
+            vec![
+                (
+                    PermissionDecision::AllowOnce,
+                    "dialog.permission_choice_once",
+                ),
+                (
+                    PermissionDecision::AllowAlways,
+                    "dialog.permission_choice_always",
+                ),
+                (PermissionDecision::Deny, "dialog.permission_choice_deny"),
+            ]
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn move_down(&mut self) {
+        let len = self.choices().len();
+        self.selected = (self.selected + 1).min(len.saturating_sub(1));
+    }
+
+    pub fn selected_decision(&self) -> Option<wyj_tools::PermissionDecision> {
+        self.choices()
+            .get(self.selected)
+            .map(|(decision, _)| *decision)
+    }
 }
 
 /// 弹窗内自由文本的输入历史（`↑` `↓` 翻上一条）。
@@ -2029,9 +2087,13 @@ pub struct AppState {
     /// `PermissionDialog` 那样逐工具调用触发，因此不需要 oneshot 回传通道，
     /// 直接在按键处理里调用 `wyj_store::project_trust::approve` 即可）。
     pub pending_mcp_trust: Option<Vec<wyj_config::McpServerConfig>>,
+    /// MCP 信任弹层的选项光标：0 = 信任并连接，1 = 本次跳过。
+    pub pending_mcp_trust_selected: usize,
     /// 项目级 skill 的待批准条目（`.wyj-code/skills/` 随 git clone 落地、
     /// 内容由仓库作者控制）。为 `Some` 时这些 skill 未进注册表也不在模型名单里。
     pub pending_skill_trust: Option<Vec<wyj_commands::skill::ProjectSkillInfo>>,
+    /// skill 信任弹层的选项光标：0 = 信任并启用，1 = 本次跳过。
+    pub pending_skill_trust_selected: usize,
     /// 上次批准后变化的条目（相对路径）。仅当 [`Self::pending_skill_trust`] 的成因是
     /// 「批准过但内容变了」时非空，用于在面板上解释为什么又问一次；从没批准过的
     /// 项目留空。与 `pending_skill_trust` 同生命周期。
@@ -2390,6 +2452,8 @@ pub struct AppState {
     pub stale_shells: HashSet<String>,
     /// shell 面板当前选中项（按 id 存而非 index，避免列表变动时错位）
     pub selected_shell: Option<String>,
+    /// 后台 shell 面板的操作菜单（查看详情 / 终止），取代裸 `k`。
+    pub shell_menu: Option<SelectConfirm<ShellMenuAction>>,
     /// 选中 shell 是否已展开详情（实时输出）
     pub shell_detail_open: bool,
     /// 详情内容的行级滚动偏移：**从正文第一行往下跳过的行数**（同 sub_agent_detail_scroll）
@@ -2479,7 +2543,9 @@ impl AppState {
             is_thinking: false,
             permission_dialog: None,
             pending_mcp_trust: None,
+            pending_mcp_trust_selected: 0,
             pending_skill_trust: None,
+            pending_skill_trust_selected: 0,
             pending_skill_trust_changes: Vec::new(),
             session_conflict: None,
             read_only_session: false,
@@ -2602,6 +2668,7 @@ impl AppState {
             shells: Vec::new(),
             stale_shells: HashSet::new(),
             selected_shell: None,
+            shell_menu: None,
             shell_detail_open: false,
             shell_detail_scroll: 0,
             shell_detail_max_scroll: 0,
@@ -2794,6 +2861,7 @@ impl AppState {
         }
         self.shells.clear();
         self.selected_shell = None;
+        self.shell_menu = None;
         self.shell_detail_open = false;
         self.reset_shell_detail_view();
         self.shell_detail_max_scroll = 0;
@@ -4059,16 +4127,18 @@ fn apply_session_profile(
     current_session_id: &str,
     session: &Arc<Mutex<Session>>,
 ) -> bool {
-    // `Save`（「设为当前」执行后的保存意图）不在这里处理——`profile_try_save`
-    // 需要的句柄组合与 `set_session_profile` 不同，由调用方（/model 面板的
-    // 菜单分支）拦截后直接走 `profile_try_save`。
-    if matches!(action, ProfileSessionAction::Save) {
+    // `Save` / `SaveStay` 不在这里处理——`profile_try_save` 需要的句柄组合与
+    // `set_session_profile` 不同，由调用方（/profile 面板的菜单分支）拦截后直接走。
+    if matches!(
+        action,
+        ProfileSessionAction::Save | ProfileSessionAction::SaveStay
+    ) {
         return false;
     }
     let desired = match action {
         ProfileSessionAction::Use(name) => Some(name),
         ProfileSessionAction::FollowGlobal => None,
-        ProfileSessionAction::Save => None,
+        ProfileSessionAction::Save | ProfileSessionAction::SaveStay => None,
     };
     set_session_profile(
         state,
@@ -4094,7 +4164,7 @@ fn apply_session_profile(
 /// 于是一个没有待办的浮层继续吞掉全部按键，用户看着输入框的光标却打不进字。
 ///
 /// 面板里有未保存的字段草稿时**不关**：会话级切换刻意不写盘，直接关等于
-/// 静默丢掉用户刚敲进去的 Key。草稿的正常出口是 Ctrl+S 或 Esc 的三选一
+/// 静默丢掉用户刚敲进去的 Key。草稿的正常出口是菜单「保存」或 Esc 的三选一
 /// 确认，不能被一次端点切换顺手抹掉；此时面板仍在，`dialog.session_profile`
 /// 已更新，再次打开头行菜单就能看到「已在使用」与「恢复跟随全局」。
 fn finish_session_profile_switch(state: &mut AppState) {
@@ -6469,18 +6539,90 @@ async fn tui_main(
 
                     // ⓪.5 设置面板拦截（/config 命令触发）
                     if state.settings_dialog.is_some() {
+                        // 未保存确认 overlay：三选一
+                        if matches!(
+                            state.settings_dialog.as_ref().map(|d| &d.overlay),
+                            Some(SettingsOverlay::UnsavedChanges { .. })
+                        ) {
+                            match key.code {
+                                KeyCode::Up | KeyCode::Left => {
+                                    if let Some(dialog) = &mut state.settings_dialog {
+                                        if let SettingsOverlay::UnsavedChanges { selected } =
+                                            &mut dialog.overlay
+                                        {
+                                            *selected = selected.saturating_sub(1);
+                                        }
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Right => {
+                                    if let Some(dialog) = &mut state.settings_dialog {
+                                        if let SettingsOverlay::UnsavedChanges { selected } =
+                                            &mut dialog.overlay
+                                        {
+                                            *selected = (*selected + 1).min(2);
+                                        }
+                                    }
+                                }
+                                KeyCode::Enter | KeyCode::Char(' ') => {
+                                    let selected = state
+                                        .settings_dialog
+                                        .as_ref()
+                                        .and_then(|d| match d.overlay {
+                                            SettingsOverlay::UnsavedChanges { selected } => {
+                                                Some(selected)
+                                            }
+                                            _ => None,
+                                        })
+                                        .unwrap_or(0);
+                                    match selected {
+                                        0 => {
+                                            // 保存并关闭
+                                            if settings_try_save(
+                                                &mut state,
+                                                &agent_tx,
+                                                &rebuild_fn,
+                                                &system_prompt_extra,
+                                                &todo_store,
+                                                &shared_agent,
+                                                session_store.as_ref(),
+                                                &current_session_id,
+                                            ) {
+                                                state.settings_dialog = None;
+                                            } else if let Some(dialog) = &mut state.settings_dialog
+                                            {
+                                                dialog.overlay = SettingsOverlay::None;
+                                            }
+                                        }
+                                        1 => {
+                                            state.settings_dialog = None;
+                                        }
+                                        _ => {
+                                            if let Some(dialog) = &mut state.settings_dialog {
+                                                dialog.overlay = SettingsOverlay::None;
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    if let Some(dialog) = &mut state.settings_dialog {
+                                        dialog.overlay = SettingsOverlay::None;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
                         match key.code {
                             KeyCode::Up => {
                                 if let Some(dialog) = &mut state.settings_dialog {
-                                    if dialog.selected > 0 {
-                                        dialog.selected -= 1;
-                                    }
+                                    dialog.selected = dialog.selected.saturating_sub(1);
                                     dialog.error = None;
                                 }
                             }
                             KeyCode::Down => {
                                 if let Some(dialog) = &mut state.settings_dialog {
-                                    if dialog.selected + 1 < SETTINGS_FIELD_COUNT {
+                                    if dialog.selected + 1 < dialog.row_count() {
                                         dialog.selected += 1;
                                     }
                                     dialog.error = None;
@@ -6489,141 +6631,75 @@ async fn tui_main(
                             KeyCode::Left => {
                                 if let Some(dialog) = &mut state.settings_dialog {
                                     let idx = dialog.selected;
-                                    dialog.draft.cycle_enum(idx, false);
+                                    if idx < SETTINGS_FIELD_COUNT {
+                                        dialog.draft.cycle_enum(idx, false);
+                                    }
                                 }
                             }
                             KeyCode::Right => {
                                 if let Some(dialog) = &mut state.settings_dialog {
                                     let idx = dialog.selected;
-                                    dialog.draft.cycle_enum(idx, true);
+                                    if idx < SETTINGS_FIELD_COUNT {
+                                        dialog.draft.cycle_enum(idx, true);
+                                    }
                                 }
                             }
                             KeyCode::Enter => {
-                                // 按字段形态分派：枚举原地循环，文本/数字/密钥借用
-                                // 底部主输入框。此前所有字段都是枚举，Enter 与
-                                // Right 同义；加入 search 文本字段后必须分开。
-                                let target = state.settings_dialog.as_ref().map(|d| {
-                                    (
-                                        d.selected,
-                                        SETTINGS_FIELD_SPECS
-                                            .get(d.selected)
-                                            .map(|s| s.kind)
-                                            .unwrap_or(SettingsFieldKind::Text),
-                                    )
-                                });
+                                let target = state.settings_dialog.as_ref().map(|d| d.selected);
                                 match target {
-                                    Some((idx, SettingsFieldKind::Enum(_))) => {
-                                        if let Some(dialog) = &mut state.settings_dialog {
-                                            dialog.draft.cycle_enum(idx, true);
-                                        }
+                                    Some(idx) if idx == SettingsDialog::SAVE_ROW => {
+                                        let _ = settings_try_save(
+                                            &mut state,
+                                            &agent_tx,
+                                            &rebuild_fn,
+                                            &system_prompt_extra,
+                                            &todo_store,
+                                            &shared_agent,
+                                            session_store.as_ref(),
+                                            &current_session_id,
+                                        );
                                     }
-                                    Some((idx, _)) => {
-                                        let prefill = state
-                                            .settings_dialog
-                                            .as_ref()
-                                            .map(|d| d.draft.text_value(idx).to_string())
-                                            .unwrap_or_default();
-                                        if let Some(dialog) = &mut state.settings_dialog {
-                                            dialog.live_input = InputBox::new();
-                                            dialog.live_input.insert_text(&prefill);
-                                        }
-                                        state.input_owner =
-                                            Some(InputOwner::Settings(SettingsInputField::Field {
-                                                field_idx: idx,
-                                            }));
-                                    }
-                                    None => {}
-                                }
-                            }
-                            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                let mut should_close = false;
-                                if let Some(dialog) = &mut state.settings_dialog {
-                                    {
-                                        if let Some((key, args)) = dialog.draft.validate() {
-                                            let refs: Vec<(&str, &str)> = args
-                                                .iter()
-                                                .map(|(k, v)| (*k, v.as_str()))
-                                                .collect();
-                                            dialog.error = Some(wyj_i18n::tr_fmt(key, &refs));
-                                            // 校验失败：保留面板与已填内容，只展示错误，
-                                            // 让用户改完再存。`continue` 跳过本轮事件处理
-                                            // （面板不关闭）。
-                                            continue;
-                                        }
-                                        let new_cfg = dialog.draft.to_config(&state.config);
-                                        match new_cfg.save() {
-                                            Ok(()) => {
-                                                should_close = true;
-                                                state.config = new_cfg.clone();
-                                                let lang = wyj_i18n::resolve_locale(
-                                                    state.config.language.as_deref(),
-                                                );
-                                                wyj_i18n::set_locale(&lang);
-
-                                                let model_for_mode = state
-                                                    .config
-                                                    .model_for_mode(&state.mode)
-                                                    .to_string();
-                                                match rebuild_fn(&state.config, &model_for_mode) {
-                                                    Ok(new_agent) => {
-                                                        // rebuild_fn 已装配完整 system prompt
-                                                        //（英文主提示 + env 块），这里只拼回
-                                                        // 模式追加段（如 Plan 限制说明）
-                                                        let new_agent = new_agent.append_system(
-                                                            system_prompt_extra
-                                                                .trim_start()
-                                                                .to_string(),
-                                                        );
-                                                        let new_agent = attach_agent_session(
-                                                            new_agent,
-                                                            session_store.as_ref(),
-                                                            &current_session_id,
-                                                        );
-                                                        let new_agent = wire_tool_callback(
-                                                            new_agent,
-                                                            agent_tx.clone(),
-                                                            todo_store.clone(),
-                                                        );
-                                                        *shared_agent.write().unwrap() =
-                                                            Arc::new(new_agent);
-                                                        state.model_name = model_for_mode;
-                                                        state.context_window = state
-                                                            .config
-                                                            .active_profile()
-                                                            .context_window;
-                                                        state.messages.push(ChatMessage::system(
-                                                            wyj_i18n::tr("settings.saved"),
-                                                        ));
-                                                    }
-                                                    Err(e) => {
-                                                        // 提示词已不随 locale 变化，重建失败时
-                                                        // 保留原 Agent 即可，无需改 system prompt
-                                                        state.messages.push(
-                                                            ChatMessage::assistant_err(
-                                                                wyj_i18n::tr_fmt(
-                                                                    "settings.rebuild_failed",
-                                                                    &[("err", &e.to_string())],
-                                                                ),
-                                                            ),
-                                                        );
-                                                    }
+                                    Some(idx) if idx < SETTINGS_FIELD_COUNT => {
+                                        let kind = SETTINGS_FIELD_SPECS
+                                            .get(idx)
+                                            .map(|s| s.kind)
+                                            .unwrap_or(SettingsFieldKind::Text);
+                                        match kind {
+                                            SettingsFieldKind::Enum(_) => {
+                                                if let Some(dialog) = &mut state.settings_dialog {
+                                                    dialog.draft.cycle_enum(idx, true);
                                                 }
                                             }
-                                            Err(e) => {
-                                                dialog.error = Some(wyj_i18n::tr_fmt(
-                                                    "settings.save_failed",
-                                                    &[("err", &e.to_string())],
+                                            _ => {
+                                                let prefill = state
+                                                    .settings_dialog
+                                                    .as_ref()
+                                                    .map(|d| d.draft.text_value(idx).to_string())
+                                                    .unwrap_or_default();
+                                                if let Some(dialog) = &mut state.settings_dialog {
+                                                    dialog.live_input = InputBox::new();
+                                                    dialog.live_input.insert_text(&prefill);
+                                                }
+                                                state.input_owner = Some(InputOwner::Settings(
+                                                    SettingsInputField::Field { field_idx: idx },
                                                 ));
                                             }
                                         }
                                     }
-                                }
-                                if should_close {
-                                    state.settings_dialog = None;
+                                    _ => {}
                                 }
                             }
                             KeyCode::Esc => {
-                                state.settings_dialog = None;
+                                let dirty =
+                                    state.settings_dialog.as_ref().is_some_and(|d| d.is_dirty());
+                                if dirty {
+                                    if let Some(dialog) = &mut state.settings_dialog {
+                                        dialog.overlay =
+                                            SettingsOverlay::UnsavedChanges { selected: 0 };
+                                    }
+                                } else {
+                                    state.settings_dialog = None;
+                                }
                             }
                             _ => {}
                         }
@@ -6632,6 +6708,240 @@ async fn tui_main(
 
                     // ⓪.54 证据化自进化治理中心（/evolve 命令触发）
                     if state.evolution_dialog.is_some() {
+                        // ActionMenu 打开时优先处理
+                        if state
+                            .evolution_dialog
+                            .as_ref()
+                            .is_some_and(|d| d.menu.is_some())
+                        {
+                            enum EvStep {
+                                None,
+                                Close,
+                                Cancel,
+                                Confirm(EvolutionMenuAction),
+                                Execute(EvolutionMenuAction, usize),
+                            }
+                            let step = {
+                                let dialog = state.evolution_dialog.as_mut().unwrap();
+                                let menu = dialog.menu.as_mut().unwrap();
+                                let target = menu.target;
+                                if let Some(confirming) = menu.confirming {
+                                    match confirm_key_outcome(key.code) {
+                                        Some(true) => EvStep::Execute(confirming, target),
+                                        Some(false) => EvStep::Cancel,
+                                        None => EvStep::None,
+                                    }
+                                } else {
+                                    match key.code {
+                                        KeyCode::Up => {
+                                            menu.move_up();
+                                            EvStep::None
+                                        }
+                                        KeyCode::Down => {
+                                            menu.move_down();
+                                            EvStep::None
+                                        }
+                                        KeyCode::Esc => EvStep::Close,
+                                        KeyCode::Enter => match menu.selected_item() {
+                                            Some(item) if item.disabled => EvStep::None,
+                                            Some(item) if item.dangerous => {
+                                                EvStep::Confirm(item.action)
+                                            }
+                                            Some(item) => EvStep::Execute(item.action, target),
+                                            None => EvStep::None,
+                                        },
+                                        _ => EvStep::None,
+                                    }
+                                }
+                            };
+                            match step {
+                                EvStep::None => {}
+                                EvStep::Close => {
+                                    if let Some(dialog) = &mut state.evolution_dialog {
+                                        dialog.menu = None;
+                                    }
+                                }
+                                EvStep::Cancel => {
+                                    if let Some(dialog) = &mut state.evolution_dialog {
+                                        if let Some(menu) = &mut dialog.menu {
+                                            menu.confirming = None;
+                                        }
+                                    }
+                                }
+                                EvStep::Confirm(action) => {
+                                    if let Some(dialog) = &mut state.evolution_dialog {
+                                        if let Some(menu) = &mut dialog.menu {
+                                            menu.confirming = Some(action);
+                                        }
+                                    }
+                                }
+                                EvStep::Execute(action, row_idx) => {
+                                    let row = state
+                                        .evolution_dialog
+                                        .as_ref()
+                                        .and_then(|d| d.rows.get(row_idx))
+                                        .cloned();
+                                    if let Some(dialog) = &mut state.evolution_dialog {
+                                        dialog.menu = None;
+                                    }
+                                    match (action, row) {
+                                        (
+                                            EvolutionMenuAction::Approve,
+                                            Some(EvolutionRow::Memory(memory)),
+                                        ) if memory.status != MemoryStatus::Active => {
+                                            if let Some(dialog) = &mut state.evolution_dialog {
+                                                dialog.confirm =
+                                                    Some(EvolutionConfirmAction::ApproveMemory(
+                                                        memory.id,
+                                                    ));
+                                            }
+                                        }
+                                        (
+                                            EvolutionMenuAction::Approve,
+                                            Some(EvolutionRow::Candidate(candidate)),
+                                        ) if candidate.status != CandidateStatus::Active => {
+                                            if let Some(dialog) = &mut state.evolution_dialog {
+                                                dialog.confirm =
+                                                    Some(EvolutionConfirmAction::ApproveCandidate(
+                                                        candidate.id,
+                                                    ));
+                                            }
+                                        }
+                                        (
+                                            EvolutionMenuAction::Reject,
+                                            Some(EvolutionRow::Candidate(candidate)),
+                                        ) if candidate.status != CandidateStatus::Active => {
+                                            if let Some(dialog) = &mut state.evolution_dialog {
+                                                dialog.confirm =
+                                                    Some(EvolutionConfirmAction::RejectCandidate(
+                                                        candidate.id,
+                                                    ));
+                                            }
+                                        }
+                                        (
+                                            EvolutionMenuAction::Forget,
+                                            Some(EvolutionRow::Memory(memory)),
+                                        ) => {
+                                            if let Some(dialog) = &mut state.evolution_dialog {
+                                                dialog.confirm = Some(
+                                                    EvolutionConfirmAction::ForgetMemory(memory.id),
+                                                );
+                                            }
+                                        }
+                                        (
+                                            EvolutionMenuAction::Rollback,
+                                            Some(EvolutionRow::Candidate(candidate)),
+                                        ) if candidate.status == CandidateStatus::Active => {
+                                            if let Some(dialog) = &mut state.evolution_dialog {
+                                                dialog.confirm = Some(
+                                                    EvolutionConfirmAction::RollbackCandidate(
+                                                        candidate.id,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        (
+                                            EvolutionMenuAction::Pin,
+                                            Some(EvolutionRow::Memory(memory)),
+                                        ) => {
+                                            let result = state
+                                                .evolution_dialog
+                                                .as_ref()
+                                                .expect("Evolution dialog exists")
+                                                .store
+                                                .pin_memory(&memory.id, !memory.pinned);
+                                            if let Some(dialog) = &mut state.evolution_dialog {
+                                                dialog.reload();
+                                                dialog.error =
+                                                    result.err().map(|error| error.to_string());
+                                            }
+                                        }
+                                        (
+                                            EvolutionMenuAction::AcceptEpisode,
+                                            Some(EvolutionRow::Episode(episode)),
+                                        ) => {
+                                            let result = state
+                                                .evolution_dialog
+                                                .as_ref()
+                                                .expect("Evolution dialog exists")
+                                                .store
+                                                .feedback_episode(
+                                                    &episode.id,
+                                                    true,
+                                                    Some("accepted from /evolve".into()),
+                                                    true,
+                                                );
+                                            if let Some(dialog) = &mut state.evolution_dialog {
+                                                dialog.reload();
+                                                dialog.error =
+                                                    result.err().map(|error| error.to_string());
+                                            }
+                                        }
+                                        (
+                                            EvolutionMenuAction::RejectEpisode,
+                                            Some(EvolutionRow::Episode(episode)),
+                                        ) => {
+                                            let result = state
+                                                .evolution_dialog
+                                                .as_ref()
+                                                .expect("Evolution dialog exists")
+                                                .store
+                                                .feedback_episode(
+                                                    &episode.id,
+                                                    false,
+                                                    Some("rejected from /evolve".into()),
+                                                    true,
+                                                );
+                                            if let Some(dialog) = &mut state.evolution_dialog {
+                                                dialog.reload();
+                                                dialog.error =
+                                                    result.err().map(|error| error.to_string());
+                                            }
+                                        }
+                                        (
+                                            EvolutionMenuAction::IncludeEpisode,
+                                            Some(EvolutionRow::Episode(episode)),
+                                        ) => {
+                                            let result = state
+                                                .evolution_dialog
+                                                .as_ref()
+                                                .expect("Evolution dialog exists")
+                                                .store
+                                                .include_episode(&episode.id);
+                                            if let Some(dialog) = &mut state.evolution_dialog {
+                                                dialog.reload();
+                                                dialog.error =
+                                                    result.err().map(|error| error.to_string());
+                                            }
+                                        }
+                                        (
+                                            EvolutionMenuAction::SkillFromEpisode,
+                                            Some(EvolutionRow::Episode(episode)),
+                                        ) => {
+                                            let result = state
+                                                .evolution_dialog
+                                                .as_ref()
+                                                .expect("Evolution dialog exists")
+                                                .store
+                                                .create_skill_candidate_from_episode(&episode.id);
+                                            if let Some(dialog) = &mut state.evolution_dialog {
+                                                let message = match result {
+                                                    Ok(id) => {
+                                                        Some(format!("已生成 Skill 候选 {id}"))
+                                                    }
+                                                    Err(error) => Some(error.to_string()),
+                                                };
+                                                dialog.reload();
+                                                dialog.error = message;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
                         let pending_confirmation = state
                             .evolution_dialog
                             .as_ref()
@@ -6645,8 +6955,6 @@ async fn tui_main(
                                         .expect("Evolution dialog exists")
                                         .store
                                         .clone();
-                                    // 激活候选要先建工作区快照（git 管道 / 全树
-                                    // 哈希），同步 IO 秒级，不能压住主循环。
                                     let session_c = session.clone();
                                     let cwd_c = cwd.clone();
                                     let id_c = current_session_id.clone();
@@ -6679,11 +6987,6 @@ async fn tui_main(
                             continue;
                         }
 
-                        let row = state
-                            .evolution_dialog
-                            .as_ref()
-                            .and_then(|dialog| dialog.rows.get(dialog.selected))
-                            .cloned();
                         match key.code {
                             KeyCode::Left | KeyCode::BackTab => {
                                 if let Some(dialog) = &mut state.evolution_dialog {
@@ -6719,138 +7022,9 @@ async fn tui_main(
                                     dialog.detail_scroll = dialog.detail_scroll.saturating_add(5);
                                 }
                             }
-                            KeyCode::Char('a') => {
-                                let action = match row {
-                                    Some(EvolutionRow::Memory(memory))
-                                        if memory.status != MemoryStatus::Active =>
-                                    {
-                                        Some(EvolutionConfirmAction::ApproveMemory(memory.id))
-                                    }
-                                    Some(EvolutionRow::Candidate(candidate))
-                                        if candidate.status != CandidateStatus::Active =>
-                                    {
-                                        Some(EvolutionConfirmAction::ApproveCandidate(candidate.id))
-                                    }
-                                    _ => None,
-                                };
+                            KeyCode::Enter | KeyCode::Char(' ') => {
                                 if let Some(dialog) = &mut state.evolution_dialog {
-                                    dialog.confirm = action;
-                                }
-                            }
-                            KeyCode::Char('r') => {
-                                if let Some(EvolutionRow::Candidate(candidate)) = row {
-                                    if candidate.status != CandidateStatus::Active {
-                                        if let Some(dialog) = &mut state.evolution_dialog {
-                                            dialog.confirm =
-                                                Some(EvolutionConfirmAction::RejectCandidate(
-                                                    candidate.id,
-                                                ));
-                                        }
-                                    }
-                                }
-                            }
-                            KeyCode::Char('f') => {
-                                if let Some(EvolutionRow::Memory(memory)) = row {
-                                    if let Some(dialog) = &mut state.evolution_dialog {
-                                        dialog.confirm =
-                                            Some(EvolutionConfirmAction::ForgetMemory(memory.id));
-                                    }
-                                }
-                            }
-                            KeyCode::Char('b') => {
-                                if let Some(EvolutionRow::Candidate(candidate)) = row {
-                                    if candidate.status == CandidateStatus::Active {
-                                        if let Some(dialog) = &mut state.evolution_dialog {
-                                            dialog.confirm =
-                                                Some(EvolutionConfirmAction::RollbackCandidate(
-                                                    candidate.id,
-                                                ));
-                                        }
-                                    }
-                                }
-                            }
-                            KeyCode::Char('p') => {
-                                if let Some(EvolutionRow::Memory(memory)) = row {
-                                    let result = state
-                                        .evolution_dialog
-                                        .as_ref()
-                                        .expect("Evolution dialog exists")
-                                        .store
-                                        .pin_memory(&memory.id, !memory.pinned);
-                                    if let Some(dialog) = &mut state.evolution_dialog {
-                                        dialog.reload();
-                                        dialog.error = result.err().map(|error| error.to_string());
-                                    }
-                                }
-                            }
-                            KeyCode::Char('+') | KeyCode::Char('=') => {
-                                if let Some(EvolutionRow::Episode(episode)) = row {
-                                    let result = state
-                                        .evolution_dialog
-                                        .as_ref()
-                                        .expect("Evolution dialog exists")
-                                        .store
-                                        .feedback_episode(
-                                            &episode.id,
-                                            true,
-                                            Some("accepted from /evolve".into()),
-                                            true,
-                                        );
-                                    if let Some(dialog) = &mut state.evolution_dialog {
-                                        dialog.reload();
-                                        dialog.error = result.err().map(|error| error.to_string());
-                                    }
-                                }
-                            }
-                            KeyCode::Char('-') => {
-                                if let Some(EvolutionRow::Episode(episode)) = row {
-                                    let result = state
-                                        .evolution_dialog
-                                        .as_ref()
-                                        .expect("Evolution dialog exists")
-                                        .store
-                                        .feedback_episode(
-                                            &episode.id,
-                                            false,
-                                            Some("rejected from /evolve".into()),
-                                            true,
-                                        );
-                                    if let Some(dialog) = &mut state.evolution_dialog {
-                                        dialog.reload();
-                                        dialog.error = result.err().map(|error| error.to_string());
-                                    }
-                                }
-                            }
-                            KeyCode::Char('i') => {
-                                if let Some(EvolutionRow::Episode(episode)) = row {
-                                    let result = state
-                                        .evolution_dialog
-                                        .as_ref()
-                                        .expect("Evolution dialog exists")
-                                        .store
-                                        .include_episode(&episode.id);
-                                    if let Some(dialog) = &mut state.evolution_dialog {
-                                        dialog.reload();
-                                        dialog.error = result.err().map(|error| error.to_string());
-                                    }
-                                }
-                            }
-                            KeyCode::Char('s') => {
-                                if let Some(EvolutionRow::Episode(episode)) = row {
-                                    let result = state
-                                        .evolution_dialog
-                                        .as_ref()
-                                        .expect("Evolution dialog exists")
-                                        .store
-                                        .create_skill_candidate_from_episode(&episode.id);
-                                    if let Some(dialog) = &mut state.evolution_dialog {
-                                        let message = match result {
-                                            Ok(id) => Some(format!("已生成 Skill 候选 {id}")),
-                                            Err(error) => Some(error.to_string()),
-                                        };
-                                        dialog.reload();
-                                        dialog.error = message;
-                                    }
+                                    dialog.menu = dialog.build_menu();
                                 }
                             }
                             KeyCode::Esc => {
@@ -6963,43 +7137,13 @@ async fn tui_main(
                                         }
                                     }
                                     MemoryRowAction::ClearAll => {
-                                        // 进入二次确认态，等待用户再次按 y/Enter 才执行。
+                                        // 进入二次确认态，等待再次 Enter 才执行。
                                         if let Some(dialog) = &mut state.memory_dialog {
                                             dialog.pending_clear_all = true;
                                             dialog.error = None;
                                         }
                                     }
                                     MemoryRowAction::None => {}
-                                }
-                            }
-                            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                // 与 Enter 行为一致：进入二次确认态或执行。
-                                let pending = state
-                                    .memory_dialog
-                                    .as_ref()
-                                    .map(|d| d.pending_clear_all)
-                                    .unwrap_or(false);
-                                if pending {
-                                    if let Some(dialog) = &mut state.memory_dialog {
-                                        dialog.pending_clear_all = false;
-                                    }
-                                    execute_memory_clear_all(&shared_agent, &mut state);
-                                } else if let Some(dialog) = &mut state.memory_dialog {
-                                    if let Some(MemoryRow::ClearAll { .. }) =
-                                        dialog.rows.get(dialog.selected)
-                                    {
-                                        dialog.pending_clear_all = true;
-                                        dialog.error = None;
-                                    }
-                                }
-                            }
-                            KeyCode::Char('n') | KeyCode::Char('N') => {
-                                // 二次确认态下按 n 视为取消（与 Esc 等价）。
-                                if let Some(dialog) = &mut state.memory_dialog {
-                                    if dialog.pending_clear_all {
-                                        dialog.pending_clear_all = false;
-                                        dialog.error = None;
-                                    }
                                 }
                             }
                             KeyCode::Esc => {
@@ -7065,7 +7209,7 @@ async fn tui_main(
                                             }
                                         }
                                     }
-                                    KeyCode::Char('y') | KeyCode::Enter => {
+                                    KeyCode::Enter => {
                                         let to_install = state.mcp_dialog.as_ref().and_then(|d| {
                                             if let McpOverlay::InstallConfirm {
                                                 server,
@@ -7120,7 +7264,7 @@ async fn tui_main(
                                             }
                                         }
                                     }
-                                    KeyCode::Char('n') | KeyCode::Esc => {
+                                    KeyCode::Esc => {
                                         if let Some(dialog) = &mut state.mcp_dialog {
                                             dialog.overlay = McpOverlay::None;
                                         }
@@ -7260,7 +7404,7 @@ async fn tui_main(
                                             }
                                         }
                                     }
-                                    KeyCode::Char('y') | KeyCode::Enter => {
+                                    KeyCode::Enter => {
                                         let home = wyj_config::home_dir().unwrap_or_default();
                                         let req = state.skills_dialog.as_ref().and_then(|d| {
                                             if let SkillsOverlay::InstallConfirm {
@@ -7306,7 +7450,7 @@ async fn tui_main(
                                             }
                                         }
                                     }
-                                    KeyCode::Char('n') | KeyCode::Esc => {
+                                    KeyCode::Esc => {
                                         if let Some(dialog) = &mut state.skills_dialog {
                                             dialog.overlay = SkillsOverlay::None;
                                         }
@@ -7335,7 +7479,7 @@ async fn tui_main(
                                             }
                                         }
                                     }
-                                    KeyCode::Char('y') | KeyCode::Enter => {
+                                    KeyCode::Enter => {
                                         // archive 用 mem::take 移出而不是 clone：确认框
                                         // 借用了 dialog，而安装又要读 state.cwd，
                                         // 两个借用不能同时活着，顺带省掉一次几 MB 的拷贝。
@@ -7393,7 +7537,7 @@ async fn tui_main(
                                             }
                                         }
                                     }
-                                    KeyCode::Char('n') | KeyCode::Esc => {
+                                    KeyCode::Esc => {
                                         if let Some(dialog) = &mut state.skills_dialog {
                                             dialog.overlay = SkillsOverlay::None;
                                         }
@@ -7537,7 +7681,7 @@ async fn tui_main(
                                             }
                                         }
                                     }
-                                    KeyCode::Char('y') | KeyCode::Enter => {
+                                    KeyCode::Enter => {
                                         let install_args =
                                             state.plugins_dialog.as_ref().and_then(|d| {
                                                 if let PluginOverlay::InstallConfirm {
@@ -7582,7 +7726,7 @@ async fn tui_main(
                                             });
                                         }
                                     }
-                                    KeyCode::Char('n') | KeyCode::Esc => {
+                                    KeyCode::Esc => {
                                         if let Some(dialog) = &mut state.plugins_dialog {
                                             dialog.overlay = PluginOverlay::None;
                                         }
@@ -7681,119 +7825,178 @@ async fn tui_main(
                         continue;
                     }
 
-                    // ⓪.58 可用 Agent 类型面板拦截（/agents 命令触发）
+                    // ⓪.58 Extensions 统一资源面板
                     if state.extensions_dialog.is_some() {
-                        let pending_action = state
+                        if state
                             .extensions_dialog
                             .as_ref()
-                            .and_then(|dialog| dialog.confirm);
-                        if let Some(action) = pending_action {
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Enter => {
-                                    let target = state
-                                        .extensions_dialog
-                                        .as_ref()
-                                        .and_then(|dialog| dialog.selected_record())
-                                        .map(|record| (record.id.clone(), record.scope));
-                                    if let Some((id, scope)) = target {
-                                        let cwd = state.cwd.clone();
-                                        let result = match action {
-                                            ExtensionAction::Enable => {
-                                                wyj_store::extensions::set_enabled(
-                                                    &id, scope, &cwd, true,
-                                                )
+                            .is_some_and(|d| d.menu.is_some())
+                        {
+                            enum ExtStep {
+                                None,
+                                Close,
+                                Cancel,
+                                Confirm(ExtensionAction),
+                                Execute(ExtensionAction),
+                            }
+                            let step = {
+                                let dialog = state.extensions_dialog.as_mut().unwrap();
+                                let menu = dialog.menu.as_mut().unwrap();
+                                if let Some(confirming) = menu.confirming {
+                                    match confirm_key_outcome(key.code) {
+                                        Some(true) => ExtStep::Execute(confirming),
+                                        Some(false) => ExtStep::Cancel,
+                                        None => ExtStep::None,
+                                    }
+                                } else {
+                                    match key.code {
+                                        KeyCode::Up => {
+                                            menu.move_up();
+                                            ExtStep::None
+                                        }
+                                        KeyCode::Down => {
+                                            menu.move_down();
+                                            ExtStep::None
+                                        }
+                                        KeyCode::Esc => ExtStep::Close,
+                                        KeyCode::Enter => match menu.selected_item() {
+                                            Some(item) if item.disabled => ExtStep::None,
+                                            Some(item) if item.dangerous => {
+                                                ExtStep::Confirm(item.action)
                                             }
-                                            ExtensionAction::Disable => {
-                                                wyj_store::extensions::set_enabled(
-                                                    &id, scope, &cwd, false,
-                                                )
+                                            Some(item) => ExtStep::Execute(item.action),
+                                            None => ExtStep::None,
+                                        },
+                                        _ => ExtStep::None,
+                                    }
+                                }
+                            };
+                            match step {
+                                ExtStep::None => {}
+                                ExtStep::Close => {
+                                    if let Some(dialog) = &mut state.extensions_dialog {
+                                        dialog.menu = None;
+                                    }
+                                }
+                                ExtStep::Cancel => {
+                                    if let Some(dialog) = &mut state.extensions_dialog {
+                                        if let Some(menu) = &mut dialog.menu {
+                                            menu.confirming = None;
+                                        }
+                                    }
+                                }
+                                ExtStep::Confirm(action) => {
+                                    if let Some(dialog) = &mut state.extensions_dialog {
+                                        if let Some(menu) = &mut dialog.menu {
+                                            menu.confirming = Some(action);
+                                        }
+                                    }
+                                }
+                                ExtStep::Execute(action) => {
+                                    if let Some(dialog) = &mut state.extensions_dialog {
+                                        dialog.menu = None;
+                                    }
+                                    match action {
+                                        ExtensionAction::ToggleDetail => {
+                                            if let Some(dialog) = &mut state.extensions_dialog {
+                                                dialog.detail_open = !dialog.detail_open;
+                                                dialog.detail_scroll = 0;
                                             }
-                                            ExtensionAction::Remove => {
-                                                wyj_store::extensions::remove(&id, scope, &cwd)
+                                        }
+                                        ExtensionAction::Refresh => {
+                                            let cwd = state.cwd.clone();
+                                            if let Some(dialog) = &mut state.extensions_dialog {
+                                                dialog.refresh(&cwd);
                                             }
-                                        };
-                                        if let Some(dialog) = &mut state.extensions_dialog {
-                                            dialog.confirm = None;
-                                            match result {
-                                                Ok(()) => {
-                                                    dialog.refresh(&cwd);
-                                                    state.messages.push(ChatMessage::system(
-                                                        format!(
-                                                            "{} {id} — applies at the next Agent boundary",
-                                                            ExtensionsDialog::action_label(action)
-                                                        ),
-                                                    ));
+                                        }
+                                        ExtensionAction::Enable
+                                        | ExtensionAction::Disable
+                                        | ExtensionAction::Remove => {
+                                            let target = state
+                                                .extensions_dialog
+                                                .as_ref()
+                                                .and_then(|dialog| dialog.selected_record())
+                                                .map(|record| (record.id.clone(), record.scope));
+                                            if let Some((id, scope)) = target {
+                                                let cwd = state.cwd.clone();
+                                                let result = match action {
+                                                    ExtensionAction::Enable => {
+                                                        wyj_store::extensions::set_enabled(
+                                                            &id, scope, &cwd, true,
+                                                        )
+                                                    }
+                                                    ExtensionAction::Disable => {
+                                                        wyj_store::extensions::set_enabled(
+                                                            &id, scope, &cwd, false,
+                                                        )
+                                                    }
+                                                    ExtensionAction::Remove => {
+                                                        wyj_store::extensions::remove(
+                                                            &id, scope, &cwd,
+                                                        )
+                                                    }
+                                                    _ => Ok(()),
+                                                };
+                                                if let Some(dialog) = &mut state.extensions_dialog {
+                                                    match result {
+                                                        Ok(()) => {
+                                                            dialog.refresh(&cwd);
+                                                            state.messages.push(
+                                                                ChatMessage::system(format!(
+                                                                    "{} {id} — applies at the next Agent boundary",
+                                                                    ExtensionsDialog::action_label(
+                                                                        action
+                                                                    )
+                                                                )),
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            dialog.error = Some(e.to_string())
+                                                        }
+                                                    }
                                                 }
-                                                Err(e) => dialog.error = Some(e.to_string()),
                                             }
                                         }
                                     }
                                 }
-                                KeyCode::Char('n') | KeyCode::Esc => {
-                                    if let Some(dialog) = &mut state.extensions_dialog {
-                                        dialog.confirm = None;
-                                    }
-                                }
-                                _ => {}
                             }
-                        } else {
-                            match key.code {
-                                KeyCode::Esc => state.extensions_dialog = None,
-                                KeyCode::Up => {
-                                    if let Some(dialog) = &mut state.extensions_dialog {
-                                        dialog.move_selected(-1);
-                                    }
+                            continue;
+                        }
+
+                        match key.code {
+                            KeyCode::Esc => state.extensions_dialog = None,
+                            KeyCode::Up => {
+                                if let Some(dialog) = &mut state.extensions_dialog {
+                                    dialog.move_selected(-1);
                                 }
-                                KeyCode::Down => {
-                                    if let Some(dialog) = &mut state.extensions_dialog {
-                                        dialog.move_selected(1);
-                                    }
+                            }
+                            KeyCode::Down => {
+                                if let Some(dialog) = &mut state.extensions_dialog {
+                                    dialog.move_selected(1);
                                 }
-                                KeyCode::PageUp => {
-                                    if let Some(dialog) = &mut state.extensions_dialog {
-                                        dialog.detail_scroll =
-                                            dialog.detail_scroll.saturating_sub(8);
-                                    }
+                            }
+                            KeyCode::PageUp => {
+                                if let Some(dialog) = &mut state.extensions_dialog {
+                                    dialog.detail_scroll = dialog.detail_scroll.saturating_sub(8);
                                 }
-                                KeyCode::PageDown => {
-                                    if let Some(dialog) = &mut state.extensions_dialog {
-                                        dialog.detail_scroll =
-                                            dialog.detail_scroll.saturating_add(8);
-                                    }
+                            }
+                            KeyCode::PageDown => {
+                                if let Some(dialog) = &mut state.extensions_dialog {
+                                    dialog.detail_scroll = dialog.detail_scroll.saturating_add(8);
                                 }
-                                KeyCode::Enter | KeyCode::Char(' ') => {
-                                    if let Some(dialog) = &mut state.extensions_dialog {
-                                        dialog.detail_open = !dialog.detail_open;
-                                        dialog.detail_scroll = 0;
-                                    }
-                                }
-                                KeyCode::Char('e') | KeyCode::Char('d') | KeyCode::Char('x') => {
-                                    let action = match key.code {
-                                        KeyCode::Char('e') => ExtensionAction::Enable,
-                                        KeyCode::Char('d') => ExtensionAction::Disable,
-                                        _ => ExtensionAction::Remove,
-                                    };
-                                    if let Some(dialog) = &mut state.extensions_dialog {
-                                        if action == ExtensionAction::Remove
-                                            || dialog.selected_record().is_some_and(|record| {
-                                                (action == ExtensionAction::Enable
-                                                    && !record.enabled)
-                                                    || (action == ExtensionAction::Disable
-                                                        && record.enabled)
-                                            })
-                                        {
-                                            dialog.confirm = Some(action);
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('r') => {
-                                    let cwd = state.cwd.clone();
-                                    if let Some(dialog) = &mut state.extensions_dialog {
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                if let Some(dialog) = &mut state.extensions_dialog {
+                                    if dialog.records.is_empty() {
+                                        // 空列表：Enter 刷新
+                                        let cwd = state.cwd.clone();
                                         dialog.refresh(&cwd);
+                                    } else {
+                                        dialog.menu = dialog.build_menu();
                                     }
                                 }
-                                _ => {}
                             }
+                            _ => {}
                         }
                         continue;
                     }
@@ -7833,11 +8036,11 @@ async fn tui_main(
                             if let Some(action) =
                                 profile_handle_menu_key(&mut state, key.code, &agent_tx)
                             {
-                                if matches!(action, ProfileSessionAction::Save) {
-                                    // 「设为当前」执行完毕后的保存意图：走与 Ctrl+S
-                                    // 完全相同的 `profile_try_save`（校验 → 写盘 →
-                                    // 重建 agent），成功自动关面板，失败留在面板
-                                    // 展示 error。
+                                if matches!(
+                                    action,
+                                    ProfileSessionAction::Save | ProfileSessionAction::SaveStay
+                                ) {
+                                    let close = matches!(action, ProfileSessionAction::Save);
                                     let saved = profile_try_save(
                                         &mut state,
                                         &agent_tx,
@@ -7848,7 +8051,7 @@ async fn tui_main(
                                         session_store.as_ref(),
                                         &current_session_id,
                                     );
-                                    if saved {
+                                    if saved && close {
                                         state.input_owner = None;
                                         state.profile_dialog = None;
                                     }
@@ -7864,7 +8067,7 @@ async fn tui_main(
                                     &current_session_id,
                                     &session,
                                 ) {
-                                    // 与 Ctrl+S / 「设为当前」同一收口：切换落地即收起
+                                    // 与「保存 / 设为当前」同一收口：切换落地即收起
                                     // 面板，否则留下一个没有待办却仍吞按键的浮层。
                                     finish_session_profile_switch(&mut state);
                                 }
@@ -8131,21 +8334,6 @@ async fn tui_main(
                                     None => {}
                                 }
                             }
-                            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                let saved = profile_try_save(
-                                    &mut state,
-                                    &agent_tx,
-                                    &rebuild_fn,
-                                    &system_prompt_extra,
-                                    &todo_store,
-                                    &shared_agent,
-                                    session_store.as_ref(),
-                                    &current_session_id,
-                                );
-                                if saved {
-                                    state.profile_dialog = None;
-                                }
-                            }
                             _ => {}
                         }
                         continue;
@@ -8338,76 +8526,100 @@ async fn tui_main(
                     // ①.5 检测到计划已批准仍在 plan 模式发消息 → 确认切换执行模式
                     if state.exec_mode_confirm.is_some() {
                         match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                if let Some(dlg) = state.exec_mode_confirm.take() {
-                                    spawn_plan_approval_checkpoint(
-                                        session.clone(),
-                                        cwd.clone(),
-                                        current_session_id.clone(),
-                                        session_store.as_ref(),
-                                    );
-                                    let new_mode = AgentMode::Auto;
-                                    switch_mode(
-                                        &shared_mode,
-                                        &shared_permission,
-                                        new_mode.clone(),
-                                        &permission_constraints,
-                                    )
-                                    .await;
-                                    state.mode = new_mode;
-                                    state.messages.push(ChatMessage::system(
-                                        "已切换至执行模式。".to_string(),
-                                    ));
-                                    state.push_user(dlg.pending_display.clone());
-                                    state.begin_new_turn();
-                                    state.is_thinking = true;
-                                    state.spinner_frame = 0;
-                                    state.begin_turn_timing();
-                                    let agent_c = shared_agent.read().unwrap().clone();
-                                    let (task, injector) = spawn_agent_turn(
-                                        Some(dlg.pending_message),
-                                        dlg.pending_attachments,
-                                        agent_c,
-                                        session.clone(),
-                                        agent_tx.clone(),
-                                        cwd.clone(),
-                                        shared_mode.clone(),
-                                        shared_permission.clone(),
-                                        auto_gate.clone(),
-                                        ui_ask_tx.clone(),
-                                        std::mem::take(&mut state.pending_bg_reminders),
-                                        plugin_runtime.clone(),
-                                        permission_constraints.clone(),
-                                    );
-                                    state.current_task = Some(task);
-                                    state.injector = Some(injector);
+                            KeyCode::Up | KeyCode::Left => {
+                                if let Some(dlg) = &mut state.exec_mode_confirm {
+                                    dlg.move_up();
                                 }
                             }
-                            KeyCode::Char('n') | KeyCode::Char('N') => {
-                                if let Some(dlg) = state.exec_mode_confirm.take() {
-                                    state.push_user(dlg.pending_display.clone());
-                                    state.begin_new_turn();
-                                    state.is_thinking = true;
-                                    state.spinner_frame = 0;
-                                    state.begin_turn_timing();
-                                    let agent_c = shared_agent.read().unwrap().clone();
-                                    let (task, injector) = spawn_agent_turn(
-                                        Some(dlg.pending_message),
-                                        dlg.pending_attachments,
-                                        agent_c,
-                                        session.clone(),
-                                        agent_tx.clone(),
-                                        cwd.clone(),
-                                        shared_mode.clone(),
-                                        shared_permission.clone(),
-                                        auto_gate.clone(),
-                                        ui_ask_tx.clone(),
-                                        std::mem::take(&mut state.pending_bg_reminders),
-                                        plugin_runtime.clone(),
-                                        permission_constraints.clone(),
-                                    );
-                                    state.current_task = Some(task);
-                                    state.injector = Some(injector);
+                            KeyCode::Down | KeyCode::Right => {
+                                if let Some(dlg) = &mut state.exec_mode_confirm {
+                                    dlg.move_down();
+                                }
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                let choice = state
+                                    .exec_mode_confirm
+                                    .as_ref()
+                                    .map(|dlg| dlg.selected_choice());
+                                match choice {
+                                    Some(ExecModeConfirmChoice::SwitchAndSend) => {
+                                        if let Some(dlg) = state.exec_mode_confirm.take() {
+                                            spawn_plan_approval_checkpoint(
+                                                session.clone(),
+                                                cwd.clone(),
+                                                current_session_id.clone(),
+                                                session_store.as_ref(),
+                                            );
+                                            let new_mode = AgentMode::Auto;
+                                            switch_mode(
+                                                &shared_mode,
+                                                &shared_permission,
+                                                new_mode.clone(),
+                                                &permission_constraints,
+                                            )
+                                            .await;
+                                            state.mode = new_mode;
+                                            state.messages.push(ChatMessage::system(
+                                                "已切换至执行模式。".to_string(),
+                                            ));
+                                            state.push_user(dlg.pending_display.clone());
+                                            state.begin_new_turn();
+                                            state.is_thinking = true;
+                                            state.spinner_frame = 0;
+                                            state.begin_turn_timing();
+                                            let agent_c = shared_agent.read().unwrap().clone();
+                                            let (task, injector) = spawn_agent_turn(
+                                                Some(dlg.pending_message),
+                                                dlg.pending_attachments,
+                                                agent_c,
+                                                session.clone(),
+                                                agent_tx.clone(),
+                                                cwd.clone(),
+                                                shared_mode.clone(),
+                                                shared_permission.clone(),
+                                                auto_gate.clone(),
+                                                ui_ask_tx.clone(),
+                                                std::mem::take(&mut state.pending_bg_reminders),
+                                                plugin_runtime.clone(),
+                                                permission_constraints.clone(),
+                                            );
+                                            state.current_task = Some(task);
+                                            state.injector = Some(injector);
+                                        }
+                                    }
+                                    Some(ExecModeConfirmChoice::KeepPlanAndSend) => {
+                                        if let Some(dlg) = state.exec_mode_confirm.take() {
+                                            state.push_user(dlg.pending_display.clone());
+                                            state.begin_new_turn();
+                                            state.is_thinking = true;
+                                            state.spinner_frame = 0;
+                                            state.begin_turn_timing();
+                                            let agent_c = shared_agent.read().unwrap().clone();
+                                            let (task, injector) = spawn_agent_turn(
+                                                Some(dlg.pending_message),
+                                                dlg.pending_attachments,
+                                                agent_c,
+                                                session.clone(),
+                                                agent_tx.clone(),
+                                                cwd.clone(),
+                                                shared_mode.clone(),
+                                                shared_permission.clone(),
+                                                auto_gate.clone(),
+                                                ui_ask_tx.clone(),
+                                                std::mem::take(&mut state.pending_bg_reminders),
+                                                plugin_runtime.clone(),
+                                                permission_constraints.clone(),
+                                            );
+                                            state.current_task = Some(task);
+                                            state.injector = Some(injector);
+                                        }
+                                    }
+                                    Some(ExecModeConfirmChoice::Cancel) | None => {
+                                        state.exec_mode_confirm = None;
+                                        state
+                                            .messages
+                                            .push(ChatMessage::system("已取消发送。".to_string()));
+                                    }
                                 }
                             }
                             KeyCode::Esc => {
@@ -8440,23 +8652,27 @@ async fn tui_main(
                         continue;
                     }
 
-                    // ③ 工具权限确认拦截：一般工具 y/Enter=允许一次、a=始终允许；
-                    //    computer-use 的 y/Enter/a 均由 ToolCtx 记为项目级授权；
-                    //    d/Esc/其它=拒绝。决策经 oneshot 回传给挂起的 Agent 回合。
+                    // ③ 工具权限确认：↑↓ 选择 + Enter 确认；Esc = 拒绝。
                     if state.permission_dialog.is_some() {
                         use wyj_tools::PermissionDecision;
                         let decision = match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                Some(PermissionDecision::AllowOnce)
+                            KeyCode::Up | KeyCode::Left => {
+                                if let Some(dlg) = &mut state.permission_dialog {
+                                    dlg.move_up();
+                                }
+                                None
                             }
-                            KeyCode::Char('a') | KeyCode::Char('A') => {
-                                Some(PermissionDecision::AllowAlways)
+                            KeyCode::Down | KeyCode::Right => {
+                                if let Some(dlg) = &mut state.permission_dialog {
+                                    dlg.move_down();
+                                }
+                                None
                             }
-                            KeyCode::Char('d')
-                            | KeyCode::Char('D')
-                            | KeyCode::Char('n')
-                            | KeyCode::Char('N')
-                            | KeyCode::Esc => Some(PermissionDecision::Deny),
+                            KeyCode::Enter | KeyCode::Char(' ') => state
+                                .permission_dialog
+                                .as_ref()
+                                .and_then(|dlg| dlg.selected_decision()),
+                            KeyCode::Esc => Some(PermissionDecision::Deny),
                             _ => None,
                         };
                         if let Some(decision) = decision {
@@ -8538,26 +8754,37 @@ async fn tui_main(
                         continue;
                     }
 
-                    // 项目级 MCP server 信任确认拦截：y/Enter=信任并连接（写盘
-                    // 批准记录，下一帧 refresh_tui_mcp_runtime 会自动纳入并连接）；
-                    // n/Esc/其它=本次跳过（不写盘，下次启动会重新询问）。
+                    // 项目级 MCP server 信任确认：↑↓ 选择 + Enter；Esc = 跳过。
                     if state.pending_mcp_trust.is_some() {
                         match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                if let Err(e) = wyj_store::project_trust::approve(&cwd) {
-                                    tracing::warn!("写入项目级 MCP 信任记录失败: {e}");
-                                }
-                                state.pending_mcp_trust = None;
-                                state.messages.push(ChatMessage::system(
-                                    "已信任并开始连接项目级 MCP server。".to_string(),
-                                ));
+                            KeyCode::Up | KeyCode::Left => {
+                                state.pending_mcp_trust_selected = 0;
                             }
-                            KeyCode::Char('n')
-                            | KeyCode::Char('N')
-                            | KeyCode::Esc
-                            | KeyCode::Char('d')
-                            | KeyCode::Char('D') => {
+                            KeyCode::Down | KeyCode::Right => {
+                                state.pending_mcp_trust_selected = 1;
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                if state.pending_mcp_trust_selected == 0 {
+                                    if let Err(e) = wyj_store::project_trust::approve(&cwd) {
+                                        tracing::warn!("写入项目级 MCP 信任记录失败: {e}");
+                                    }
+                                    state.pending_mcp_trust = None;
+                                    state.pending_mcp_trust_selected = 0;
+                                    state.messages.push(ChatMessage::system(
+                                        "已信任并开始连接项目级 MCP server。".to_string(),
+                                    ));
+                                } else {
+                                    state.pending_mcp_trust = None;
+                                    state.pending_mcp_trust_selected = 0;
+                                    state.messages.push(ChatMessage::system(
+                                        "已跳过，这些 server 本次不会连接（下次启动会重新询问）。"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                            KeyCode::Esc => {
                                 state.pending_mcp_trust = None;
+                                state.pending_mcp_trust_selected = 0;
                                 state.messages.push(ChatMessage::system(
                                     "已跳过，这些 server 本次不会连接（下次启动会重新询问）。"
                                         .to_string(),
@@ -8568,45 +8795,60 @@ async fn tui_main(
                         continue;
                     }
 
-                    // 项目级 skill 信任确认拦截。放在 MCP 分支**之后**：两者同时
+                    // 项目级 skill 信任确认。放在 MCP 分支**之后**：两者同时
                     // pending 时 MCP 先吃掉这次按键（它能执行任意命令，优先级更高），
                     // 答完后下一轮自然轮到 skill——不需要额外的排队逻辑。
                     if state.pending_skill_trust.is_some() {
                         match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                if let Err(e) = wyj_store::skill_trust::approve_skills(&cwd) {
-                                    tracing::warn!("写入项目级 skill 信任记录失败: {e}");
-                                }
-                                state.pending_skill_trust = None;
-                                state.pending_skill_trust_changes.clear();
-                                // ① 重建命令注册表 —— 不做这步的症状是"按了 y 但
-                                //    `/xxx` 还是敲不出来"，且没有任何报错。
-                                {
-                                    let disabled = wyj_store::disabled_skill_names(&cwd);
-                                    let mut plugin_sources =
-                                        wyj_store::plugin_install::enabled_plugin_skill_paths(&cwd);
-                                    if let Some(local) = &local_plugin {
-                                        plugin_sources.extend(local.skill_paths.clone());
-                                    }
-                                    cmd_registry = standard_registry_with_skills(
-                                        &home_dir,
-                                        &cwd,
-                                        &disabled,
-                                        &plugin_sources,
-                                        ProjectSkillsGate::resolve(&cwd),
-                                    );
-                                    update_slash_completions(&mut state, &input, &cmd_registry);
-                                }
-                                state.messages.push(ChatMessage::system(
-                                    "已信任，本会话即可使用这些项目 skill。".to_string(),
-                                ));
+                            KeyCode::Up | KeyCode::Left => {
+                                state.pending_skill_trust_selected = 0;
                             }
-                            KeyCode::Char('n')
-                            | KeyCode::Char('N')
-                            | KeyCode::Esc
-                            | KeyCode::Char('d')
-                            | KeyCode::Char('D') => {
+                            KeyCode::Down | KeyCode::Right => {
+                                state.pending_skill_trust_selected = 1;
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                if state.pending_skill_trust_selected == 0 {
+                                    if let Err(e) = wyj_store::skill_trust::approve_skills(&cwd) {
+                                        tracing::warn!("写入项目级 skill 信任记录失败: {e}");
+                                    }
+                                    state.pending_skill_trust = None;
+                                    state.pending_skill_trust_selected = 0;
+                                    state.pending_skill_trust_changes.clear();
+                                    // 重建命令注册表，否则信任后 `/xxx` 仍敲不出来。
+                                    {
+                                        let disabled = wyj_store::disabled_skill_names(&cwd);
+                                        let mut plugin_sources =
+                                            wyj_store::plugin_install::enabled_plugin_skill_paths(
+                                                &cwd,
+                                            );
+                                        if let Some(local) = &local_plugin {
+                                            plugin_sources.extend(local.skill_paths.clone());
+                                        }
+                                        cmd_registry = standard_registry_with_skills(
+                                            &home_dir,
+                                            &cwd,
+                                            &disabled,
+                                            &plugin_sources,
+                                            ProjectSkillsGate::resolve(&cwd),
+                                        );
+                                        update_slash_completions(&mut state, &input, &cmd_registry);
+                                    }
+                                    state.messages.push(ChatMessage::system(
+                                        "已信任，本会话即可使用这些项目 skill。".to_string(),
+                                    ));
+                                } else {
+                                    state.pending_skill_trust = None;
+                                    state.pending_skill_trust_selected = 0;
+                                    state.pending_skill_trust_changes.clear();
+                                    state.messages.push(ChatMessage::system(
+                                        "已跳过，这些项目 skill 本次不加载（下次启动会重新询问）。"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                            KeyCode::Esc => {
                                 state.pending_skill_trust = None;
+                                state.pending_skill_trust_selected = 0;
                                 state.pending_skill_trust_changes.clear();
                                 state.messages.push(ChatMessage::system(
                                     "已跳过，这些项目 skill 本次不加载（下次启动会重新询问）。"
@@ -8756,11 +8998,19 @@ async fn tui_main(
                         }
                         match key.code {
                             KeyCode::Up => {
-                                state.move_focus_selection(-1);
+                                if let Some(menu) = &mut state.shell_menu {
+                                    menu.move_up();
+                                } else {
+                                    state.move_focus_selection(-1);
+                                }
                                 continue;
                             }
                             KeyCode::Down => {
-                                state.move_focus_selection(1);
+                                if let Some(menu) = &mut state.shell_menu {
+                                    menu.move_down();
+                                } else {
+                                    state.move_focus_selection(1);
+                                }
                                 continue;
                             }
                             KeyCode::PageUp => {
@@ -8773,23 +9023,53 @@ async fn tui_main(
                             }
                             KeyCode::Enter | KeyCode::Char(' ')
                                 if key.modifiers.is_empty()
-                                    && !matches!(state.ui_focus, UiFocus::Chat) =>
+                                    && state.ui_focus == UiFocus::Shells =>
+                            {
+                                if let Some(menu) = &mut state.shell_menu {
+                                    match menu.selected_action().copied() {
+                                        Some(ShellMenuAction::ToggleDetail) => {
+                                            state.shell_menu = None;
+                                            state.toggle_focused_content_detail();
+                                        }
+                                        Some(ShellMenuAction::Kill) => {
+                                            state.shell_menu = None;
+                                            state.kill_selected_shell();
+                                        }
+                                        None => {}
+                                    }
+                                } else if state.selected_shell.is_some() {
+                                    state.shell_menu = Some(SelectConfirm::new(vec![
+                                        SelectConfirmItem {
+                                            label: wyj_i18n::tr(if state.shell_detail_open {
+                                                "shell.menu.hide_detail"
+                                            } else {
+                                                "shell.menu.show_detail"
+                                            }),
+                                            action: ShellMenuAction::ToggleDetail,
+                                        },
+                                        SelectConfirmItem {
+                                            label: wyj_i18n::tr("shell.menu.kill"),
+                                            action: ShellMenuAction::Kill,
+                                        },
+                                    ]));
+                                }
+                                continue;
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ')
+                                if key.modifiers.is_empty()
+                                    && !matches!(
+                                        state.ui_focus,
+                                        UiFocus::Chat | UiFocus::Shells
+                                    ) =>
                             {
                                 state.toggle_focused_content_detail();
                                 continue;
                             }
                             KeyCode::Esc => {
+                                if state.shell_menu.take().is_some() {
+                                    continue;
+                                }
                                 state.close_panel_focus();
-                                continue;
-                            }
-                            // 裸 `k` 在后台任务面板里终止选中的进程组。输入框的
-                            // Ctrl+K（kill-to-end）走的是另一条 CONTROL 分支，
-                            // 两者不会撞车。
-                            KeyCode::Char('k')
-                                if key.modifiers.is_empty()
-                                    && state.ui_focus == UiFocus::Shells =>
-                            {
-                                state.kill_selected_shell();
                                 continue;
                             }
                             // Ctrl+T 自己负责聚焦/折叠 Todo；保持当前焦点让它能判断
@@ -10372,13 +10652,11 @@ async fn tui_main(
                                         .unwrap_or(false);
 
                                 if plan_already_approved {
-                                    state.exec_mode_confirm = Some(ExecModeConfirmDialog {
-                                        pending_message: text.clone(),
-                                        pending_attachments: std::mem::take(
-                                            &mut state.pending_attachments,
-                                        ),
-                                        pending_display: display_text,
-                                    });
+                                    state.exec_mode_confirm = Some(ExecModeConfirmDialog::new(
+                                        text.clone(),
+                                        std::mem::take(&mut state.pending_attachments),
+                                        display_text,
+                                    ));
                                     state.input_history.push(text);
                                 } else {
                                     state.push_user(display_text);
@@ -11450,19 +11728,12 @@ mod session_conflict_dialog_tests {
     }
 
     #[test]
-    fn number_keys_select_directly() {
-        assert_eq!(
-            dialog().handle_key(KeyCode::Char('1')),
-            Some(SessionConflictChoice::TakeOver)
-        );
-        assert_eq!(
-            dialog().handle_key(KeyCode::Char('2')),
-            Some(SessionConflictChoice::ReadOnly)
-        );
-        assert_eq!(
-            dialog().handle_key(KeyCode::Char('3')),
-            Some(SessionConflictChoice::Abort)
-        );
+    fn letter_and_digit_shortcuts_are_removed() {
+        assert_eq!(dialog().handle_key(KeyCode::Char('1')), None);
+        assert_eq!(dialog().handle_key(KeyCode::Char('t')), None);
+        assert_eq!(dialog().handle_key(KeyCode::Char('2')), None);
+        assert_eq!(dialog().handle_key(KeyCode::Char('r')), None);
+        assert_eq!(dialog().handle_key(KeyCode::Char('3')), None);
         assert_eq!(
             dialog().handle_key(KeyCode::Esc),
             Some(SessionConflictChoice::Abort)

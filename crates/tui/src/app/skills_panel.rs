@@ -394,10 +394,10 @@ pub(super) fn skills_handle_menu_key(
         };
         let target = menu.target;
         if let Some(confirming) = menu.confirming {
-            match code {
-                KeyCode::Enter | KeyCode::Char('y') => Step::Execute(confirming, target),
-                KeyCode::Esc | KeyCode::Char('n') => Step::Cancel,
-                _ => Step::None,
+            match confirm_key_outcome(code) {
+                Some(true) => Step::Execute(confirming, target),
+                Some(false) => Step::Cancel,
+                None => Step::None,
             }
         } else {
             match code {
@@ -1057,11 +1057,11 @@ mod skills_registry_tests {
         state.is_thinking = true;
         state.current_task = Some(spawn_turn_task(std::future::pending::<()>()));
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        state.permission_dialog = Some(PermissionDialog {
-            tool_name: "Bash".to_string(),
-            action_summary: "cargo test".to_string(),
-            response_tx: tx,
-        });
+        state.permission_dialog = Some(PermissionDialog::new(
+            "Bash".to_string(),
+            "cargo test".to_string(),
+            tx,
+        ));
         // 静默远超阈值，但弹窗开着
         state.last_turn_activity = Instant::now() - (TURN_STALL_TIMEOUT * 3);
 

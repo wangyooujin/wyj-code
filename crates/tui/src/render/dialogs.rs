@@ -32,9 +32,10 @@ pub(super) fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let max_w = (inner.width as usize).saturating_sub(2).max(20);
     let preview = truncate_chars(&dlg.action_summary, (inner.width as usize * 3).max(80));
 
-    let lines: Vec<Line<'static>> = vec![
+    let mut lines: Vec<Line<'static>> = vec![
         Line::from(vec![
             Span::styled(wyj_i18n::tr("dialog.permission_tool_label"), Theme::dim()),
             Span::styled(dlg.tool_name.clone(), Theme::permission_dialog()),
@@ -45,17 +46,20 @@ pub(super) fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area
         )),
         Line::from(Span::raw(preview)),
         Line::from(""),
-        Line::from(Span::styled(
-            if wyj_tools::ctx::is_project_approve_once_tool(&dlg.tool_name) {
-                wyj_i18n::tr("dialog.permission_hint_project_once")
-            } else {
-                wyj_i18n::tr("dialog.permission_hint")
-            },
-            Theme::highlight(),
-        )),
     ];
+    for (index, (_, label_key)) in dlg.choices().iter().enumerate() {
+        lines.push(choice_row(
+            index == dlg.selected,
+            &wyj_i18n::tr(label_key),
+            max_w,
+        ));
+    }
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr("dialog.hint_nav_select_cancel"),
+        Theme::highlight(),
+    )));
 
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
 }
 
@@ -95,11 +99,7 @@ pub(super) fn draw_session_conflict_panel(f: &mut Frame, dlg: &SessionConflictDi
         wyj_i18n::tr("dialog.session_conflict_abort"),
     ];
     for (index, label) in labels.iter().enumerate() {
-        lines.push(choice_row(
-            index == dlg.selected,
-            &format!("[{}] {label}", index + 1),
-            max_w,
-        ));
+        lines.push(choice_row(index == dlg.selected, label, max_w));
     }
     lines.push(Line::from(Span::styled(
         wyj_i18n::tr("dialog.session_conflict_hint"),
@@ -130,6 +130,7 @@ pub(super) fn choice_row(selected: bool, label: &str, max_w: usize) -> Line<'sta
 pub(super) fn draw_project_trust_panel(
     f: &mut Frame,
     servers: &[wyj_config::McpServerConfig],
+    selected: usize,
     area: Rect,
 ) {
     let block = Block::default()
@@ -143,6 +144,7 @@ pub(super) fn draw_project_trust_panel(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let max_w = (inner.width as usize).saturating_sub(2).max(20);
     let mut lines: Vec<Line<'static>> = vec![Line::from(Span::raw(wyj_i18n::tr(
         "dialog.project_trust_intro",
     )))];
@@ -165,12 +167,22 @@ pub(super) fn draw_project_trust_panel(
         ))));
     }
     lines.push(Line::from(""));
+    lines.push(choice_row(
+        selected == 0,
+        &wyj_i18n::tr("dialog.project_trust_approve"),
+        max_w,
+    ));
+    lines.push(choice_row(
+        selected == 1,
+        &wyj_i18n::tr("dialog.project_trust_skip"),
+        max_w,
+    ));
     lines.push(Line::from(Span::styled(
         wyj_i18n::tr("dialog.project_trust_hint"),
         Theme::highlight(),
     )));
 
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
 }
 
@@ -184,6 +196,7 @@ pub(super) fn draw_skill_trust_panel(
     f: &mut Frame,
     infos: &[wyj_commands::skill::ProjectSkillInfo],
     changed: &[String],
+    selected: usize,
     area: Rect,
 ) {
     let block = Block::default()
@@ -197,6 +210,7 @@ pub(super) fn draw_skill_trust_panel(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let max_w = (inner.width as usize).saturating_sub(2).max(20);
     let mut lines: Vec<Line<'static>> = vec![Line::from(Span::raw(wyj_i18n::tr(
         "dialog.skill_trust_intro",
     )))];
@@ -227,12 +241,22 @@ pub(super) fn draw_skill_trust_panel(
         ))));
     }
     lines.push(Line::from(""));
+    lines.push(choice_row(
+        selected == 0,
+        &wyj_i18n::tr("dialog.skill_trust_approve"),
+        max_w,
+    ));
+    lines.push(choice_row(
+        selected == 1,
+        &wyj_i18n::tr("dialog.skill_trust_skip"),
+        max_w,
+    ));
     lines.push(Line::from(Span::styled(
         wyj_i18n::tr("dialog.skill_trust_hint"),
         Theme::highlight(),
     )));
 
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
 }
 
@@ -314,26 +338,35 @@ pub(super) fn draw_exec_mode_confirm_panel(f: &mut Frame, dlg: &ExecModeConfirmD
         .borders(Borders::ALL)
         .border_style(Theme::warning())
         .title(Span::styled(
-            " ⚠ 检测到计划已批准 ",
+            wyj_i18n::tr("dialog.exec_mode_title"),
             Theme::warning().add_modifier(Modifier::BOLD),
         ));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let max_w = inner.width as usize;
+    let max_w = (inner.width as usize).saturating_sub(2).max(20);
     let preview = truncate_line(&dlg.pending_message, max_w.saturating_sub(6));
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
-            Span::styled("待发送：", Theme::muted()),
+            Span::styled(wyj_i18n::tr("dialog.exec_mode_pending"), Theme::muted()),
             Span::styled(preview, Theme::body()),
         ]),
-        Line::from(Span::styled(
-            "  [y/Enter] 切换执行模式并发送   [n] 保持规划模式发送   [Esc] 取消",
-            Theme::warning().add_modifier(Modifier::BOLD),
-        )),
+        Line::from(""),
     ];
+    let options = [
+        wyj_i18n::tr("dialog.exec_mode_switch_send"),
+        wyj_i18n::tr("dialog.exec_mode_keep_plan"),
+        wyj_i18n::tr("dialog.exec_mode_cancel"),
+    ];
+    for (index, label) in options.iter().enumerate() {
+        lines.push(choice_row(index == dlg.selected, label, max_w));
+    }
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr("dialog.hint_nav_select_cancel"),
+        Theme::warning().add_modifier(Modifier::BOLD),
+    )));
     let para = Paragraph::new(Text::from(lines));
     f.render_widget(para, inner);
 }
@@ -766,8 +799,12 @@ pub(super) fn draw_settings_dialog(
     input_owner: Option<InputOwner>,
     area: Rect,
 ) {
-    // 字段行 + 分隔线 + 错误行 + 提示行
-    let content_lines = SETTINGS_FIELD_COUNT as u16 + 3;
+    // 字段行 + 保存行 + 分隔线 + 错误行 + 提示行（未保存 overlay 再加几行）
+    let overlay_extra = match dialog.overlay {
+        SettingsOverlay::UnsavedChanges { .. } => 5,
+        SettingsOverlay::None => 0,
+    };
+    let content_lines = dialog.row_count() as u16 + 3 + overlay_extra;
     let height = (content_lines + 2).min(area.height.saturating_sub(2));
     let width = (area.width * 6 / 10).clamp(50, 90).min(area.width);
 
@@ -827,12 +864,41 @@ pub(super) fn draw_settings_dialog(
         lines.push(Line::from(Span::styled(text, style)));
     }
 
+    let save_selected = dialog.selected == SettingsDialog::SAVE_ROW;
+    let save_marker = if save_selected { "▶ " } else { "  " };
+    let save_label = if dialog.is_dirty() {
+        wyj_i18n::tr("settings.save_row_dirty")
+    } else {
+        wyj_i18n::tr("settings.save_row")
+    };
+    lines.push(Line::from(Span::styled(
+        truncate_line(&format!("{save_marker}{save_label}"), w),
+        if save_selected {
+            Theme::selected_row()
+        } else {
+            Theme::body()
+        },
+    )));
+
     lines.push(Line::from(Span::styled("─".repeat(w), Theme::border())));
     if let Some(err) = &dialog.error {
         lines.push(Line::from(Span::styled(
             truncate_line(err, w),
             Theme::warning(),
         )));
+    } else if let SettingsOverlay::UnsavedChanges { selected } = dialog.overlay {
+        lines.push(Line::from(Span::styled(
+            wyj_i18n::tr("profile.overlay.unsaved_title"),
+            Theme::warning(),
+        )));
+        let options = [
+            wyj_i18n::tr("profile.overlay.unsaved_save_close"),
+            wyj_i18n::tr("profile.overlay.unsaved_discard_close"),
+            wyj_i18n::tr("profile.overlay.unsaved_cancel"),
+        ];
+        for (idx, label) in options.iter().enumerate() {
+            lines.push(choice_row(idx == selected, label, w));
+        }
     } else {
         lines.push(Line::from(""));
     }
@@ -1157,6 +1223,21 @@ pub(super) fn draw_evolution_dialog(f: &mut Frame, dialog: &EvolutionDialog, are
         ),
         vertical[2],
     );
+
+    if let Some(menu) = &dialog.menu {
+        // 以整块 evolve 面板为锚点弹出操作菜单
+        let dialog_area = Rect::new(
+            area.x
+                + (area
+                    .width
+                    .saturating_sub((area.width * 9 / 10).clamp(80, 140).min(area.width)))
+                    / 2,
+            area.y + 1,
+            (area.width * 9 / 10).clamp(80, 140).min(area.width),
+            area.height.saturating_sub(2),
+        );
+        draw_action_menu(f, area, dialog_area, &wyj_i18n::tr("evolve.title"), menu);
+    }
 }
 
 // ── MCP server 管理面板渲染：/mcp 命令触发 ─────────────────────────────────────
@@ -2285,7 +2366,7 @@ pub(super) fn draw_agents_dialog(f: &mut Frame, dialog: &mut AgentsDialog, area:
 pub(super) fn draw_extensions_dialog(f: &mut Frame, dialog: &mut ExtensionsDialog, area: Rect) {
     let list_rows = dialog.records.len().clamp(1, MAX_LIST_VIEWPORT);
     let detail_rows = if dialog.detail_open { 10 } else { 0 };
-    let footer_rows = if dialog.confirm.is_some() { 3 } else { 2 };
+    let footer_rows = 2;
     let content_lines = list_rows as u16 + detail_rows + footer_rows + 1;
     let height = (content_lines + 2).min(area.height.saturating_sub(2));
     let width = (area.width * 9 / 10).clamp(72, 140).min(area.width);
@@ -2423,32 +2504,21 @@ pub(super) fn draw_extensions_dialog(f: &mut Frame, dialog: &mut ExtensionsDialo
         "─".repeat(footer_area.width as usize),
         Theme::border(),
     ))];
-    if let Some(action) = dialog.confirm {
-        let id = dialog
-            .selected_record()
-            .map(|record| record.id.as_str())
-            .unwrap_or("selected resource");
-        footer.push(Line::from(Span::styled(
-            truncate_line(
-                &format!(
-                    "Confirm {} {}? [y/Enter] yes · [n/Esc] cancel",
-                    ExtensionsDialog::action_label(action),
-                    id
-                ),
-                footer_area.width as usize,
-            ),
-            Theme::warning(),
-        )));
-    } else {
-        footer.push(Line::from(Span::styled(
-            truncate_line(
-                "↑/↓ select · Enter detail · e enable · d disable · x remove · r refresh · Esc close",
-                footer_area.width as usize,
-            ),
-            Theme::dim(),
-        )));
-    }
+    footer.push(Line::from(Span::styled(
+        truncate_line(&wyj_i18n::tr("extensions.hint"), footer_area.width as usize),
+        Theme::dim(),
+    )));
     f.render_widget(Paragraph::new(Text::from(footer)), footer_area);
+
+    if let Some(menu) = &dialog.menu {
+        draw_action_menu(
+            f,
+            area,
+            dialog_area,
+            &wyj_i18n::tr("extensions.title"),
+            menu,
+        );
+    }
 }
 /// 分组管理面板渲染（/model 无参命令触发）
 pub(super) fn draw_profile_dialog(
