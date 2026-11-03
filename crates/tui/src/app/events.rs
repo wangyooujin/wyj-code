@@ -97,7 +97,17 @@ impl AppState {
                 // 不能只依赖"call_idx 找不到配对"来自然落空——那样会走
                 // `push_tracked_message` 把 "⎿ 任务列表已更新: N 项…" 追加到流尾。
                 if name == "TodoWrite" {
-                    // TodoWrite 没有 ToolCall 行，因此也不存在 sub_agent_id 回填。
+                    // TodoUpdate 可能被 try_send 丢包：ToolEnd 必达时从共享
+                    // store 再读一次，保证面板与权威状态一致。
+                    if !is_error {
+                        let snapshot = self
+                            .todo_store
+                            .as_ref()
+                            .and_then(|store| store.lock().ok().map(|g| g.items.clone()));
+                        if let Some(items) = snapshot {
+                            self.apply_todo_snapshot(items);
+                        }
+                    }
                 } else {
                     let summary = tool_result_summary(&name, &output, is_error);
                     // 找到对应的 ToolCall 消息位置：多个工具调用在同一轮里并发执行时，
@@ -203,6 +213,8 @@ impl AppState {
                     //
                     // 走与 TodoUpdate handler 里 was_in_progress → not_in_progress
                     // 同款 started_at → elapsed_secs 收口，统计数字保持连续。
+                    // 收口结果必须写回 TodoStore，否则下次 TodoWrite 整表替换
+                    // 前 store 仍是旧 in_progress，面板与权威状态会再次分叉。
                     self.todo_resume_pending = false;
                     if let Some(items) = self.current_todos.as_mut() {
                         for item in items.iter_mut() {
@@ -216,6 +228,8 @@ impl AppState {
                             }
                         }
                     }
+                    self.focused_todo_id = None;
+                    self.sync_todos_to_store();
                 }
                 if let Some(start) = self.turn_start_time.take() {
                     let elapsed = start.elapsed().as_secs_f64();
@@ -525,54 +539,7 @@ impl AppState {
             }
 
             AgentEvent::TodoUpdate(items) => {
-                let old_all_done = self.current_todos.as_ref().is_some_and(|old| {
-                    !old.is_empty() && old.iter().all(|t| t.status == TodoStatus::Completed)
-                });
-                let new_all_done =
-                    !items.is_empty() && items.iter().all(|t| t.status == TodoStatus::Completed);
-                let is_new_round = is_new_todo_round(self.current_todos.as_deref(), &items);
-                if is_new_round || (new_all_done && !old_all_done) {
-                    // 新一轮任务开始，或本轮刚全部完成：重置为默认折叠态
-                    self.todo_panel_expanded = false;
-                }
-                if is_new_round {
-                    self.todo_stats.clear();
-                    self.todo_execution_logs.clear();
-                }
-
-                // 状态转换检测：新一轮时旧状态视为空表（所有任务都视为之前不是
-                // in_progress），否则用更新前的 current_todos 按 id 查旧状态。
-                let old_status: HashMap<&str, &TodoStatus> = if is_new_round {
-                    HashMap::new()
-                } else {
-                    self.current_todos
-                        .as_deref()
-                        .unwrap_or(&[])
-                        .iter()
-                        .map(|t| (t.id.as_str(), &t.status))
-                        .collect()
-                };
-                for item in &items {
-                    let was_in_progress = old_status
-                        .get(item.id.as_str())
-                        .is_some_and(|s| **s == TodoStatus::InProgress);
-                    let is_in_progress = item.status == TodoStatus::InProgress;
-                    if is_in_progress && !was_in_progress {
-                        self.todo_stats
-                            .entry(item.id.clone())
-                            .or_default()
-                            .started_at = Some(Instant::now());
-                    } else if !is_in_progress && was_in_progress {
-                        if let Some(s) = self.todo_stats.get_mut(&item.id) {
-                            if let Some(start) = s.started_at.take() {
-                                s.elapsed_secs += start.elapsed().as_secs_f64();
-                            }
-                        }
-                    }
-                }
-
-                self.current_todos = Some(items);
-                self.ensure_selected_todo();
+                self.apply_todo_snapshot(items);
             }
 
             AgentEvent::AskQuestions {

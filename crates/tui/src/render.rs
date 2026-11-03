@@ -3552,18 +3552,16 @@ fn thinking_status_label(state: &AppState) -> String {
 
     // 3. 有任务清单时先答"为哪件事"：工具名每几步就会换，任务名才是用户
     //    真正在追的进度。缺这一步的话，标题栏与聊天区的工具行仍是同义反复。
-    if let Some(task) = state
-        .current_todos
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .find(|t| t.status == TodoStatus::InProgress)
-    {
-        return task
-            .active_form
-            .as_deref()
-            .unwrap_or(&task.content)
-            .to_string();
+    //    优先 focused_todo_id（最近 TodoWrite / 工具归因），避免钉死列表更前
+    //    面、模型已漏更新的旧 in_progress。
+    if let Some(task) = state.current_focus_todo() {
+        if task.status == TodoStatus::InProgress {
+            return task
+                .active_form
+                .as_deref()
+                .unwrap_or(&task.content)
+                .to_string();
+        }
     }
 
     // 4. 工具动词短语（不带参数）：参数在聊天区 `⏺ Bash(cargo test)` 上已经完整

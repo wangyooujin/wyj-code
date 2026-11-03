@@ -22,6 +22,97 @@ impl AppState {
             .collect()
     }
 
+    /// 标题栏 / 默认选中用的「当前任务」：优先 `focused_todo_id`（仍为
+    /// in_progress 时），否则退回列表里唯一的 in_progress，再否则第一个未完成项。
+    pub(crate) fn current_focus_todo(&self) -> Option<&TodoItem> {
+        let items = self.current_todos.as_deref()?;
+        if let Some(id) = self.focused_todo_id.as_deref() {
+            if let Some(item) = items
+                .iter()
+                .find(|t| t.id == id && t.status == TodoStatus::InProgress)
+            {
+                return Some(item);
+            }
+        }
+        items
+            .iter()
+            .rev()
+            .find(|t| t.status == TodoStatus::InProgress)
+            .or_else(|| items.iter().find(|t| t.status != TodoStatus::Completed))
+            .or_else(|| items.last())
+    }
+
+    /// 把一份 todo 快照收口后写入 `current_todos`，并刷新 focus / 统计。
+    ///
+    /// TodoUpdate 事件与 TodoWrite 的 ToolEnd（丢包兜底）共用；幂等。
+    pub(super) fn apply_todo_snapshot(&mut self, mut items: Vec<TodoItem>) {
+        wyj_tools::normalize_todo_statuses(&mut items);
+
+        let old_all_done = self.current_todos.as_ref().is_some_and(|old| {
+            !old.is_empty() && old.iter().all(|t| t.status == TodoStatus::Completed)
+        });
+        let new_all_done =
+            !items.is_empty() && items.iter().all(|t| t.status == TodoStatus::Completed);
+        let is_new_round = is_new_todo_round(self.current_todos.as_deref(), &items);
+        if is_new_round || (new_all_done && !old_all_done) {
+            self.todo_panel_expanded = false;
+        }
+        if is_new_round {
+            self.todo_stats.clear();
+            self.todo_execution_logs.clear();
+        }
+
+        let old_status: HashMap<&str, &TodoStatus> = if is_new_round {
+            HashMap::new()
+        } else {
+            self.current_todos
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|t| (t.id.as_str(), &t.status))
+                .collect()
+        };
+        for item in &items {
+            let was_in_progress = old_status
+                .get(item.id.as_str())
+                .is_some_and(|s| **s == TodoStatus::InProgress);
+            let is_in_progress = item.status == TodoStatus::InProgress;
+            if is_in_progress && !was_in_progress {
+                self.todo_stats
+                    .entry(item.id.clone())
+                    .or_default()
+                    .started_at = Some(Instant::now());
+            } else if !is_in_progress && was_in_progress {
+                if let Some(s) = self.todo_stats.get_mut(&item.id) {
+                    if let Some(start) = s.started_at.take() {
+                        s.elapsed_secs += start.elapsed().as_secs_f64();
+                    }
+                }
+            }
+        }
+
+        self.focused_todo_id = items
+            .iter()
+            .rev()
+            .find(|t| t.status == TodoStatus::InProgress)
+            .map(|t| t.id.clone());
+        self.current_todos = Some(items);
+        self.ensure_selected_todo();
+    }
+
+    /// 把 `current_todos` 写回共享 TodoStore（TurnDone 自动收口后必须同步）。
+    pub(super) fn sync_todos_to_store(&self) {
+        let Some(store) = &self.todo_store else {
+            return;
+        };
+        let Some(items) = self.current_todos.as_ref() else {
+            return;
+        };
+        if let Ok(mut g) = store.lock() {
+            g.items = items.clone();
+        }
+    }
+
     /// 清单里所有**未完成**项（pending + in_progress），按 id 与内容返回。
     ///
     /// 唯一的消费者是自动续跑：被轮数预算截断的回合结束后，主循环据此生成
@@ -38,7 +129,13 @@ impl AppState {
     }
 
     pub(super) fn link_message_to_active_todos(&mut self, message_id: u64) {
-        for todo_id in self.active_todo_ids() {
+        let active = self.active_todo_ids();
+        // 工具活动归因到进行中的任务时，把焦点钉到最后一个（normalize 后通常
+        // 只有一个）——避免标题栏仍显示列表更前面、已不再有活动的旧 in_progress。
+        if let Some(id) = active.last() {
+            self.focused_todo_id = Some(id.clone());
+        }
+        for todo_id in active {
             let follow_detail_tail = self.ui_focus == UiFocus::TodoDetail
                 && self.selected_todo_id.as_deref() == Some(todo_id.as_str())
                 && self.todo_detail_scroll >= self.todo_detail_max_scroll;
@@ -67,13 +164,7 @@ impl AppState {
     }
 
     pub(super) fn default_todo_id(&self) -> Option<String> {
-        let items = self.current_todos.as_deref()?;
-        items
-            .iter()
-            .find(|t| t.status == TodoStatus::InProgress)
-            .or_else(|| items.iter().find(|t| t.status != TodoStatus::Completed))
-            .or_else(|| items.last())
-            .map(|t| t.id.clone())
+        self.current_focus_todo().map(|t| t.id.clone())
     }
 
     pub(super) fn ensure_selected_todo(&mut self) {

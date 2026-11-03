@@ -30,6 +30,7 @@ pub mod memory_v3;
 pub mod notify;
 pub mod permission;
 pub mod pricing;
+pub mod progress;
 pub mod project;
 pub mod prompt_fingerprint;
 pub mod prompts;

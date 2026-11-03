@@ -257,11 +257,11 @@ forced_thinking_max_turns = 64  # 强制思考端点的单回合熔断轮数。*
                                 # 死循环保护同样由 loop_guard 独立承担。
 
 [tools]                          # 工具注册门控（v0.2.27+）
-todo_enabled = true            # 是否注册 TodoWrite 任务列表工具。**默认开启**
-                                # （v0.3.1 起由关闭改为开启，见架构节
-                                # 「TodoWrite 默认开启」）。未注册 = 工具不产生
-                                # schema，模型目录里看不到它。简单任务为主、
-                                # 或用强模型跑短任务时设 false 更划算。
+todo_enabled = false           # 是否注册 TodoWrite 任务列表工具。**默认关闭**
+                                # （长程进度改由 Progress / `.wyj-code/progress.md`）。
+                                # 需要会话内 UI 任务面板时显式 true。
+progress_enabled = true        # 是否注册 Progress 工具（读写项目进度文件）。
+                                # **默认开启**。压缩后框架从磁盘重新注入该文件。
 
 [ui]                            # TUI 展示区交互（v0.3.10+）
 mouse = "auto"                 # 鼠标报告（DEC 1000/1002/1006）策略，三态：
@@ -381,9 +381,8 @@ forced_thinking_max_turns = 64   # **思考关不掉的端点**（reasoner / -r1
                                  # 推理，实测单回合可达 163 轮 / 35.6 万 output token
 
 [tools]
-todo_enabled = true              # 是否注册 TodoWrite 任务列表工具（**默认开启**）。
-                                 # 未注册 = 工具不产生 schema，模型目录里看不到它。
-                                 # 简单任务为主、或用强模型跑短任务时设 false 更划算
+todo_enabled = false             # 是否注册 TodoWrite（**默认关闭**；长程进度用 Progress）
+progress_enabled = true          # 是否注册 Progress（读写 `.wyj-code/progress.md`，默认开）
 
 [ui]                             # TUI 展示区交互
 mouse = "auto"                   # 鼠标报告策略三态：auto（按 TERM 判定，默认）/ on / off。

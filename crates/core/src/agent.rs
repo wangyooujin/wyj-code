@@ -159,6 +159,13 @@ fn estimate_tool_schema_tokens(tools: &[ToolDefinition]) -> u32 {
 /// 主提示词和基础工作流会直接引用这些工具；lazy schema 只能隐藏可选集成，
 /// 不能把正常编码和 computer-use 所需的执行面从模型目录中移除。未注册的名字
 /// 不会产生 schema，因此同一列表也可安全用于只读子 Agent 和 Plan 模式。
+/// 无论 lazy 阈值如何，这些 schema 都必须常驻。
+///
+/// 名单刻意压到「编码主路径」：Read/搜索/编辑/Shell/Agent/召回/进度。Web*、
+/// AskQuestion、Memory、ExitPlanMode、TodoWrite、computer 三件套**不**在这里——
+/// 装配侧在「确实注册了」时把它们追加进 `enable_lazy_tools` 的 `core_tools`，
+/// 未注册就不占每轮预填。ContextRecall 例外：清理把输出外置后它是唯一召回
+/// 入口，折叠等于让清理不可逆。
 const ALWAYS_VISIBLE_TOOL_SCHEMAS: &[&str] = &[
     "Read",
     "Glob",
@@ -169,27 +176,11 @@ const ALWAYS_VISIBLE_TOOL_SCHEMAS: &[&str] = &[
     "KillShell",
     "Edit",
     "Write",
-    "WebFetch",
-    "WebSearch",
-    "AskQuestion",
-    "Memory",
-    // 清理把工具输出外部化后，模型唯一取回全文的入口。**必须常驻**——
-    // 一旦被 lazy 折叠掉，占位符里的 cas:// 引用就成了死路，清理变成不可逆。
     "ContextRecall",
     "Agent",
-    "ExitPlanMode",
-    // TodoWrite 由 `[tools].todo_enabled` 门控（默认开，用户可显式关掉）。
-    // 开启时**必须**常驻：它是纯状态写入、不碰文件系统，但 schema 一旦被 lazy 折叠，
-    // 模型就完全不知道这个工具存在 —— 配置只管「注册」，管不到「可见」，
-    // 表现为「配了 todo_enabled = true 但任务列表面板永远不出现」。
-    // 未注册时不产生 schema，因此列在这里对只读子 Agent / Plan 模式同样无副作用。
-    "TodoWrite",
-    // COMPUTER_USE_HINT 要求模型直接从稳定窗口发现开始，再走后台动作。
-    // 如果这三个 schema 被 ToolSearch 隐藏，国内模型可能把“当前不可见”误判为
-    // “本会话未注册”，从而在没有发起任何工具调用时直接拒绝 GUI 任务。
-    "window_capture",
-    "app_computer",
-    "computer",
+    // 长程任务的磁盘进度载体（见 `Progress` 工具 / `.wyj-code/progress.md`）。
+    // 未注册时 catalog 里没有它，列在这里无副作用。
+    "Progress",
 ];
 
 /// 工具执行事件（供回调使用，例如 headless 格式化输出或 TUI 事件推送）
@@ -428,6 +419,8 @@ pub struct Agent {
     /// 「做到哪了」的连续叙述。混成一体会让 `project_brief` 的 8KB 预算被
     /// 会话内的临时进展挤占。
     session_memory: Option<Arc<crate::session_memory::SessionMemory>>,
+    /// 项目根（用于压缩后重新注入 `.wyj-code/progress.md`）。`None` = 不注入。
+    progress_root: Option<std::path::PathBuf>,
     /// 证据化自进化存储（可选）。Memory v3 存在时只记录 Episode 并发现需审批
     /// 的 Rule/Skill 候选；无 v3 时保留旧 Memory v2 兼容行为。
     evolution: Option<Arc<EvolutionStore>>,
@@ -679,6 +672,7 @@ impl Agent {
             aux_provider: None,
             memory_v3: None,
             session_memory: None,
+            progress_root: None,
             evolution: None,
             claude_md: None,
             tool_cb: None,
@@ -1131,6 +1125,21 @@ impl Agent {
         self
     }
 
+    /// 压缩后从该目录读 `.wyj-code/progress.md` 并拼进摘要。通常是
+    /// [`crate::project::project_root`]。`None` 关闭注入（测试 / 子 Agent）。
+    pub fn with_progress_root(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.progress_root = root;
+        self
+    }
+
+    /// 压缩成功后把磁盘进度拼进最新摘要；文件空则清掉旧注入块。
+    fn splice_progress_after_compact(&self, session: &mut Session) {
+        let Some(root) = self.progress_root.as_deref() else {
+            return;
+        };
+        crate::progress::splice_into_latest_summary(&mut session.messages, root);
+    }
+
     pub fn memory_v3_ref(&self) -> Option<&Arc<MemoryV3Store>> {
         self.memory_v3.as_ref()
     }
@@ -1302,6 +1311,11 @@ impl Agent {
                 state.upsert(definition);
             }
         }
+    }
+
+    /// 当前 lazy 工具状态（Plan 模式动态注册 ExitPlanMode 后需要 `expose`）。
+    pub fn lazy_tool_state(&self) -> Option<&crate::tool_search::LazyToolState> {
+        self.lazy_tool_state.as_ref()
     }
 
     /// 仅暴露核心工具 schema；其他工具通过 ToolSearch 命中后**永久暴露**
@@ -2566,6 +2580,10 @@ impl Agent {
                                 ],
                             ));
                         }
+                        // 磁盘进度不经摘要改写：压缩后从 `.wyj-code/progress.md`
+                        // 重新注入，避免「摘要把进度洗成一句话」。必须在重算
+                        // audit 之前，否则 `/context` 会漏掉这块。
+                        self.splice_progress_after_compact(session);
                         if outcome.passes > 1 {
                             tracing::warn!(
                                 "上下文压缩连续跑了 {} 轮,最终估算 {} tokens (阈值 {}); \
@@ -2744,6 +2762,7 @@ impl Agent {
                                                 ("kept", &result.messages_kept.to_string()),
                                             ],
                                         ));
+                                        self.splice_progress_after_compact(session);
                                     }
                                     Err(compact_error) => {
                                         tracing::warn!(
@@ -4427,7 +4446,7 @@ impl Agent {
             snapshot
         };
 
-        crate::compact::compact_session_with_session_memory(
+        let result = crate::compact::compact_session_with_session_memory(
             session,
             route.provider.as_ref(),
             // 与自动压缩同源：配置值原样生效，只有端点实测能收紧。两处若用
@@ -4454,7 +4473,11 @@ impl Agent {
             self.compact_archive_cas(),
             self.session_memory.as_deref(),
         )
-        .await
+        .await;
+        if result.is_ok() {
+            self.splice_progress_after_compact(session);
+        }
+        result
     }
 }
 

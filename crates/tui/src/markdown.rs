@@ -2645,33 +2645,17 @@ mod tests {
     #[test]
     fn headings_have_no_bar_prefix_and_align_with_body() {
         let mut lines = vec![];
-        render_markdown(
-            &mut lines,
-            "# 一级\n\n## 二级\n\n### 三级\n\n正文段落",
-            80,
-        );
+        render_markdown(&mut lines, "# 一级\n\n## 二级\n\n### 三级\n\n正文段落", 80);
         let rendered = rendered_text(&lines);
         let joined = rendered.join("\n");
 
         for ch in ['█', '▌', '▎'] {
-            assert!(
-                !joined.contains(ch),
-                "标题不应再带装饰竖条 {ch}：{joined}"
-            );
+            assert!(!joined.contains(ch), "标题不应再带装饰竖条 {ch}：{joined}");
         }
 
-        let h1 = rendered
-            .iter()
-            .find(|l| l.contains("一级"))
-            .expect("H1");
-        let h2 = rendered
-            .iter()
-            .find(|l| l.contains("二级"))
-            .expect("H2");
-        let h3 = rendered
-            .iter()
-            .find(|l| l.contains("三级"))
-            .expect("H3");
+        let h1 = rendered.iter().find(|l| l.contains("一级")).expect("H1");
+        let h2 = rendered.iter().find(|l| l.contains("二级")).expect("H2");
+        let h3 = rendered.iter().find(|l| l.contains("三级")).expect("H3");
         let body = rendered
             .iter()
             .find(|l| l.contains("正文段落"))
@@ -2682,20 +2666,13 @@ mod tests {
                 line.starts_with("  "),
                 "{label} 应与正文同列（两空格缩进）：{line:?}"
             );
-            assert!(
-                !line[2..].starts_with(' '),
-                "{label} 不应多缩进：{line:?}"
-            );
+            assert!(!line[2..].starts_with(' '), "{label} 不应多缩进：{line:?}");
         }
 
         // H1 文本带 underline；H2/H3 只有 bold（无竖条 span）。
         let h1_line = lines
             .iter()
-            .find(|l| {
-                l.spans
-                    .iter()
-                    .any(|s| s.content.as_ref().contains("一级"))
-            })
+            .find(|l| l.spans.iter().any(|s| s.content.as_ref().contains("一级")))
             .expect("H1 line");
         let h1_text = h1_line
             .spans
@@ -2703,10 +2680,7 @@ mod tests {
             .find(|s| s.content.as_ref().contains("一级"))
             .expect("H1 text span");
         assert!(
-            h1_text
-                .style
-                .add_modifier
-                .contains(Modifier::UNDERLINED),
+            h1_text.style.add_modifier.contains(Modifier::UNDERLINED),
             "H1 应带 underline：{h1_text:?}"
         );
         assert!(

@@ -49,6 +49,47 @@ pub fn is_todo_collapsible(items: &[TodoItem]) -> bool {
         || (!items.is_empty() && items.iter().all(|t| t.status == TodoStatus::Completed))
 }
 
+/// 收口任务状态，让 UI「当前任务」与列表字段一致。
+///
+/// 1. **最多一个** `in_progress`：保留列表里**最后一个**，更早的改成 `completed`
+///    （新开一项 = 自动收口旧项）。
+/// 2. 若更靠后的项已经是 `completed`，而前面还有 `in_progress`，视为模型忘了
+///    收口旧项（典型：A 仍 in_progress，却把 B/C 标成完成）——把那些过期的
+///    `in_progress` 改成 `completed`。
+///
+/// 返回被自动改写的条数（供 tool_result 提示模型）。
+pub fn normalize_todo_statuses(items: &mut [TodoItem]) -> usize {
+    let mut changed = 0;
+
+    // 先处理「后面已完成、前面还挂着 in_progress」：从尾部找最后一个
+    // Completed 的下标，把它之前的 InProgress 全部收口。
+    let last_completed = items
+        .iter()
+        .rposition(|t| t.status == TodoStatus::Completed);
+    if let Some(last_c) = last_completed {
+        for item in items.iter_mut().take(last_c) {
+            if item.status == TodoStatus::InProgress {
+                item.status = TodoStatus::Completed;
+                changed += 1;
+            }
+        }
+    }
+
+    // 再保证最多一个 InProgress：从后往前，留下第一个碰到的，其余收口。
+    let mut kept = false;
+    for item in items.iter_mut().rev() {
+        if item.status == TodoStatus::InProgress {
+            if kept {
+                item.status = TodoStatus::Completed;
+                changed += 1;
+            } else {
+                kept = true;
+            }
+        }
+    }
+    changed
+}
+
 impl TodoStore {
     pub fn render_text(&self) -> String {
         if self.items.is_empty() {
@@ -150,7 +191,7 @@ impl Tool for TodoWriteTool {
 
     async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
-        let items: Vec<TodoItem> = inp
+        let mut items: Vec<TodoItem> = inp
             .todos
             .into_iter()
             .map(|t| TodoItem {
@@ -161,6 +202,8 @@ impl Tool for TodoWriteTool {
                 active_form: t.active_form,
             })
             .collect();
+
+        let auto_fixed = normalize_todo_statuses(&mut items);
 
         let count = items.len();
         let pending = items
@@ -181,10 +224,17 @@ impl Tool for TodoWriteTool {
             store.items = items;
         }
 
-        Ok(ToolResult::ok(format!(
+        let mut msg = format!(
             "任务列表已更新: {} 项（待处理 {pending}，进行中 {in_progress}，已完成 {done}）",
             count
-        )))
+        );
+        if auto_fixed > 0 {
+            msg.push_str(&format!(
+                "；已自动收口 {auto_fixed} 项过期的 in_progress（同时只允许一项进行中；\
+                 后面的项已 completed 时，前面残留的 in_progress 也会被收口）"
+            ));
+        }
+        Ok(ToolResult::ok(msg))
     }
 }
 
@@ -259,13 +309,14 @@ mod tests {
     async fn run_writes_items_and_returns_summary() {
         let store = empty_store();
         let tool = TodoWriteTool::new(store.clone());
+        // 正常顺序：已完成在前，进行中，待处理在后——收口启发式不得误伤。
         let r = tool
             .run(
                 json!({
                     "todos": [
-                        {"id":"a","content":"task-a","status":"pending"},
+                        {"id":"a","content":"task-a","status":"completed"},
                         {"id":"b","content":"task-b","status":"in_progress"},
-                        {"id":"c","content":"task-c","status":"completed"}
+                        {"id":"c","content":"task-c","status":"pending"}
                     ]
                 }),
                 &make_ctx(),
@@ -416,6 +467,53 @@ mod tests {
     #[test]
     fn is_todo_collapsible_false_for_empty() {
         assert!(!is_todo_collapsible(&[]));
+    }
+
+    #[test]
+    fn normalize_keeps_only_the_last_in_progress() {
+        let mut items = vec![
+            item("a", TodoStatus::InProgress),
+            item("b", TodoStatus::InProgress),
+            item("c", TodoStatus::Pending),
+        ];
+        assert_eq!(normalize_todo_statuses(&mut items), 1);
+        assert_eq!(items[0].status, TodoStatus::Completed);
+        assert_eq!(items[1].status, TodoStatus::InProgress);
+        assert_eq!(items[2].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn normalize_completes_stale_in_progress_before_later_completed() {
+        let mut items = vec![
+            item("a", TodoStatus::InProgress),
+            item("b", TodoStatus::Completed),
+            item("c", TodoStatus::Pending),
+        ];
+        assert_eq!(normalize_todo_statuses(&mut items), 1);
+        assert_eq!(items[0].status, TodoStatus::Completed);
+        assert_eq!(items[1].status, TodoStatus::Completed);
+        assert_eq!(items[2].status, TodoStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn run_auto_normalizes_multiple_in_progress() {
+        let store = empty_store();
+        let r = TodoWriteTool::new(store.clone())
+            .run(
+                json!({
+                    "todos": [
+                        {"id":"a","content":"task-a","status":"in_progress"},
+                        {"id":"b","content":"task-b","status":"in_progress"}
+                    ]
+                }),
+                &make_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(r.content.contains("自动收口"));
+        let g = store.lock().unwrap();
+        assert_eq!(g.items[0].status, TodoStatus::Completed);
+        assert_eq!(g.items[1].status, TodoStatus::InProgress);
     }
 
     #[test]

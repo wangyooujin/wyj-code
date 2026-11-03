@@ -571,6 +571,11 @@ pub struct ModelRuntimeCfg {
     /// **单调不减**（`LazyToolState::exposed`），本字段只管「刚用过的工具在
     /// 搜索结果里排得更前」。
     pub lazy_tools_sticky_turns: u64,
+    /// 额外常驻工具白名单（与核心 `ALWAYS_VISIBLE` 合并）。空 = 只用装配侧
+    /// 默认（按「已注册则常驻」追加 TodoWrite / computer 等）。非空时**替换**
+    /// 装配侧那份条件名单，便于把某几个工具强制折叠或强制常驻做消融。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lazy_core_tools: Vec<String>,
 }
 
 impl Default for ModelRuntimeCfg {
@@ -582,6 +587,7 @@ impl Default for ModelRuntimeCfg {
             lazy_tools_threshold: 12,
             lazy_tools_top_k: 8,
             lazy_tools_sticky_turns: 3,
+            lazy_core_tools: Vec::new(),
         }
     }
 }
@@ -739,35 +745,25 @@ impl Default for AgentCfg {
 pub struct ToolsCfg {
     /// 是否注册 `TodoWrite` 任务列表工具。
     ///
-    /// **默认开启**（v0.3.1 起由关闭改为开启）。这里保留一段反向实测，
-    /// 因为它是"为什么曾经关闭"的唯一记录，也是本开关存在的理由：
-    ///
-    /// - 曾对齐 Claude Code v2.1.233 / Codex CLI v0.152.0 的默认关闭口径
-    ///   （"新模型不需要书面任务列表也能自行跟踪多步工作"）。
-    /// - 本地 102 个历史会话实测支持那个口径：27 个会话用到 TodoWrite、共 132
-    ///   次调用，其中 **132 次（100%）独占一个完整 LLM 往返**，没有一次与真实
-    ///   工作工具同轮发出；**59% 的会话结束时 todo 未收尾**，与 arXiv:2604.12147
-    ///   的结论一致——"a subpar plan hurts performance even more than no plan at
-    ///   all"。
-    ///
-    /// 那么为什么还是改成了默认开启：上面那份实测只覆盖了**强模型的短任务**，
-    /// 它的结论形态是"对强模型是净成本"。而本项目要扛的复杂任务形态恰恰是
-    /// 另一个区间——跨十几个文件、几十轮工具调用、中途还会被自动压缩打断的长
-    /// 任务。那种任务里模型**没有外部状态锚点**：压缩一发生，它不知道自己走过
-    /// 哪条路，实测退化路径是重新 grep 刚 grep 过的目录、重新 read 刚读过的
-    /// 文件，把刚省下的上下文又吃回去。TodoWrite 是目前唯一一条能穿透压缩的
-    /// 显式进度载体——它每轮被重放进上下文，压缩后仍在。
-    ///
-    /// 代价是确定的：**每个用了 TodoWrite 的会话多花约 1 个 LLM 往返**
-    /// （132/27 ≈ 4.9 次调用，但按会话折算首次那一次不可省）。所以开关保留：
-    /// 简单任务为主、或用强模型跑短任务的场景，`todo_enabled = false` 仍然
-    /// 更划算。
+    /// **默认关闭**。实测 102 会话里 TodoWrite 100% 独占 LLM 往返、59% 未收尾，
+    /// 作为「穿透压缩的进度载体」性价比差。长程进度改由 [`Self::progress_enabled`]
+    /// 的 `.wyj-code/progress.md`（压缩时从磁盘重新注入，跨 session 保留）。
+    /// 需要会话内 UI 任务面板时显式 `todo_enabled = true`。
     pub todo_enabled: bool,
+    /// 是否注册 `Progress` 工具（读写 `<git-root>/.wyj-code/progress.md`）。
+    ///
+    /// **默认开启**。文件在磁盘上，压缩不会改写它；每次压缩后框架把现行内容
+    /// 作为独立消息重新注入，避免「摘要把进度洗成一句话 → 模型重搜刚搜过的
+    /// 目录」。短任务可以 `progress_enabled = false` 省 schema。
+    pub progress_enabled: bool,
 }
 
 impl Default for ToolsCfg {
     fn default() -> Self {
-        Self { todo_enabled: true }
+        Self {
+            todo_enabled: false,
+            progress_enabled: true,
+        }
     }
 }
 
@@ -2738,26 +2734,29 @@ context_window = 200000
     }
 
     #[test]
-    fn todo_is_enabled_by_default_and_opt_out_works() {
-        // 默认开启（v0.3.1）：复杂长任务里 TodoWrite 是唯一能穿透自动压缩的
-        // 显式进度锚点。代价是每个用到的会话多约 1 个 LLM 往返，所以开关保留。
+    fn todo_is_off_by_default_and_progress_is_on() {
+        // 长程进度改由 Progress / progress.md；TodoWrite 默认关以免独占往返。
         let cfg: Config = toml::from_str("").unwrap();
-        assert!(cfg.tools.todo_enabled);
-
-        // 用户显式关闭时（简单任务 / 强模型短任务，对应 CLAUDE_CODE_ENABLE_TODO_TOOLS=0）
-        let cfg: Config = toml::from_str("[tools]\ntodo_enabled = false\n").unwrap();
         assert!(!cfg.tools.todo_enabled);
+        assert!(cfg.tools.progress_enabled);
+
+        let cfg: Config = toml::from_str("[tools]\ntodo_enabled = true\n").unwrap();
+        assert!(cfg.tools.todo_enabled);
+        assert!(cfg.tools.progress_enabled);
+
+        let cfg: Config = toml::from_str("[tools]\nprogress_enabled = false\n").unwrap();
+        assert!(!cfg.tools.progress_enabled);
     }
 
     #[test]
-    fn todo_opt_out_survives_a_partial_tools_block() {
+    fn todo_opt_in_survives_a_partial_tools_block() {
         // 老配置里已有 [tools] 但没写 todo_enabled：走结构体级 serde(default)，
-        // 取 ToolsCfg::default() 的 true。显式写 false 的必须仍是 false——
-        // 否则用户关不掉，只能去删整个 [tools] 块。
+        // 取 ToolsCfg::default() 的 false。显式写 true 的必须仍是 true。
         let cfg: Config = toml::from_str("[tools]\n").unwrap();
-        assert!(cfg.tools.todo_enabled);
-        let cfg: Config = toml::from_str("[tools]\ntodo_enabled = false\n").unwrap();
         assert!(!cfg.tools.todo_enabled);
+        assert!(cfg.tools.progress_enabled);
+        let cfg: Config = toml::from_str("[tools]\ntodo_enabled = true\n").unwrap();
+        assert!(cfg.tools.todo_enabled);
     }
 
     #[test]

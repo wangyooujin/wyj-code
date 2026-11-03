@@ -24,13 +24,16 @@ use std::sync::{Arc, Mutex};
 
 use wyj_core::{Agent, AgentRoute};
 use wyj_tools::{
-    AskQuestionTool, MemoryTool, SubAgentTool, TodoWriteTool, ToolRegistry, WebSearchTool,
+    AskQuestionTool, MemoryTool, ProgressTool, SubAgentTool, TodoWriteTool, ToolRegistry,
+    WebSearchTool,
 };
 
 /// 装配工具注册表所需的、跨首建/重建保持不变的依赖。
 pub struct RegistryDeps<'a> {
     /// 配置只借用：调用点持有的 `cfg` 生命周期覆盖整个装配过程。
     pub cfg: &'a wyj_config::Config,
+    /// 工作目录：Progress 工具解析 `<git-root>/.wyj-code/progress.md`。
+    pub cwd: &'a Path,
     pub code_index: Arc<dyn wyj_core::CodeIndex>,
     pub memory_v3: Option<Arc<wyj_core::MemoryV3Store>>,
     /// 跨会话原始 transcript 检索入口。缺失时 Memory 工具的 `search_sessions`
@@ -90,6 +93,11 @@ pub fn build_tool_registry(
     // 模型目录里根本看不到，也就不会浪费 LLM 往返去更新它。
     if cfg.tools.todo_enabled {
         registry.register_arc(Arc::new(TodoWriteTool::new(deps.todo_store.clone())));
+    }
+    // 长程进度文件：默认开。路径钉在项目根，压缩后由 Agent 重新注入。
+    if cfg.tools.progress_enabled {
+        let root = wyj_core::project_root(deps.cwd);
+        registry.register_arc(Arc::new(ProgressTool::new(root)));
     }
     registry.register_arc(Arc::new(AskQuestionTool::new()));
 
@@ -169,6 +177,9 @@ pub struct SharedAgentConfig<'a> {
     /// 若拿不到同一个文档，压缩就会在换模型后突然退回全量摘要——用户看到
     /// 的是「换了模型成本就变了」，而真实原因是装配漏了一项。
     pub session_memory: Option<Arc<wyj_core::session_memory::SessionMemory>>,
+    /// 压缩后注入 `.wyj-code/progress.md` 的项目根。跟 `progress_enabled` 对齐：
+    /// 工具没注册时也不注入，避免摘要里出现模型调不了的路径。
+    pub progress_root: Option<PathBuf>,
 }
 
 impl SharedAgentConfig<'_> {
@@ -204,6 +215,7 @@ impl SharedAgentConfig<'_> {
         }
         agent = agent.with_aux_usage(self.aux_usage);
         agent = agent.with_session_memory(self.session_memory.clone());
+        agent = agent.with_progress_root(self.progress_root.clone());
         agent.with_capability_cache(Some(self.capability_cache))
     }
 }
@@ -271,6 +283,18 @@ impl AgentCoreConfig {
     }
 }
 
+/// 条件常驻工具：只有注册表里**确实有**才进 `core_tools`，避免未启用的
+/// computer / TodoWrite 占每轮 schema。Web* / AskQuestion / Memory 故意不在
+/// 这里——走 ToolSearch，把固定预填压到编码主路径。
+const CONDITIONAL_CORE_TOOLS: &[&str] = &[
+    "TodoWrite",
+    "Progress",
+    "ExitPlanMode",
+    "window_capture",
+    "app_computer",
+    "computer",
+];
+
 /// 把注册表里的工具定义装进 Agent，并按模型能力决定是否折叠 lazy schema。
 ///
 /// lazy 工具名单写在这里而不是两个调用点各写一份：它是「模型目录」的一部分，
@@ -287,10 +311,22 @@ pub fn attach_tools(
         }
     }
     if enable_lazy {
-        agent.enable_lazy_tools(
-            ["Read", "Glob", "Grep", "AskQuestion", "Memory"]
+        let core_tools = if cfg.model_runtime.lazy_core_tools.is_empty() {
+            let mut core: Vec<String> = ["Read", "Glob", "Grep"]
                 .into_iter()
-                .map(str::to_string),
+                .map(str::to_string)
+                .collect();
+            for name in CONDITIONAL_CORE_TOOLS {
+                if registry.get(name).is_some() {
+                    core.push((*name).to_string());
+                }
+            }
+            core
+        } else {
+            cfg.model_runtime.lazy_core_tools.clone()
+        };
+        agent.enable_lazy_tools(
+            core_tools,
             cfg.model_runtime.lazy_tools_threshold,
             cfg.model_runtime.lazy_tools_top_k,
             cfg.model_runtime.lazy_tools_sticky_turns,

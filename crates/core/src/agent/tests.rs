@@ -2466,8 +2466,11 @@ fn lazy_tools_never_hide_the_core_execution_surface() {
         "BashOutput",
         "Edit",
         "Write",
-        "Memory",
+        "CodeSearch",
+        "ContextRecall",
         "Agent",
+        "Progress",
+        "Memory",
         "ExitPlanMode",
         "window_capture",
         "app_computer",
@@ -2477,6 +2480,8 @@ fn lazy_tools_never_hide_the_core_execution_surface() {
         agent.register_tool(Arc::new(NamedTool(name)));
     }
 
+    // ALWAYS_VISIBLE 合并进 core；Memory / ExitPlanMode / computer 需装配侧
+    // 显式列入 core_tools 才会常驻——这里只验证硬常驻集合。
     assert!(agent.enable_lazy_tools(["Read".to_string()], 0, 8, 3));
     let state = agent.lazy_tool_state.as_ref().unwrap();
     for name in [
@@ -2485,18 +2490,20 @@ fn lazy_tools_never_hide_the_core_execution_surface() {
         "BashOutput",
         "Edit",
         "Write",
-        "Memory",
+        "CodeSearch",
+        "ContextRecall",
         "Agent",
-        "ExitPlanMode",
-        "window_capture",
-        "app_computer",
-        "computer",
+        "Progress",
     ] {
         assert!(
             state.visible(name),
             "核心工具 {name} 不应被 lazy schema 隐藏"
         );
     }
+    assert!(
+        !state.visible("Memory"),
+        "Memory 应走 ToolSearch，除非装配侧显式列入 core"
+    );
     assert!(!state.visible("mcp__optional__lookup"));
 }
 

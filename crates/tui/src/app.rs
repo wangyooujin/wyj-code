@@ -2248,6 +2248,13 @@ pub struct AppState {
     pub history_draft: Option<String>,
     /// 当前任务列表快照（TodoWrite 更新），用于底部固定面板渲染
     pub current_todos: Option<Vec<TodoItem>>,
+    /// 与 Agent 共用的 TodoStore。`TurnDone` 自动收口、以及 TodoUpdate
+    /// `try_send` 丢包时从这里回读，避免「面板已完成、store 仍 in_progress」。
+    pub todo_store: Option<Arc<std::sync::Mutex<TodoStore>>>,
+    /// 标题栏 / 默认选中优先展示的任务 id（最近一次 TodoWrite 收口后的
+    /// in_progress，或最近一次工具活动归因到的 in_progress）。列表顺序上的
+    /// 「第一个 InProgress」在模型漏更新时会钉死旧项。
+    pub focused_todo_id: Option<String>,
     /// 任务面板是否处于展开态（仅在 is_todo_collapsible 为真时生效）
     pub todo_panel_expanded: bool,
     /// 任务列表当前选中项（按 id 而非 index，避免列表变动时错位）
@@ -2603,6 +2610,8 @@ impl AppState {
             history_idx: None,
             history_draft: None,
             current_todos: None,
+            todo_store: None,
+            focused_todo_id: None,
             todo_panel_expanded: false,
             selected_todo_id: None,
             todo_detail_open: false,
@@ -2753,6 +2762,7 @@ impl AppState {
     fn begin_turn_lifecycle(&mut self, clear_todos: bool) {
         if clear_todos {
             self.current_todos = None;
+            self.focused_todo_id = None;
             self.todo_panel_expanded = false;
             self.selected_todo_id = None;
             self.todo_detail_open = false;
@@ -2804,6 +2814,7 @@ impl AppState {
         self.history_idx = None;
         self.history_draft = None;
         self.current_todos = None;
+        self.focused_todo_id = None;
         self.todo_panel_expanded = false;
         self.selected_todo_id = None;
         self.todo_detail_open = false;
@@ -3420,6 +3431,12 @@ fn plan_turn_agent(base: &Arc<Agent>, mode: &AgentMode) -> Arc<Agent> {
     }
     let mut a = (**base).clone();
     a.register_tool(Arc::new(ExitPlanModeTool));
+    // ExitPlanMode 不在全局 ALWAYS_VISIBLE 里（非 Plan 会话不该付这份 schema）。
+    // register_tool 只 upsert catalog，不自动 expose——这里必须显式常驻，
+    // 否则 lazy 折叠会让模型「写完计划却调不出退出工具」。
+    if let Some(state) = a.lazy_tool_state() {
+        state.expose("ExitPlanMode");
+    }
     let a = a.append_system(wyj_core::prompts::PLAN_TURN);
     Arc::new(a)
 }
@@ -3453,6 +3470,9 @@ fn wire_tool_callback(
                 elapsed_secs,
                 output,
             } => {
+                // TodoUpdate 与 ToolEnd 都发：前者让 UI 尽快刷新；后者在
+                // apply 时若前者 try_send 丢包，会从 todo_store 再读一次。
+                // 两条路径都成功时 apply 幂等（同一份 normalize 后的 items）。
                 if name == "TodoWrite" && !is_error {
                     if let Ok(store) = todo_store.lock() {
                         let items = store.items.clone();
@@ -5181,6 +5201,7 @@ async fn tui_main(
         config,
         hub.clone(),
     );
+    state.todo_store = Some(todo_store.clone());
     state.session_profile_override = session_profile_override;
     if needs_api_key_onboarding {
         // 首次启动缺 API Key 时,默认聚焦 api_key 字段而非 entry header,
@@ -12004,20 +12025,63 @@ mod todo_stats_tests {
     }
 
     #[test]
-    fn usage_delta_splits_evenly_across_multiple_in_progress_tasks() {
+    fn usage_delta_attributes_to_the_single_normalized_in_progress() {
+        // 多 in_progress 会被 normalize 收口到最后一个；用量只记在那一项上。
         let mut state = make_state();
         state.apply_agent_event(AgentEvent::TodoUpdate(vec![
             todo("a", TodoStatus::InProgress),
             todo("b", TodoStatus::InProgress),
         ]));
+        assert_eq!(
+            state.current_todos.as_ref().unwrap()[0].status,
+            TodoStatus::Completed
+        );
+        assert_eq!(
+            state.current_todos.as_ref().unwrap()[1].status,
+            TodoStatus::InProgress
+        );
+        assert_eq!(state.focused_todo_id.as_deref(), Some("b"));
         state.apply_agent_event(AgentEvent::UsageDelta {
             input_tokens: 5,
             output_tokens: 5,
         });
-        let a = state.todo_stats.get("a").unwrap();
         let b = state.todo_stats.get("b").unwrap();
-        assert_eq!(a.input_tokens + b.input_tokens, 5);
-        assert_eq!(a.output_tokens + b.output_tokens, 5);
+        assert_eq!(b.input_tokens, 5);
+        assert_eq!(b.output_tokens, 5);
+        assert!(!state.todo_stats.contains_key("a"));
+    }
+
+    #[test]
+    fn todo_update_completes_stale_in_progress_before_later_completed() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("a", TodoStatus::InProgress),
+            todo("b", TodoStatus::Completed),
+            todo("c", TodoStatus::Pending),
+        ]));
+        let items = state.current_todos.as_ref().unwrap();
+        assert_eq!(items[0].status, TodoStatus::Completed);
+        assert_eq!(items[1].status, TodoStatus::Completed);
+        assert_eq!(items[2].status, TodoStatus::Pending);
+        assert!(state.focused_todo_id.is_none());
+    }
+
+    #[test]
+    fn turn_done_writes_completed_status_back_to_todo_store() {
+        let store = Arc::new(std::sync::Mutex::new(TodoStore {
+            items: vec![todo("c", TodoStatus::InProgress)],
+        }));
+        let mut state = make_state();
+        state.todo_store = Some(store.clone());
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("a", TodoStatus::Completed),
+            todo("b", TodoStatus::Completed),
+            todo("c", TodoStatus::InProgress),
+        ]));
+        state.apply_agent_event(AgentEvent::TurnDone { truncated: false });
+        let g = store.lock().unwrap();
+        assert!(g.items.iter().all(|t| t.status == TodoStatus::Completed));
+        assert_eq!(g.items.len(), 3);
     }
 
     #[test]

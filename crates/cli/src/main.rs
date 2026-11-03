@@ -2312,11 +2312,9 @@ async fn main() -> Result<()> {
     };
 
     let todo_store = Arc::new(Mutex::new(TodoStore::default()));
-    // 任务列表默认不注册（对齐 Claude Code v2.1.233 / Codex v0.152.0）。未注册的
-    // 工具不产生 schema，模型目录里根本看不到，模型也就不会浪费 LLM 往返去更新它。
-    // todo_store 仍无条件构造并向下传递：TUI 的 TodoUpdate 事件链路要读它，
-    // 且开启开关后的 rebuild_fn 复用同一个 store。
-    // 注册动作在下面 `build_tool_registry` 里按 `[tools].todo_enabled` 门控。
+    // TodoWrite 默认不注册（`[tools].todo_enabled = false`）；长程进度改走 Progress。
+    // todo_store 仍无条件构造：TUI 的 TodoUpdate 链路与显式开启后的 rebuild 要读它。
+    // 注册在下面 `build_tool_registry` 里按开关门控。
 
     // computer-use 是否启用：注册动作同样在下面统一做，这里只需要结果决定是否
     // 追加 COMPUTER_USE_HINT（教模型用 Bash 启动应用）。先空跑一次注册函数拿到
@@ -2418,6 +2416,7 @@ async fn main() -> Result<()> {
     };
     let registry_deps = assembly::RegistryDeps {
         cfg: &cfg,
+        cwd: &cwd,
         code_index: code_index.clone(),
         memory_v3: memory_v3_store.clone(),
         sessions: session_store_arc.clone(),
@@ -2614,6 +2613,12 @@ async fn main() -> Result<()> {
         system_prompt_extra.push_str("\n\n");
         system_prompt_extra.push_str(extra);
     }
+    if cfg.tools.progress_enabled {
+        let extra = wyj_core::prompts::PROGRESS_HINT;
+        agent = agent.append_system(extra);
+        system_prompt_extra.push_str("\n\n");
+        system_prompt_extra.push_str(extra);
+    }
 
     // Active plugin output style is a model-facing instruction, independent of UI locale. Keep
     // it out of `system_prompt_extra`: rebuild_fn installs it directly so scoped/headless model
@@ -2664,6 +2669,10 @@ async fn main() -> Result<()> {
         plugin_output_style: None,
         aux_usage: Some(aux_usage.clone()),
         session_memory: session_memory.clone(),
+        progress_root: cfg
+            .tools
+            .progress_enabled
+            .then(|| wyj_core::project_root(&cwd)),
     }
     .apply(agent);
 
@@ -2947,6 +2956,10 @@ async fn main() -> Result<()> {
             plugin_output_style: plugin_output_style_for_rebuild.clone(),
             aux_usage: Some(aux_usage_for_rebuild.clone()),
             session_memory: session_memory_for_rebuild.clone(),
+            progress_root: cfg
+                .tools
+                .progress_enabled
+                .then(|| wyj_core::project_root(&cwd_for_rebuild)),
         }
         .apply(new_agent);
         // 重建时重新装配辅助 provider：`/model` 面板改的是**分组配置**，
@@ -2977,6 +2990,7 @@ async fn main() -> Result<()> {
         let reg = assembly::build_tool_registry(
             &assembly::RegistryDeps {
                 cfg,
+                cwd: &cwd_for_rebuild,
                 code_index: code_index_for_rebuild.clone(),
                 memory_v3: memory_v3_for_rebuild.clone(),
                 sessions: store_for_rebuild.clone(),
@@ -4880,6 +4894,7 @@ mod cli_tests {
 
         let deps = assembly::RegistryDeps {
             cfg: cfg.as_ref(),
+            cwd: dir.path(),
             code_index: Arc::new(
                 wyj_core::ProjectCodeIndex::new(dir.path(), dir.path().join(".wyj-index")).unwrap(),
             ),
