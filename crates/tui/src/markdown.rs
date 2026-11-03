@@ -1123,7 +1123,12 @@ impl Ctx {
                 s.add_modifier(Modifier::BOLD)
             } else {
                 match lvl {
-                    1 => s.fg(Theme::claude_color()).add_modifier(Modifier::BOLD),
+                    // H1 加 underline：去掉竖条前缀后，粗体+品牌色还不够和正文
+                    // 拉开扫读层级；Claude Code 对 H1 也是 bold(+italic)+underline。
+                    1 => s
+                        .fg(Theme::claude_color())
+                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::UNDERLINED),
                     2 => s.fg(Theme::text_color()).add_modifier(Modifier::BOLD),
                     // h3–h6 是「小标题」，比正文弱一档而不是弱两档：
                     // 旧实现用 `inactive`（#999）在暗底上与正文差距过大，
@@ -1282,7 +1287,7 @@ impl Ctx {
             if state.leader > 0 {
                 head.push(Span::raw(" ".repeat(state.leader)));
                 cont.push(Span::raw(" ".repeat(state.leader)));
-            } else if self.heading.is_none() {
+            } else {
                 head.push(Span::raw("  "));
                 cont.push(Span::raw("  "));
             }
@@ -1299,8 +1304,10 @@ impl Ctx {
         } else if self.def_title {
             head.push(Span::raw("  "));
             cont.push(Span::raw("  "));
-        } else if self.heading.is_none() && self.blockquote == 0 && !self.thinking {
-            // 普通段落(无 list 包裹)加 2 空格与 User 消息视觉对齐。
+        } else if self.blockquote == 0 && !self.thinking {
+            // 普通段落与标题(无 list 包裹)加 2 空格与 User 消息视觉对齐。
+            // 标题也曾靠 `█ `/`▌ `/`▎ ` 占两列把文字推到同列；去掉竖条后
+            // 必须显式补缩进，否则标题顶格、正文缩进，扫读列抖动。
             //
             // thinking 模式不加：那一层缩进由调用方统一补（见
             // `render_thinking_block`），两处都加就是 6 格，比列表 bullet
@@ -1680,35 +1687,14 @@ fn render_markdown_inner(
         match event {
             // ─── 标题 ───────────────────────────────────────────────────────
             Event::Start(Tag::Heading { level, .. }) => {
+                // 标题不加装饰竖条 / 字面 `##`：终端层级靠 bold + 颜色 +（H1）
+                // underline（Claude Code / Glow / marked-terminal 同款）。
                 c.pending_blank = true;
                 c.heading = Some(match level {
                     HeadingLevel::H1 => 1,
                     HeadingLevel::H2 => 2,
                     _ => 3,
                 });
-                let (prefix, prefix_style) = match level {
-                    HeadingLevel::H1 => ("█ ", Theme::assistant_prefix()),
-                    HeadingLevel::H2 => (
-                        "▌ ",
-                        Style::default()
-                            .fg(Theme::text_color())
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    // h3–h6 共用一个前缀：终端没有字号可用，层级只能靠缩进表现。
-                    // 逐级加宽前缀（`▎` × n）会让深层标题顶到第 6 列，比标题本身
-                    // 还要显眼，深层小标题在长文档里本来就该最不显眼。
-                    //
-                    // 前缀色与正文色一致：旧实现所有标题前缀都用品牌橙，于是
-                    // 「▎ 小标题」的橙色前缀比它自己的灰色正文还亮，层级读起来
-                    // 正好反了。
-                    _ => (
-                        "▎ ",
-                        Style::default()
-                            .fg(Theme::text_dim_color())
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                };
-                c.cur.push((prefix.to_string(), prefix_style, false));
             }
             Event::End(TagEnd::Heading(_)) => {
                 c.flush(lines);
@@ -2652,6 +2638,81 @@ mod tests {
     fn highlight_code_line_does_not_panic_on_trailing_escape_backslash() {
         let seg = "            f\"[{i}] 来源:{it.get('source','')} | 时间:{pub}\\";
         let _ = highlight_code_line(seg, "python");
+    }
+
+    /// 标题不用装饰竖条：层级只靠样式（bold / 颜色 / H1 underline）。
+    /// 去掉 `█ `/`▌ `/`▎ ` 后标题与正文同列（顶层 2 空格），避免扫读列抖动。
+    #[test]
+    fn headings_have_no_bar_prefix_and_align_with_body() {
+        let mut lines = vec![];
+        render_markdown(
+            &mut lines,
+            "# 一级\n\n## 二级\n\n### 三级\n\n正文段落",
+            80,
+        );
+        let rendered = rendered_text(&lines);
+        let joined = rendered.join("\n");
+
+        for ch in ['█', '▌', '▎'] {
+            assert!(
+                !joined.contains(ch),
+                "标题不应再带装饰竖条 {ch}：{joined}"
+            );
+        }
+
+        let h1 = rendered
+            .iter()
+            .find(|l| l.contains("一级"))
+            .expect("H1");
+        let h2 = rendered
+            .iter()
+            .find(|l| l.contains("二级"))
+            .expect("H2");
+        let h3 = rendered
+            .iter()
+            .find(|l| l.contains("三级"))
+            .expect("H3");
+        let body = rendered
+            .iter()
+            .find(|l| l.contains("正文段落"))
+            .expect("正文");
+
+        for (label, line) in [("H1", h1), ("H2", h2), ("H3", h3), ("正文", body)] {
+            assert!(
+                line.starts_with("  "),
+                "{label} 应与正文同列（两空格缩进）：{line:?}"
+            );
+            assert!(
+                !line[2..].starts_with(' '),
+                "{label} 不应多缩进：{line:?}"
+            );
+        }
+
+        // H1 文本带 underline；H2/H3 只有 bold（无竖条 span）。
+        let h1_line = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.content.as_ref().contains("一级"))
+            })
+            .expect("H1 line");
+        let h1_text = h1_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().contains("一级"))
+            .expect("H1 text span");
+        assert!(
+            h1_text
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED),
+            "H1 应带 underline：{h1_text:?}"
+        );
+        assert!(
+            h1_text.style.add_modifier.contains(Modifier::BOLD),
+            "H1 应加粗：{h1_text:?}"
+        );
     }
 
     /// 块级元素之间**留一行空**。
