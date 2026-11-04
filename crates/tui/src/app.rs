@@ -2695,16 +2695,12 @@ impl AppState {
 
     /// 一轮新对话开始时清理「按轮次」的生命周期状态。
     ///
-    /// 目前只管 TodoWrite 面板。任务是**某一轮对话**的产物：上一轮的任务列表
-    /// 对新一轮没有参考价值，留着只会误导 —— 尤其上一轮全部完成后，面板会以
-    /// 折叠态一直挂在聊天流里，直到用户发新消息（`TodoUpdate` 不会再来，
-    /// 于是永远不消失）。
+    /// 任务面板通常是**某一轮对话**的产物：上一轮全部完成后留着只会误导。
+    /// 但若磁盘仍有 `.wyj-code/progress.md`（TodoWrite 双写的持久清单），
+    /// 跨轮次保留面板，避免长任务进度凭空消失。
     ///
     /// 粒度上刻意区别于 `reset_for_new_session`：那是「新会话 / resume /
     /// /clear」用的整块重置，这里只管每轮都会作废的那部分。
-    ///
-    /// 下一轮若确实需要任务板，模型重新调一次 TodoWrite 就会重新出现
-    /// （`AgentEvent::TodoUpdate` 负责填 `current_todos`）。
     /// 标记「有一个后台长任务在跑」（`/compact` 的 LLM 往返、
     /// `needs_background` 的 slash 命令、`/checkpoint` / `/rewind` / `/branch`
     /// 的工作区快照、`/evolve` 的候选激活）。
@@ -2761,15 +2757,18 @@ impl AppState {
 
     fn begin_turn_lifecycle(&mut self, clear_todos: bool) {
         if clear_todos {
-            self.current_todos = None;
-            self.focused_todo_id = None;
-            self.todo_panel_expanded = false;
-            self.selected_todo_id = None;
-            self.todo_detail_open = false;
-            self.todo_detail_scroll = 0;
-            self.todo_detail_max_scroll = 0;
-            self.todo_stats.clear();
-            self.todo_execution_logs.clear();
+            // 磁盘还有 progress.md → 长任务续跑，保留面板；否则清掉会话内清单。
+            if !self.has_progress_on_disk() {
+                self.current_todos = None;
+                self.focused_todo_id = None;
+                self.todo_panel_expanded = false;
+                self.selected_todo_id = None;
+                self.todo_detail_open = false;
+                self.todo_detail_scroll = 0;
+                self.todo_detail_max_scroll = 0;
+                self.todo_stats.clear();
+                self.todo_execution_logs.clear();
+            }
             // 用户主动发了消息 = 恢复对自动唤醒的信任（此前可能是 ESC 打断后暂停的）
             self.auto_wake_paused = false;
             // 用户自己开口了，「续跑上一轮」这件事就不再成立：不清的话，那条
@@ -2883,6 +2882,8 @@ impl AppState {
         // 心跳基准随会话一起重置：新会话第一帧不能继承上一段的静默时长，
         // 否则空闲很久后立刻发消息会被看门狗当帧判死。
         self.last_turn_activity = Instant::now();
+        // Progress 跨会话保留：清 UI 后再从磁盘回填，避免 /clear 后长任务进度消失。
+        self.load_progress_panel_from_disk();
     }
 
     pub fn ensure_message_ids(&mut self) {
@@ -3442,7 +3443,7 @@ fn plan_turn_agent(base: &Arc<Agent>, mode: &AgentMode) -> Arc<Agent> {
 }
 
 /// 给重建出的 Agent 挂上工具事件回调（ToolStart/ToolEnd → AgentEvent，
-/// TodoWrite 额外广播快照），/model 热切换与设置面板保存后重建 Agent 共用。
+/// TodoWrite 额外广播任务面板快照），/model 热切换与设置面板保存后重建 Agent 共用。
 fn wire_tool_callback(
     agent: Agent,
     tool_tx: mpsc::Sender<AgentEvent>,
@@ -3472,7 +3473,6 @@ fn wire_tool_callback(
             } => {
                 // TodoUpdate 与 ToolEnd 都发：前者让 UI 尽快刷新；后者在
                 // apply 时若前者 try_send 丢包，会从 todo_store 再读一次。
-                // 两条路径都成功时 apply 幂等（同一份 normalize 后的 items）。
                 if name == "TodoWrite" && !is_error {
                     if let Ok(store) = todo_store.lock() {
                         let items = store.items.clone();
@@ -5274,9 +5274,12 @@ async fn tui_main(
         ProjectSkillsGate::resolve(&cwd),
     );
 
-    // 工具回调：ToolStart/ToolEnd/Usage → AgentEvent，同时拦截 TodoWrite 读取快照
-    // （title_cb 也在 wire_tool_callback 内部设置，确保 /model 重建后仍生效）
+    // 工具回调：ToolStart/ToolEnd/Usage → AgentEvent，同时拦截 TodoWrite /
+    // Progress(set) 读取面板快照（title_cb 也在 wire_tool_callback 内部设置，
+    // 确保 /model 重建后仍生效）
     let agent = wire_tool_callback(agent, agent_tx.clone(), todo_store.clone());
+    // 启动时若磁盘已有 progress.md，直接填任务面板（跨会话续跑可见）
+    state.load_progress_panel_from_disk();
 
     // 用 RwLock 包装 agent，支持 /model 热切换
     let shared_agent = Arc::new(std::sync::RwLock::new(Arc::new(agent)));
@@ -12405,6 +12408,58 @@ mod todo_stats_tests {
 
         assert_eq!(todo_seq, 1);
         assert_eq!(read_seq, 2, "TodoWrite 必须占用 seq，Read 不能与之撞号");
+    }
+
+    // ── TodoWrite 双写 progress.md / 跨轮次保留 ──────────────────────────
+
+    #[test]
+    fn turn_done_syncs_todos_to_progress_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_state();
+        state.cwd = dir.path().to_path_buf();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![todo(
+            "p1",
+            TodoStatus::InProgress,
+        )]));
+        state.apply_agent_event(AgentEvent::TurnDone { truncated: false });
+        let body = wyj_core::progress::read_progress(&wyj_core::project_root(dir.path()))
+            .expect("TurnDone 应收口后写回 progress.md");
+        assert!(body.contains("[x]"), "in_progress 应收口成 completed: {body}");
+    }
+
+    #[test]
+    fn begin_new_turn_keeps_panel_when_progress_md_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_state();
+        state.cwd = dir.path().to_path_buf();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![todo(
+            "p1",
+            TodoStatus::InProgress,
+        )]));
+        state.sync_todos_to_store();
+        assert!(state.has_progress_on_disk());
+        state.begin_new_turn();
+        assert!(
+            state.current_todos.is_some(),
+            "磁盘有 progress.md 时 begin_new_turn 必须保留面板"
+        );
+    }
+
+    #[test]
+    fn load_progress_panel_from_disk_seeds_current_todos() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = wyj_core::project_root(dir.path());
+        wyj_core::progress::write_progress(
+            &root,
+            "- [x] done\n- [~] active\n- [ ] next\n",
+        )
+        .unwrap();
+        let mut state = make_state();
+        state.cwd = dir.path().to_path_buf();
+        state.load_progress_panel_from_disk();
+        let items = state.current_todos.as_ref().expect("应从磁盘灌进面板");
+        assert_eq!(items.len(), 3);
+        assert_eq!(state.focused_todo_id.as_deref(), Some("p2"));
     }
 
     // ── 新一轮对话清空任务板 ─────────────────────────────────────────────

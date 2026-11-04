@@ -161,11 +161,12 @@ fn estimate_tool_schema_tokens(tools: &[ToolDefinition]) -> u32 {
 /// 不会产生 schema，因此同一列表也可安全用于只读子 Agent 和 Plan 模式。
 /// 无论 lazy 阈值如何，这些 schema 都必须常驻。
 ///
-/// 名单刻意压到「编码主路径」：Read/搜索/编辑/Shell/Agent/召回/进度。Web*、
-/// AskQuestion、Memory、ExitPlanMode、TodoWrite、computer 三件套**不**在这里——
+/// 名单刻意压到「编码主路径」：Read/搜索/编辑/Shell/Agent/召回/任务列表。Web*、
+/// AskQuestion、Memory、ExitPlanMode、computer 三件套**不**在这里——
 /// 装配侧在「确实注册了」时把它们追加进 `enable_lazy_tools` 的 `core_tools`，
 /// 未注册就不占每轮预填。ContextRecall 例外：清理把输出外置后它是唯一召回
-/// 入口，折叠等于让清理不可逆。
+/// 入口，折叠等于让清理不可逆。TodoWrite 默认开且常驻：未注册时 catalog
+/// 里没有它，列在这里无副作用。
 const ALWAYS_VISIBLE_TOOL_SCHEMAS: &[&str] = &[
     "Read",
     "Glob",
@@ -178,9 +179,7 @@ const ALWAYS_VISIBLE_TOOL_SCHEMAS: &[&str] = &[
     "Write",
     "ContextRecall",
     "Agent",
-    // 长程任务的磁盘进度载体（见 `Progress` 工具 / `.wyj-code/progress.md`）。
-    // 未注册时 catalog 里没有它，列在这里无副作用。
-    "Progress",
+    "TodoWrite",
 ];
 
 /// 工具执行事件（供回调使用，例如 headless 格式化输出或 TUI 事件推送）

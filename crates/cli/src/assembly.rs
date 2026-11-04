@@ -24,15 +24,14 @@ use std::sync::{Arc, Mutex};
 
 use wyj_core::{Agent, AgentRoute};
 use wyj_tools::{
-    AskQuestionTool, MemoryTool, ProgressTool, SubAgentTool, TodoWriteTool, ToolRegistry,
-    WebSearchTool,
+    AskQuestionTool, MemoryTool, SubAgentTool, TodoWriteTool, ToolRegistry, WebSearchTool,
 };
 
 /// 装配工具注册表所需的、跨首建/重建保持不变的依赖。
 pub struct RegistryDeps<'a> {
     /// 配置只借用：调用点持有的 `cfg` 生命周期覆盖整个装配过程。
     pub cfg: &'a wyj_config::Config,
-    /// 工作目录：Progress 工具解析 `<git-root>/.wyj-code/progress.md`。
+    /// 工作目录：TodoWrite 落盘 `<git-root>/.wyj-code/progress.md`。
     pub cwd: &'a Path,
     pub code_index: Arc<dyn wyj_core::CodeIndex>,
     pub memory_v3: Option<Arc<wyj_core::MemoryV3Store>>,
@@ -91,13 +90,13 @@ pub fn build_tool_registry(
 
     // 任务列表由 `[tools].todo_enabled` 门控：未注册的工具不产生 schema，
     // 模型目录里根本看不到，也就不会浪费 LLM 往返去更新它。
+    // 写入时双写 TodoStore + `.wyj-code/progress.md`（压缩注入 / 跨会话）。
     if cfg.tools.todo_enabled {
-        registry.register_arc(Arc::new(TodoWriteTool::new(deps.todo_store.clone())));
-    }
-    // 长程进度文件：默认开。路径钉在项目根，压缩后由 Agent 重新注入。
-    if cfg.tools.progress_enabled {
         let root = wyj_core::project_root(deps.cwd);
-        registry.register_arc(Arc::new(ProgressTool::new(root)));
+        registry.register_arc(Arc::new(TodoWriteTool::new(
+            deps.todo_store.clone(),
+            root,
+        )));
     }
     registry.register_arc(Arc::new(AskQuestionTool::new()));
 
@@ -177,8 +176,8 @@ pub struct SharedAgentConfig<'a> {
     /// 若拿不到同一个文档，压缩就会在换模型后突然退回全量摘要——用户看到
     /// 的是「换了模型成本就变了」，而真实原因是装配漏了一项。
     pub session_memory: Option<Arc<wyj_core::session_memory::SessionMemory>>,
-    /// 压缩后注入 `.wyj-code/progress.md` 的项目根。跟 `progress_enabled` 对齐：
-    /// 工具没注册时也不注入，避免摘要里出现模型调不了的路径。
+    /// 压缩后注入 `.wyj-code/progress.md` 的项目根。跟 `todo_enabled` 对齐：
+    /// TodoWrite 没注册时也不注入，避免摘要里出现模型调不了的路径。
     pub progress_root: Option<PathBuf>,
 }
 
@@ -288,7 +287,6 @@ impl AgentCoreConfig {
 /// 这里——走 ToolSearch，把固定预填压到编码主路径。
 const CONDITIONAL_CORE_TOOLS: &[&str] = &[
     "TodoWrite",
-    "Progress",
     "ExitPlanMode",
     "window_capture",
     "app_computer",

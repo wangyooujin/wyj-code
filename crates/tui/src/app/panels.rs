@@ -44,7 +44,7 @@ impl AppState {
 
     /// 把一份 todo 快照收口后写入 `current_todos`，并刷新 focus / 统计。
     ///
-    /// TodoUpdate 事件与 TodoWrite 的 ToolEnd（丢包兜底）共用；幂等。
+    /// TodoUpdate 与 TodoWrite 的 ToolEnd（丢包兜底）共用；幂等。
     pub(super) fn apply_todo_snapshot(&mut self, mut items: Vec<TodoItem>) {
         wyj_tools::normalize_todo_statuses(&mut items);
 
@@ -96,21 +96,49 @@ impl AppState {
             .rev()
             .find(|t| t.status == TodoStatus::InProgress)
             .map(|t| t.id.clone());
-        self.current_todos = Some(items);
+        self.current_todos = if items.is_empty() {
+            None
+        } else {
+            Some(items)
+        };
         self.ensure_selected_todo();
     }
 
-    /// 把 `current_todos` 写回共享 TodoStore（TurnDone 自动收口后必须同步）。
-    pub(super) fn sync_todos_to_store(&self) {
-        let Some(store) = &self.todo_store else {
+    /// 启动 / `/clear` 后：磁盘有 progress.md 时灌进面板（跨会话续跑可见）。
+    pub(super) fn load_progress_panel_from_disk(&mut self) {
+        let items = self.read_progress_todos();
+        if items.is_empty() {
             return;
-        };
+        }
+        self.apply_todo_snapshot(items);
+    }
+
+    fn read_progress_todos(&self) -> Vec<TodoItem> {
+        let root = wyj_core::project_root(&self.cwd);
+        match wyj_core::progress::read_progress(&root) {
+            Some(body) => wyj_tools::parse_progress_to_todos(&body),
+            None => Vec::new(),
+        }
+    }
+
+    /// 磁盘上是否还有未清空的 progress.md（新轮次是否保留面板的判据）。
+    pub(super) fn has_progress_on_disk(&self) -> bool {
+        !self.read_progress_todos().is_empty()
+    }
+
+    /// TurnDone 收口后写回 TodoStore **与** `.wyj-code/progress.md`。
+    pub(super) fn sync_todos_to_store(&self) {
         let Some(items) = self.current_todos.as_ref() else {
             return;
         };
-        if let Ok(mut g) = store.lock() {
-            g.items = items.clone();
+        if let Some(store) = &self.todo_store {
+            if let Ok(mut g) = store.lock() {
+                g.items = items.clone();
+            }
         }
+        let root = wyj_core::project_root(&self.cwd);
+        let body = wyj_tools::todos_to_progress_markdown(items);
+        let _ = wyj_core::progress::write_progress(&root, &body);
     }
 
     /// 清单里所有**未完成**项（pending + in_progress），按 id 与内容返回。

@@ -2603,18 +2603,11 @@ async fn main() -> Result<()> {
         system_prompt_extra.push_str(extra);
     }
 
-    // TodoWrite 已由 `[tools].todo_enabled` 显式打开：补一段「何时用」的指引。
-    // 工具描述只说了它是什么，模型没有动机去调用；不注入的话会出现「配了开关
-    // 但面板永远不出现」。写进 `system_prompt_extra` 是为了让 TUI 侧 `/model`
-    // 重建 Agent 时同样带上（漏了就会在热切换后退回「模型不用 TodoWrite」）。
+    // TodoWrite 默认开：补一段「何时用 / 少更新 / 会落盘」的指引。工具描述只
+    // 说了它是什么，模型没有动机去调用；不注入的话会出现「面板永远不出现」。
+    // 写进 `system_prompt_extra` 是为了让 TUI 侧 `/model` 重建 Agent 时同样带上。
     if cfg.tools.todo_enabled {
         let extra = wyj_core::prompts::TODO_HINT;
-        agent = agent.append_system(extra);
-        system_prompt_extra.push_str("\n\n");
-        system_prompt_extra.push_str(extra);
-    }
-    if cfg.tools.progress_enabled {
-        let extra = wyj_core::prompts::PROGRESS_HINT;
         agent = agent.append_system(extra);
         system_prompt_extra.push_str("\n\n");
         system_prompt_extra.push_str(extra);
@@ -2671,7 +2664,7 @@ async fn main() -> Result<()> {
         session_memory: session_memory.clone(),
         progress_root: cfg
             .tools
-            .progress_enabled
+            .todo_enabled
             .then(|| wyj_core::project_root(&cwd)),
     }
     .apply(agent);
@@ -2958,7 +2951,7 @@ async fn main() -> Result<()> {
             session_memory: session_memory_for_rebuild.clone(),
             progress_root: cfg
                 .tools
-                .progress_enabled
+                .todo_enabled
                 .then(|| wyj_core::project_root(&cwd_for_rebuild)),
         }
         .apply(new_agent);

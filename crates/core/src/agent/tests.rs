@@ -2469,7 +2469,7 @@ fn lazy_tools_never_hide_the_core_execution_surface() {
         "CodeSearch",
         "ContextRecall",
         "Agent",
-        "Progress",
+        "TodoWrite",
         "Memory",
         "ExitPlanMode",
         "window_capture",
@@ -2493,7 +2493,7 @@ fn lazy_tools_never_hide_the_core_execution_surface() {
         "CodeSearch",
         "ContextRecall",
         "Agent",
-        "Progress",
+        "TodoWrite",
     ] {
         assert!(
             state.visible(name),

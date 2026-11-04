@@ -62,7 +62,7 @@ pub enum AgentEvent {
         input_tokens: u32,
         output_tokens: u32,
     },
-    /// TodoWrite 工具完成后推送任务列表快照
+    /// TodoWrite 工具完成后推送任务列表快照（同时已落盘 progress.md）
     TodoUpdate(Vec<wyj_tools::todo::TodoItem>),
     /// AskQuestion 工具请求用户完成多题访谈（含 oneshot 响应通道）
     AskQuestions {

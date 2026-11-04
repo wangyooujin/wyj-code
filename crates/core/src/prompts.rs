@@ -324,10 +324,7 @@ Reply with one JSON object and nothing else:
 /// 因此这里做成**条件注入**而非写回 `MAIN`：只有用户显式打开开关时才追加，
 /// 关闭时 prompt 一个字节都不变，默认路径继续对齐 Claude Code v2.1.233 /
 /// Codex v0.152.0 的「todo 脚手架默认关闭」。
-pub const TODO_HINT: &str = "For multi-step tasks (roughly three or more distinct steps), use TodoWrite to keep a visible task list: create it once at the start, then update it as you make progress. Keep exactly one task in_progress — mark the previous completed when you start the next (the runtime will auto-complete stale in_progress entries if you forget). Skip it for single-step tasks. For work that may span a context compaction or a later session, also keep `.wyj-code/progress.md` via the Progress tool — that file survives compaction; TodoWrite does not.";
-
-/// `[tools].progress_enabled = true` 时追加：教模型用 Progress 维护长程状态。
-pub const PROGRESS_HINT: &str = "For long-running or multi-session work, keep a short markdown checklist in `.wyj-code/progress.md` via the Progress tool (action=get / action=set). Update it when you finish a meaningful chunk or change direction. After context compaction the runtime re-injects the file into the summary — treat that block as authoritative and continue from it instead of re-exploring. Skip Progress for one-shot questions and single-file edits.";
+pub const TODO_HINT: &str = "For multi-step tasks (roughly three or more distinct steps), call TodoWrite once at the start so the user sees a live task-list panel, then update it when you finish a step or change direction — not after every tool call. Keep exactly one task in_progress; mark the previous completed when you start the next (the runtime auto-completes stale in_progress entries if you forget). Each TodoWrite also syncs `.wyj-code/progress.md` on disk, so the checklist survives context compaction and can be resumed later; after compact, treat any re-injected progress block as authoritative. Skip TodoWrite for one-shot questions and single-file edits.";
 
 /// 自动续跑时注入的续跑指令（框架生成，不是用户说的话）。
 ///

@@ -1,12 +1,15 @@
-//! TodoWrite 工具 — 管理结构化任务列表
+//! TodoWrite 工具 — 结构化任务列表（TUI 面板 + `.wyj-code/progress.md` 双写）。
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use wyj_api::types::ToolDefinition;
 use wyj_core::tool::{Tool, ToolContext, ToolResult};
+
+use crate::progress::todos_to_progress_markdown;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -112,11 +115,16 @@ impl TodoStore {
 
 pub struct TodoWriteTool {
     store: Arc<Mutex<TodoStore>>,
+    /// 项目根：每次写入同步到 `<root>/.wyj-code/progress.md`（压缩注入 / 跨会话）。
+    project_root: PathBuf,
 }
 
 impl TodoWriteTool {
-    pub fn new(store: Arc<Mutex<TodoStore>>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<Mutex<TodoStore>>, project_root: impl Into<PathBuf>) -> Self {
+        Self {
+            store,
+            project_root: project_root.into(),
+        }
     }
 }
 
@@ -221,12 +229,23 @@ impl Tool for TodoWriteTool {
 
         {
             let mut store = self.store.lock().unwrap();
-            store.items = items;
+            store.items = items.clone();
+        }
+
+        // 双写磁盘：压缩后由框架从 progress.md 重新注入；跨会话续跑可见。
+        let md = todos_to_progress_markdown(&items);
+        if let Err(e) = wyj_core::progress::write_progress(&self.project_root, &md) {
+            return Ok(ToolResult::err(format!(
+                "任务列表已写入内存，但落盘 {} 失败: {e}",
+                wyj_core::progress::PROGRESS_REL_PATH
+            )));
         }
 
         let mut msg = format!(
-            "任务列表已更新: {} 项（待处理 {pending}，进行中 {in_progress}，已完成 {done}）",
-            count
+            "任务列表已更新: {} 项（待处理 {pending}，进行中 {in_progress}，已完成 {done}）；\
+             已同步 {}",
+            count,
+            wyj_core::progress::PROGRESS_REL_PATH
         );
         if auto_fixed > 0 {
             msg.push_str(&format!(
@@ -246,6 +265,11 @@ mod tests {
 
     fn empty_store() -> Arc<Mutex<TodoStore>> {
         Arc::new(Mutex::new(TodoStore::default()))
+    }
+
+    fn make_tool(store: Arc<Mutex<TodoStore>>) -> (TodoWriteTool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (TodoWriteTool::new(store, dir.path()), dir)
     }
 
     fn make_ctx() -> ToolCtx {
@@ -308,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn run_writes_items_and_returns_summary() {
         let store = empty_store();
-        let tool = TodoWriteTool::new(store.clone());
+        let (tool, dir) = make_tool(store.clone());
         // 正常顺序：已完成在前，进行中，待处理在后——收口启发式不得误伤。
         let r = tool
             .run(
@@ -328,15 +352,19 @@ mod tests {
         assert!(r.content.contains("待处理 1"));
         assert!(r.content.contains("进行中 1"));
         assert!(r.content.contains("已完成 1"));
+        assert!(r.content.contains(wyj_core::progress::PROGRESS_REL_PATH));
         let g = store.lock().unwrap();
         assert_eq!(g.items.len(), 3);
         assert_eq!(g.items[1].status, TodoStatus::InProgress);
+        let md = wyj_core::progress::read_progress(dir.path()).expect("应落盘 progress.md");
+        assert!(md.contains("[~]"));
+        assert!(md.contains("task-b"));
     }
 
     #[tokio::test]
     async fn run_is_overwrite_not_append() {
         let store = empty_store();
-        let tool = TodoWriteTool::new(store.clone());
+        let (tool, _dir) = make_tool(store.clone());
         tool.run(
             json!({"todos":[
                 {"id":"a","content":"x","status":"pending"},
@@ -360,7 +388,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_rejects_invalid_status() {
-        let r = TodoWriteTool::new(empty_store())
+        let (tool, _dir) = make_tool(empty_store());
+        let r = tool
             .run(
                 json!({"todos":[{"id":"a","content":"x","status":"done"}]}),
                 &make_ctx(),
@@ -371,7 +400,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_rejects_missing_required_field() {
-        let r = TodoWriteTool::new(empty_store())
+        let (tool, _dir) = make_tool(empty_store());
+        let r = tool
             .run(
                 json!({"todos":[{"id":"a","status":"pending"}]}),
                 &make_ctx(),
@@ -383,7 +413,7 @@ mod tests {
     #[tokio::test]
     async fn run_zero_items_is_valid() {
         let store = empty_store();
-        let tool = TodoWriteTool::new(store.clone());
+        let (tool, _dir) = make_tool(store.clone());
         tool.run(
             json!({"todos":[{"id":"x","content":"y","status":"pending"}]}),
             &make_ctx(),
@@ -399,26 +429,26 @@ mod tests {
     #[tokio::test]
     async fn run_priority_defaults_to_none() {
         let store = empty_store();
-        TodoWriteTool::new(store.clone())
-            .run(
-                json!({"todos":[{"id":"a","content":"x","status":"pending"}]}),
-                &make_ctx(),
-            )
-            .await
-            .unwrap();
+        let (tool, _dir) = make_tool(store.clone());
+        tool.run(
+            json!({"todos":[{"id":"a","content":"x","status":"pending"}]}),
+            &make_ctx(),
+        )
+        .await
+        .unwrap();
         assert!(store.lock().unwrap().items[0].priority.is_none());
     }
 
     #[tokio::test]
     async fn run_preserves_priority_when_provided() {
         let store = empty_store();
-        TodoWriteTool::new(store.clone())
-            .run(
-                json!({"todos":[{"id":"a","content":"x","status":"pending","priority":"low"}]}),
-                &make_ctx(),
-            )
-            .await
-            .unwrap();
+        let (tool, _dir) = make_tool(store.clone());
+        tool.run(
+            json!({"todos":[{"id":"a","content":"x","status":"pending","priority":"low"}]}),
+            &make_ctx(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             store.lock().unwrap().items[0].priority.as_deref(),
             Some("low")
@@ -498,7 +528,8 @@ mod tests {
     #[tokio::test]
     async fn run_auto_normalizes_multiple_in_progress() {
         let store = empty_store();
-        let r = TodoWriteTool::new(store.clone())
+        let (tool, _dir) = make_tool(store.clone());
+        let r = tool
             .run(
                 json!({
                     "todos": [
@@ -518,12 +549,14 @@ mod tests {
 
     #[test]
     fn tool_name_is_todowrite() {
-        assert_eq!(TodoWriteTool::new(empty_store()).name(), "TodoWrite");
+        let (tool, _dir) = make_tool(empty_store());
+        assert_eq!(tool.name(), "TodoWrite");
     }
 
     #[test]
     fn definition_declares_required_todos_field() {
-        let def = TodoWriteTool::new(empty_store()).definition();
+        let (tool, _dir) = make_tool(empty_store());
+        let def = tool.definition();
         assert_eq!(def.name, "TodoWrite");
         let req = def
             .input_schema

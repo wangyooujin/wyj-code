@@ -40,11 +40,10 @@ impl AppState {
                 input_json,
             } => {
                 // TodoWrite 有专属面板（push_inline_todo_lines），走常规工具行会
-                // 让同一次调用在聊天流里出现三遍：⏺ TodoWrite / ⎿ 任务列表已更新… /
-                // TodoWrite 面板头 + 分隔线 + 条目。面板已经把"改了什么"讲得更完整，
-                // 常规行只剩噪音。这里仍然照常登记 tool_info 与占用 seq（ToolEnd 靠
-                // seq 配对回执，见下方同名分支），只是不往聊天流插消息。
-                let is_todo = name == "TodoWrite";
+                // 让同一次调用在聊天流里出现三遍。面板已经把"改了什么"讲得更
+                // 完整，常规行只剩噪音。这里仍然照常登记 tool_info 与占用 seq
+                // （ToolEnd 靠 seq 配对回执），只是不往聊天流插消息。
+                let skip_chat_line = name == "TodoWrite";
                 self.tool_call_count += 1;
                 let seq = self.tool_call_count;
                 let arg = tool_display_arg(&name, &input_json);
@@ -67,7 +66,7 @@ impl AppState {
                 self.current_op_started = Some(Instant::now());
                 self.tool_info.insert(id, (name.clone(), seq));
                 self.flush_streaming();
-                if !is_todo {
+                if !skip_chat_line {
                     let mut msg = ChatMessage::tool_call_with_command(
                         display,
                         seq,
@@ -95,7 +94,7 @@ impl AppState {
                 self.live_tool_out.remove(&id);
                 // ToolStart 已跳过 TodoWrite 的常规行，这里对称地跳过它的回执。
                 // 不能只依赖"call_idx 找不到配对"来自然落空——那样会走
-                // `push_tracked_message` 把 "⎿ 任务列表已更新: N 项…" 追加到流尾。
+                // `push_tracked_message` 把摘要追加到流尾。
                 if name == "TodoWrite" {
                     // TodoUpdate 可能被 try_send 丢包：ToolEnd 必达时从共享
                     // store 再读一次，保证面板与权威状态一致。

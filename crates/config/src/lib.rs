@@ -745,24 +745,19 @@ impl Default for AgentCfg {
 pub struct ToolsCfg {
     /// 是否注册 `TodoWrite` 任务列表工具。
     ///
-    /// **默认关闭**。实测 102 会话里 TodoWrite 100% 独占 LLM 往返、59% 未收尾，
-    /// 作为「穿透压缩的进度载体」性价比差。长程进度改由 [`Self::progress_enabled`]
-    /// 的 `.wyj-code/progress.md`（压缩时从磁盘重新注入，跨 session 保留）。
-    /// 需要会话内 UI 任务面板时显式 `todo_enabled = true`。
-    pub todo_enabled: bool,
-    /// 是否注册 `Progress` 工具（读写 `<git-root>/.wyj-code/progress.md`）。
+    /// **默认开启**。写入时同时更新 TUI 面板与 `<git-root>/.wyj-code/progress.md`
+    ///（压缩时从磁盘重新注入，跨 session 保留）。短任务 / 想省 schema 时可
+    /// `todo_enabled = false`。提示词要求「多步任务开头建一次、完成一步再更新」，
+    /// 避免每个工具调用都独占一轮。
     ///
-    /// **默认开启**。文件在磁盘上，压缩不会改写它；每次压缩后框架把现行内容
-    /// 作为独立消息重新注入，避免「摘要把进度洗成一句话 → 模型重搜刚搜过的
-    /// 目录」。短任务可以 `progress_enabled = false` 省 schema。
-    pub progress_enabled: bool,
+    /// 旧配置里的 `progress_enabled` 已废弃并被 serde 忽略；进度落盘并入本开关。
+    pub todo_enabled: bool,
 }
 
 impl Default for ToolsCfg {
     fn default() -> Self {
         Self {
-            todo_enabled: false,
-            progress_enabled: true,
+            todo_enabled: true,
         }
     }
 }
@@ -2734,29 +2729,25 @@ context_window = 200000
     }
 
     #[test]
-    fn todo_is_off_by_default_and_progress_is_on() {
-        // 长程进度改由 Progress / progress.md；TodoWrite 默认关以免独占往返。
+    fn todo_is_on_by_default() {
+        // TodoWrite 默认开：面板 + progress.md 双写；短任务可显式关掉。
         let cfg: Config = toml::from_str("").unwrap();
-        assert!(!cfg.tools.todo_enabled);
-        assert!(cfg.tools.progress_enabled);
-
-        let cfg: Config = toml::from_str("[tools]\ntodo_enabled = true\n").unwrap();
         assert!(cfg.tools.todo_enabled);
-        assert!(cfg.tools.progress_enabled);
 
-        let cfg: Config = toml::from_str("[tools]\nprogress_enabled = false\n").unwrap();
-        assert!(!cfg.tools.progress_enabled);
+        let cfg: Config = toml::from_str("[tools]\ntodo_enabled = false\n").unwrap();
+        assert!(!cfg.tools.todo_enabled);
     }
 
     #[test]
-    fn todo_opt_in_survives_a_partial_tools_block() {
+    fn todo_default_survives_a_partial_tools_block() {
         // 老配置里已有 [tools] 但没写 todo_enabled：走结构体级 serde(default)，
-        // 取 ToolsCfg::default() 的 false。显式写 true 的必须仍是 true。
+        // 取 ToolsCfg::default() 的 true。显式写 false 必须仍是 false。
+        // 废弃的 progress_enabled 被忽略，不影响解析。
         let cfg: Config = toml::from_str("[tools]\n").unwrap();
-        assert!(!cfg.tools.todo_enabled);
-        assert!(cfg.tools.progress_enabled);
-        let cfg: Config = toml::from_str("[tools]\ntodo_enabled = true\n").unwrap();
         assert!(cfg.tools.todo_enabled);
+        let cfg: Config =
+            toml::from_str("[tools]\nprogress_enabled = false\ntodo_enabled = false\n").unwrap();
+        assert!(!cfg.tools.todo_enabled);
     }
 
     #[test]

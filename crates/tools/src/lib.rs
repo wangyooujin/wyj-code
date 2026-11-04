@@ -52,7 +52,7 @@ pub use diff::{make_added, make_diff};
 pub use exit_plan_mode::ExitPlanModeTool;
 pub use grep::backend_label as grep_backend_label;
 pub use memory::MemoryTool;
-pub use progress::ProgressTool;
+pub use progress::{parse_progress_to_todos, todos_to_progress_markdown};
 pub use registry::ToolRegistry;
 pub use search::{build_backend, SearchBackend, WebSearchTool};
 pub use sub_agent::{AgentFactory, SharedAgentDefinitions, SubAgentTool};
