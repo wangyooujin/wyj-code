@@ -4,7 +4,7 @@
 //! 不引入 `walkdir` 等新依赖;进程内 `OnceLock` 保证单进程只触发一次警告,
 //! 避免每次工具调用都打印。
 //!
-//! 默认阈值来自 `StorageRetentionCfg::disk_usage_warn_bytes`(5 GiB);设为 0
+//! 默认阈值来自 `StorageRetentionCfg::disk_usage_warn_bytes`(512 MiB);设为 0
 //! 表示关闭提示。
 
 use std::path::Path;

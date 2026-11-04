@@ -1118,11 +1118,13 @@ pub struct StorageRetentionCfg {
     /// 关掉可省掉启动期一次全池目录遍历（blob 多时是毫秒级 IO）。
     pub cas_gc_on_start: bool,
 
-    /// 会话文件保留天数（0 = 永不自动删除，旧行为）。
+    /// 会话文件保留天数（0 = 永不自动删除）。
     ///
-    /// 对应 Claude Code 的 `cleanupPeriodDays`。只删**早于**该天数的会话及其
-    /// checkpoint / subagent 旁路目录；最近一条会话永远保留，避免把「唯一一次
-    /// 会话」删掉。清理在进程启动时跑一次（与 CAS gc 同批），不阻塞主流程。
+    /// 对应 Claude Code 的 `cleanupPeriodDays`（其默认也是 30）。只删**早于**
+    /// 该天数的会话及其 checkpoint / subagent 旁路目录；配合
+    /// [`Self::sessions_keep_recent`]，每个项目额外无条件保留最新 N 条。
+    /// 清理在进程启动时跑一次（与 CAS gc 同批），不阻塞主流程。
+    /// 想永久保留历史：显式设 `0`，或把天数调大。
     pub sessions_ttl_days: u32,
 
     /// 会话清理时额外保留的最近条数（按项目计）。0 = 不额外保留。
@@ -1153,17 +1155,17 @@ pub struct StorageRetentionCfg {
     /// 单个 session 的 checkpoint **字节**预算（0 = 不按字节淘汰）。
     ///
     /// 与 [`Self::checkpoints_per_session`] 是**两个独立的闸门**，任一超标即淘汰：
-    /// 条数防「短会话攒出几百个小 checkpoint」，字节数防「长会话留 20 个
+    /// 条数防「短会话攒出几百个小 checkpoint」，字节数防「长会话留 N 个
     /// 几 MB 的历史」。
     ///
     /// 为什么必须有字节闸门（实测 2026-10-28）：本机 5,703 个 checkpoint 合计
     /// 1,836 MB、平均 322 KB，其中 **96% 是内联的完整 `messages` 快照**——
-    /// 每个有副作用的工具前后各写一份全量历史。只按条数留 20 个，对一个
-    /// 1,400 条消息的会话就是「留 20 份 × 每份几百 KB」。
+    /// 每个有副作用的工具前后各写一份全量历史。只按条数留 10~20 个，对一个
+    /// 1,400 条消息的会话就是「留 N 份 × 每份几百 KB~几 MB」。
     ///
-    /// 默认 256 MiB：按平均 322 KB 算约等于 800 个 checkpoint，对绝大多数
-    /// 会话是「条数闸门先生效」，只有真正的大历史会话才会被字节闸门削。
-    /// 设成 0 关闭字节淘汰，退回纯条数行为。
+    /// 默认 32 MiB：让字节闸门在「单会话 checkpoint 目录已经几十 MB」时真正
+    /// 生效（实测最大会话 checkpoint 目录可达 ~57 MB；旧默认 256 MiB 几乎
+    /// 从不触发）。设成 0 关闭字节淘汰，退回纯条数行为。
     pub checkpoint_bytes_per_session: u64,
 }
 
@@ -1174,31 +1176,31 @@ fn default_storage_scope() -> String {
 impl Default for StorageRetentionCfg {
     fn default() -> Self {
         Self {
-            checkpoints_per_session: 20,
+            // 10：rewind 仍够用；旧默认 20 在长会话上等于「留 20 份近全量历史」。
+            checkpoints_per_session: 10,
             memory_v2_md_per_kind: 200,
             memory_v3_records_max: 5_000,
             memory_v3_jobs_max: 32,
             memory_v3_rejected_history_max: 500,
             plugin_gc_interval_days: 7,
             workspace_worktree_max_age_days: 30,
-            disk_usage_warn_bytes: 5 * 1024 * 1024 * 1024,
+            // 512 MiB。旧默认 5 GiB 对个人机偏晚，磁盘已经涨很久才第一次提示。
+            disk_usage_warn_bytes: 512 * 1024 * 1024,
             cas_max_blob_bytes: 16 * 1024 * 1024,
             // 1 GiB。context editing 每次清理写入的是"当时在上下文里"的内容，
             // 单个会话可控；跨会话累积靠 gc 在启动时按 LRU 收口。
             cas_total_bytes: 1024 * 1024 * 1024,
             cas_gc_on_start: true,
-            // **默认关闭**。自动删历史会话是不可逆操作，不该在升级后的第一次
-            // 启动里静默发生——用户会以为「历史丢了」。想开的话自己设成 30/90。
-            // 想立刻清理一次走 `wyj-code storage prune --yes`（它读同一组配置）。
-            sessions_ttl_days: 0,
+            // 30 天：对齐 Claude Code 的 `cleanupPeriodDays` 默认。想永久保留
+            // 显式写 `0`；想立刻清一次走 `wyj-code storage prune --yes`。
+            sessions_ttl_days: 30,
             sessions_keep_recent: 5,
             // 锁文件是纯垃圾（内容只有 pid），默认清理没有数据风险。
             stale_lock_ttl_days: 7,
             scope: default_storage_scope(),
-            // 256 MiB。按实测平均 322 KB/个算约等于 800 个 checkpoint，
-            // 所以对绝大多数会话是条数闸门（20）先生效；只有历史特别长的
-            // 会话才会被这条削掉，而那正是磁盘被撑爆的场景。
-            checkpoint_bytes_per_session: 256 * 1024 * 1024,
+            // 32 MiB。配合条数闸门（10）：短会话由条数收口，长会话由字节削掉
+            // 那几份几 MB 的全量快照——这才是磁盘被撑爆的场景。
+            checkpoint_bytes_per_session: 32 * 1024 * 1024,
         }
     }
 }
@@ -2984,7 +2986,7 @@ allow = ["$defaults", "允许推送到 staging"]
 
 #[cfg(test)]
 mod search_cfg_tests {
-    use super::{Config, SearchCfg};
+    use super::{Config, SearchCfg, StorageRetentionCfg};
 
     #[test]
     fn legacy_flat_search_fields_migrate_into_the_section() {
@@ -3128,5 +3130,17 @@ context_window = 200000
         assert!(cfg.search_api_key().is_none());
         assert_eq!(cfg.effective_search_provider(), "tavily");
         assert!(cfg.search_provider_issue().is_some());
+    }
+
+    /// 默认 retention 对齐 Claude Code：30 天会话 TTL + 更紧的 checkpoint/告警闸门。
+    /// 钉住是为了防止「又变回永不删 / 256 MiB 形同虚设」的回归。
+    #[test]
+    fn storage_retention_defaults_match_claude_code_style() {
+        let s = StorageRetentionCfg::default();
+        assert_eq!(s.sessions_ttl_days, 30);
+        assert_eq!(s.sessions_keep_recent, 5);
+        assert_eq!(s.checkpoints_per_session, 10);
+        assert_eq!(s.checkpoint_bytes_per_session, 32 * 1024 * 1024);
+        assert_eq!(s.disk_usage_warn_bytes, 512 * 1024 * 1024);
     }
 }

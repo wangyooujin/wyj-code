@@ -98,14 +98,14 @@ scope = "home"      # 默认。"project" = 会话与历史跟着工作副本走
 
 ```toml
 [storage]
-sessions_ttl_days = 0        # 0 = 不自动删（默认）。设 30/90 启用
+sessions_ttl_days = 30       # 默认 30（对齐 Claude Code cleanupPeriodDays）。0 = 永不自动删
 sessions_keep_recent = 5     # 每个项目无条件保留最新 N 条
 stale_lock_ttl_days = 7      # 删 cas/locks/ 与 sessions/*.lock 里无人持有且超期的
 ```
 
-`sessions_ttl_days` **默认 0**：删历史不可逆，不该在升级后第一次启动里静默发生。
-想立刻清一次用 `wyj-code storage prune`（dry-run）看计划，`--yes` 执行；未设置时
-`prune` 按 30 天算，且 dry-run 与 `--yes` 用同一个值。
+`sessions_ttl_days` **默认 30**：启动时删掉超过该天数的会话（每个项目仍保留最新
+`sessions_keep_recent` 条）。想永久保留历史，显式写 `0`。想立刻清一次用
+`wyj-code storage prune`（dry-run）看计划，`--yes` 执行——它读同一组配置。
 
 `sessions_keep_recent` 是 TTL 的必要配套：纯 TTL 会把「三个月没动的项目里唯一那批
 会话」删光，而那恰恰是最想回看的。
@@ -432,7 +432,8 @@ text_head_bytes = 16384          # 纯文本 ContentBlock 的 head 上限，0 = 
 text_tail_bytes = 8192           # 纯文本 ContentBlock 的 tail 上限，0 = 不截断
 
 [storage]                        # ~/.wyj-code 各子系统 retention / cap / rotation（0 = 关闭该项清理）
-checkpoints_per_session = 20     # 单会话 checkpoint 上限。超限按时间淘汰最旧的
+checkpoints_per_session = 10     # 单会话 checkpoint 上限。超限按时间淘汰最旧的
+checkpoint_bytes_per_session = 33554432  # 单会话 checkpoint 字节预算（默认 32 MiB）；与条数闸门独立，任一超标即淘汰
 memory_v2_md_per_kind = 200      # Memory v2 每类 .md 文件条数上限
 memory_v3_records_max = 5000     # Memory v3 records.json 单文件条目上限。Superseded 永远保留，
                                  # 只对 Active/Pending 按「写入新鲜度 0.30 + 使用强度 0.70」淘汰
@@ -440,13 +441,12 @@ memory_v3_jobs_max = 32          # Memory v3 pending 任务队列上限
 memory_v3_rejected_history_max = 500  # rejected_history.json 条数上限（防止反复提议已拒绝项的那份指纹表）
 plugin_gc_interval_days = 7      # 插件 .git 做 `git gc --prune=now` 的间隔天数
 workspace_worktree_max_age_days = 30  # workspace worktree 自动 prune 的过期天数
-disk_usage_warn_bytes = 5368709120    # 启动期占用告警阈值（默认 5 GiB）
+disk_usage_warn_bytes = 536870912     # 启动期占用告警阈值（默认 512 MiB）
 cas_max_blob_bytes = 16777216    # CAS 单 blob 上限（默认 16 MiB），超此值不进 CAS 直接 inline
 cas_total_bytes = 1073741824     # CAS 总量上限（默认 1 GiB），启动时按 LRU 回收 ref_count == 0 的 blob
 cas_gc_on_start = true           # 启动时是否跑一次 CAS gc。blob 很多时是毫秒级全池遍历，可关
-sessions_ttl_days = 0            # **默认 0 = 不自动删**。删历史不可逆，不该在升级后第一次启动里
-                                 # 静默发生。想启用设 30/90，或手动跑 `wyj-code storage prune --yes`
-                                 # （它读同一组配置；dry-run 与 --yes 用同一个值）
+sessions_ttl_days = 30           # **默认 30**（对齐 Claude Code cleanupPeriodDays）。0 = 永不自动删。
+                                 # 启动时与 `wyj-code storage prune` 读同一组配置
 sessions_keep_recent = 5         # 每个项目无条件保留最新 N 条。TTL 的必要配套：纯 TTL 会把
                                  # 「三个月没动的项目里唯一那批会话」删光，而那恰恰最想回看
 stale_lock_ttl_days = 7          # 删 cas/locks/ 与 sessions/*.lock 里无人持有且超期的

@@ -57,7 +57,7 @@ Agent 循环、会话、记忆、压缩、权限策略、存储布局。根 `CLA
 - 会话、信任文件不进 git。`storage.scope = "project"` 时会话进 `<git-root>/.wyj-code/local/`，并写 gitignore。不跟随 scope：`memory-v3/global`、`projects/`、`cas/`、`workspaces/`、`workflows/`。
 - 旧的平铺 `sessions/` 与根上 `history.jsonl` 仍要能读。`locate()` 跨项目找到会话后写回原目录。doctor/prune 扫根目录和每个项目子目录，跳过 `.checkpoints/` 与 `.subagents/`。
 - 切到 project scope 时，新位置还没有标志文件才从 home **复制**。不覆盖已有文件，不删旧目录。
-- 探测锁用 `filelock::is_locked`，不用 `try_acquire`（后者会刷新 mtime，导致永远删不掉）。启动清理排在 CAS gc 之后。会话 TTL 默认关闭。
+- 探测锁用 `filelock::is_locked`，不用 `try_acquire`（后者会刷新 mtime，导致永远删不掉）。启动清理排在 CAS gc 之后。会话 TTL 默认 30 天（对齐 Claude Code；`0` = 永不删）。
 - thinking 不参与 `persist_cap` 截断。窗口被 thinking 吃满时，调 context editing 或 effort，不要去设 `thinking_bytes`。`<sid>.subagents/` 仍没有自动回收。
 
 ## 其它

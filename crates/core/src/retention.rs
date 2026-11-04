@@ -21,10 +21,11 @@
 //!    正在写」的情况。
 //! 2. **每个项目永远保留最近 N 条会话**（`sessions_keep_recent`）。纯 TTL 会把
 //!    「三个月没动的项目里唯一那批会话」删光，而那恰恰是用户最想回看的。
-//! 3. **会话 TTL 默认 0（关闭）**，锁清理默认 7 天。区别在于风险：锁文件内容
-//!    只有 pid，删错了没有任何数据损失；而会话是不可逆的对话历史，不该在升级后
-//!    第一次启动里静默消失。想开就自己设 `storage.sessions_ttl_days`，
-//!    或者用 `wyj-code storage prune --yes` 显式清一次。
+//! 3. **会话 TTL 默认 30 天**（对齐 Claude Code `cleanupPeriodDays`），锁清理
+//!    默认 7 天。每个项目另由 `sessions_keep_recent` 无条件保留最新 N 条，避免
+//!    「久未打开的项目」被 TTL 删光。想永久保留历史：显式设
+//!    `storage.sessions_ttl_days = 0`；想立刻清一次用
+//!    `wyj-code storage prune --yes`。
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};

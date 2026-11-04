@@ -10,6 +10,23 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
+## [Unreleased]
+
+### 改动：默认 storage retention 对齐 Claude Code
+
+`StorageRetentionCfg` 默认值收紧，避免 `~/.wyj-code` 在默认配置下只增不减：
+
+| 字段 | 旧默认 | 新默认 |
+|---|---|---|
+| `sessions_ttl_days` | `0`（永不删） | **`30`**（对齐 Claude Code `cleanupPeriodDays`） |
+| `checkpoints_per_session` | `20` | **`10`** |
+| `checkpoint_bytes_per_session` | `256 MiB` | **`32 MiB`** |
+| `disk_usage_warn_bytes` | `5 GiB` | **`512 MiB`** |
+
+`sessions_keep_recent = 5` 不变：TTL 仍不会把「久未打开项目里最新那几条」删光。
+想永久保留历史，在 `config.toml` 里显式写 `sessions_ttl_days = 0`。
+**已有 config.toml 若写死了旧值，不会被这次默认变更覆盖**——需要手工改或删掉对应键。
+
 ## [0.3.24] - 2026-10-29
 
 ### 改进：通知正文的耗时与 token 改成人可读格式

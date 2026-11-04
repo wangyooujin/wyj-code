@@ -441,7 +441,8 @@ TUI 永久运行在 `Viewport::Fullscreen`，输入框/状态栏贴住窗口底�
 | 子系统 | 默认 cap | 配置字段 |
 |---|---|---|
 | Evolution（per project）| 100 MiB + 28–180 天 TTL | `evolution.retention_*` / `evolution.max_project_store_bytes` |
-| Session checkpoints | 20 / session | `storage.checkpoints_per_session` |
+| Session checkpoints | 10 / session + 32 MiB | `storage.checkpoints_per_session` / `storage.checkpoint_bytes_per_session` |
+| Session TTL | 30 天（每项目另留最近 5 条） | `storage.sessions_ttl_days` / `storage.sessions_keep_recent` |
 | Memory v2 `.md` | 200 / kind | `storage.memory_v2_md_per_kind` |
 | Memory v3 `records.json` | 5000 条（Superseded 永保留）| `storage.memory_v3_records_max` |
 | Memory v3 `jobs.json` | 32 pending | `storage.memory_v3_jobs_max` |
@@ -450,7 +451,7 @@ TUI 永久运行在 `Viewport::Fullscreen`，输入框/状态栏贴住窗口底�
 | Workspace worktrees | 30 天 prune | `storage.workspace_worktree_max_age_days` |
 | Sub-agent trace | 256 KiB / agent | `subagent.trace_max_bytes_per_agent` |
 | 持久化前 `ContentBlock` 字节截断 | tool_result 20K+10K head+tail、thinking 8K、tool_use.input 64K | `persist_cap.*` |
-| 顶层 `~/.wyj-code` warn | 5 GiB 启动一次性 warn | `storage.disk_usage_warn_bytes` |
+| 顶层 `~/.wyj-code` warn | 512 MiB 启动一次性 warn | `storage.disk_usage_warn_bytes` |
 
 容量清理不得自动删除 Active candidate 或 Active/Pinned Memory。
 
