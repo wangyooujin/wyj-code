@@ -100,10 +100,16 @@ impl AppState {
         self.ensure_selected_todo();
     }
 
-    /// 启动 / `/clear` 后：磁盘有 progress.md 时灌进面板（跨会话续跑可见）。
+    /// 启动 / `/clear` 后：磁盘上还有**未完成**进度时灌进面板（跨会话续跑）。
+    /// 全部 `[x]` 的陈旧清单不回填，并顺手删掉文件——否则 `/new` 后仍会挂着
+    /// 上一轮已完成的 tasklist，压缩也会把死清单注回上下文。
     pub(super) fn load_progress_panel_from_disk(&mut self) {
         let items = self.read_progress_todos();
-        if items.is_empty() {
+        if !progress_items_have_unfinished(&items) {
+            if !items.is_empty() {
+                let root = wyj_core::project_root(&self.cwd);
+                wyj_core::progress::clear_progress(&root);
+            }
             return;
         }
         self.apply_todo_snapshot(items);
@@ -117,12 +123,16 @@ impl AppState {
         }
     }
 
-    /// 磁盘上是否还有未清空的 progress.md（新轮次是否保留面板的判据）。
-    pub(super) fn has_progress_on_disk(&self) -> bool {
-        !self.read_progress_todos().is_empty()
+    /// 磁盘 progress.md 是否仍有未完成项（新轮次是否保留面板的判据）。
+    ///
+    /// 只认 pending / in_progress：全 completed 的文件不算「还在跑的长任务」，
+    /// 否则上一轮收口后写下的 `[x]` 清单会挡住 `begin_new_turn` 清面板。
+    pub(super) fn has_unfinished_progress_on_disk(&self) -> bool {
+        progress_items_have_unfinished(&self.read_progress_todos())
     }
 
-    /// TurnDone 收口后写回 TodoStore **与** `.wyj-code/progress.md`。
+    /// TurnDone 收口后写回 TodoStore；未完成项同步到 `.wyj-code/progress.md`，
+    /// 全部完成后则清掉该文件（避免新一轮 / 压缩注入还背着旧清单）。
     pub(super) fn sync_todos_to_store(&self) {
         let Some(items) = self.current_todos.as_ref() else {
             return;
@@ -133,8 +143,27 @@ impl AppState {
             }
         }
         let root = wyj_core::project_root(&self.cwd);
-        let body = wyj_tools::todos_to_progress_markdown(items);
-        let _ = wyj_core::progress::write_progress(&root, &body);
+        if progress_items_have_unfinished(items) {
+            let body = wyj_tools::todos_to_progress_markdown(items);
+            let _ = wyj_core::progress::write_progress(&root, &body);
+        } else {
+            wyj_core::progress::clear_progress(&root);
+        }
+    }
+
+    /// 清掉会话内任务板，并删除已无未完成项意义的 progress.md。
+    pub(super) fn clear_todo_panel_and_progress(&mut self) {
+        self.current_todos = None;
+        self.focused_todo_id = None;
+        self.todo_panel_expanded = false;
+        self.selected_todo_id = None;
+        self.todo_detail_open = false;
+        self.todo_detail_scroll = 0;
+        self.todo_detail_max_scroll = 0;
+        self.todo_stats.clear();
+        self.todo_execution_logs.clear();
+        let root = wyj_core::project_root(&self.cwd);
+        wyj_core::progress::clear_progress(&root);
     }
 
     /// 清单里所有**未完成**项（pending + in_progress），按 id 与内容返回。
@@ -786,4 +815,9 @@ impl AppState {
     pub(super) fn trace_push(&mut self, id: u64, event: TraceEvent) {
         Arc::make_mut(self.sub_agent_trace_cache.entry(id).or_default()).push(event);
     }
+}
+
+/// progress.md / 面板条目是否仍有未完成工作（pending 或 in_progress）。
+fn progress_items_have_unfinished(items: &[TodoItem]) -> bool {
+    items.iter().any(|t| t.status != TodoStatus::Completed)
 }

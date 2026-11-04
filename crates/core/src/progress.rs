@@ -61,6 +61,13 @@ pub fn write_progress(project_root: &Path, content: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// 删除进度文件。任务全部完成或新一轮作废旧清单时调用——
+/// `read_progress` 会返回 `None`，压缩注入也会清掉历史里的旧块。
+pub fn clear_progress(project_root: &Path) {
+    let path = progress_path(project_root);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// 把磁盘进度拼进压缩摘要消息正文（替换旧注入块）。
 ///
 /// 只改**第一条**带压缩前缀的 user 文本消息——那正是刚写进去的摘要。
@@ -147,6 +154,17 @@ mod tests {
         let dir = tempdir().unwrap();
         write_progress(dir.path(), "# done\n- a\n").unwrap();
         assert_eq!(read_progress(dir.path()).as_deref(), Some("# done\n- a"));
+    }
+
+    #[test]
+    fn clear_progress_removes_file() {
+        let dir = tempdir().unwrap();
+        write_progress(dir.path(), "- [ ] still going\n").unwrap();
+        assert!(read_progress(dir.path()).is_some());
+        clear_progress(dir.path());
+        assert!(read_progress(dir.path()).is_none());
+        // 幂等：文件本就不在时也不 panic
+        clear_progress(dir.path());
     }
 
     #[test]

@@ -233,19 +233,26 @@ impl Tool for TodoWriteTool {
         }
 
         // 双写磁盘：压缩后由框架从 progress.md 重新注入；跨会话续跑可见。
-        let md = todos_to_progress_markdown(&items);
-        if let Err(e) = wyj_core::progress::write_progress(&self.project_root, &md) {
-            return Ok(ToolResult::err(format!(
-                "任务列表已写入内存，但落盘 {} 失败: {e}",
-                wyj_core::progress::PROGRESS_REL_PATH
-            )));
-        }
+        // 全部完成或空清单时清掉文件——否则陈旧 `[x]` 会挡住新一轮清面板，
+        // 也会被压缩注入背进上下文。
+        let disk_note = if items.iter().any(|t| t.status != TodoStatus::Completed) {
+            let md = todos_to_progress_markdown(&items);
+            if let Err(e) = wyj_core::progress::write_progress(&self.project_root, &md) {
+                return Ok(ToolResult::err(format!(
+                    "任务列表已写入内存，但落盘 {} 失败: {e}",
+                    wyj_core::progress::PROGRESS_REL_PATH
+                )));
+            }
+            format!("已同步 {}", wyj_core::progress::PROGRESS_REL_PATH)
+        } else {
+            wyj_core::progress::clear_progress(&self.project_root);
+            format!("已清除 {}", wyj_core::progress::PROGRESS_REL_PATH)
+        };
 
         let mut msg = format!(
             "任务列表已更新: {} 项（待处理 {pending}，进行中 {in_progress}，已完成 {done}）；\
-             已同步 {}",
-            count,
-            wyj_core::progress::PROGRESS_REL_PATH
+             {disk_note}",
+            count
         );
         if auto_fixed > 0 {
             msg.push_str(&format!(
@@ -364,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn run_is_overwrite_not_append() {
         let store = empty_store();
-        let (tool, _dir) = make_tool(store.clone());
+        let (tool, dir) = make_tool(store.clone());
         tool.run(
             json!({"todos":[
                 {"id":"a","content":"x","status":"pending"},
@@ -375,15 +382,23 @@ mod tests {
         )
         .await
         .unwrap();
-        tool.run(
-            json!({"todos":[{"id":"d","content":"only","status":"completed"}]}),
-            &make_ctx(),
-        )
-        .await
-        .unwrap();
+        assert!(
+            wyj_core::progress::read_progress(dir.path()).is_some(),
+            "未完成清单应落盘"
+        );
+        let r = tool
+            .run(
+                json!({"todos":[{"id":"d","content":"only","status":"completed"}]}),
+                &make_ctx(),
+            )
+            .await
+            .unwrap();
         let g = store.lock().unwrap();
         assert_eq!(g.items.len(), 1);
         assert_eq!(g.items[0].id, "d");
+        // 全部完成后清掉 progress.md，避免新一轮对话被陈旧 `[x]` 挡住清面板。
+        assert!(r.content.contains("已清除"));
+        assert!(wyj_core::progress::read_progress(dir.path()).is_none());
     }
 
     #[tokio::test]

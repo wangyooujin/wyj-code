@@ -2734,8 +2734,8 @@ impl AppState {
     /// 一轮新对话开始时清理「按轮次」的生命周期状态。
     ///
     /// 任务面板通常是**某一轮对话**的产物：上一轮全部完成后留着只会误导。
-    /// 但若磁盘仍有 `.wyj-code/progress.md`（TodoWrite 双写的持久清单），
-    /// 跨轮次保留面板，避免长任务进度凭空消失。
+    /// 仅当磁盘 progress.md 仍有**未完成**项时跨轮保留面板（长任务续跑）；
+    /// 全 completed 的陈旧文件不算，否则会挡住清面板。
     ///
     /// 粒度上刻意区别于 `reset_for_new_session`：那是「新会话 / resume /
     /// /clear」用的整块重置，这里只管每轮都会作废的那部分。
@@ -2795,17 +2795,10 @@ impl AppState {
 
     fn begin_turn_lifecycle(&mut self, clear_todos: bool) {
         if clear_todos {
-            // 磁盘还有 progress.md → 长任务续跑，保留面板；否则清掉会话内清单。
-            if !self.has_progress_on_disk() {
-                self.current_todos = None;
-                self.focused_todo_id = None;
-                self.todo_panel_expanded = false;
-                self.selected_todo_id = None;
-                self.todo_detail_open = false;
-                self.todo_detail_scroll = 0;
-                self.todo_detail_max_scroll = 0;
-                self.todo_stats.clear();
-                self.todo_execution_logs.clear();
+            // 磁盘还有未完成进度 → 长任务续跑，保留面板；全 completed / 无文件
+            // 则清掉会话内清单，并删掉陈旧 progress.md，避免下一轮再被回填。
+            if !self.has_unfinished_progress_on_disk() {
+                self.clear_todo_panel_and_progress();
             }
             // 用户主动发了消息 = 恢复对自动唤醒的信任（此前可能是 ESC 打断后暂停的）
             self.auto_wake_paused = false;
@@ -2920,7 +2913,8 @@ impl AppState {
         // 心跳基准随会话一起重置：新会话第一帧不能继承上一段的静默时长，
         // 否则空闲很久后立刻发消息会被看门狗当帧判死。
         self.last_turn_activity = Instant::now();
-        // Progress 跨会话保留：清 UI 后再从磁盘回填，避免 /clear 后长任务进度消失。
+        // 未完成的 Progress 跨会话保留：清 UI 后再从磁盘回填；全 completed 的
+        // 陈旧文件由 load 路径跳过并删除，避免 /new 后仍挂着上一轮 tasklist。
         self.load_progress_panel_from_disk();
     }
 
@@ -12548,25 +12542,7 @@ mod todo_stats_tests {
     // ── TodoWrite 双写 progress.md / 跨轮次保留 ──────────────────────────
 
     #[test]
-    fn turn_done_syncs_todos_to_progress_md() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = make_state();
-        state.cwd = dir.path().to_path_buf();
-        state.apply_agent_event(AgentEvent::TodoUpdate(vec![todo(
-            "p1",
-            TodoStatus::InProgress,
-        )]));
-        state.apply_agent_event(AgentEvent::TurnDone { truncated: false });
-        let body = wyj_core::progress::read_progress(&wyj_core::project_root(dir.path()))
-            .expect("TurnDone 应收口后写回 progress.md");
-        assert!(
-            body.contains("[x]"),
-            "in_progress 应收口成 completed: {body}"
-        );
-    }
-
-    #[test]
-    fn begin_new_turn_keeps_panel_when_progress_md_exists() {
+    fn turn_done_clears_progress_md_when_all_complete() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = make_state();
         state.cwd = dir.path().to_path_buf();
@@ -12575,11 +12551,78 @@ mod todo_stats_tests {
             TodoStatus::InProgress,
         )]));
         state.sync_todos_to_store();
-        assert!(state.has_progress_on_disk());
+        assert!(state.has_unfinished_progress_on_disk());
+        state.apply_agent_event(AgentEvent::TurnDone { truncated: false });
+        // 唯一一项被收口成 completed → 进度文件应删除，否则会挡住下一轮清面板。
+        assert!(
+            wyj_core::progress::read_progress(&wyj_core::project_root(dir.path())).is_none(),
+            "全部完成后 TurnDone 应清掉 progress.md"
+        );
+        assert!(!state.has_unfinished_progress_on_disk());
+    }
+
+    #[test]
+    fn turn_done_keeps_unfinished_items_on_progress_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_state();
+        state.cwd = dir.path().to_path_buf();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("p1", TodoStatus::InProgress),
+            todo("p2", TodoStatus::Pending),
+        ]));
+        state.apply_agent_event(AgentEvent::TurnDone { truncated: false });
+        let body = wyj_core::progress::read_progress(&wyj_core::project_root(dir.path()))
+            .expect("仍有 pending 时应保留 progress.md");
+        assert!(
+            body.contains("[x]"),
+            "in_progress 应收口成 completed: {body}"
+        );
+        assert!(body.contains("[ ]"), "pending 项必须仍在磁盘上: {body}");
+        assert!(state.has_unfinished_progress_on_disk());
+    }
+
+    #[test]
+    fn begin_new_turn_keeps_panel_when_unfinished_progress_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_state();
+        state.cwd = dir.path().to_path_buf();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![todo(
+            "p1",
+            TodoStatus::InProgress,
+        )]));
+        state.sync_todos_to_store();
+        assert!(state.has_unfinished_progress_on_disk());
         state.begin_new_turn();
         assert!(
             state.current_todos.is_some(),
-            "磁盘有 progress.md 时 begin_new_turn 必须保留面板"
+            "磁盘仍有未完成进度时 begin_new_turn 必须保留面板"
+        );
+    }
+
+    #[test]
+    fn begin_new_turn_clears_panel_when_progress_md_all_done() {
+        // 回归：上一轮全部完成后 sync/TurnDone 曾把 `[x]` 清单留在磁盘，
+        // has_progress_on_disk 把「文件非空」当成「长任务续跑」→ 新一轮清不掉面板。
+        let dir = tempfile::tempdir().unwrap();
+        let root = wyj_core::project_root(dir.path());
+        let mut state = make_state();
+        state.cwd = dir.path().to_path_buf();
+        state.current_todos = Some(vec![todo("a", TodoStatus::Completed)]);
+        wyj_core::progress::write_progress(&root, "- [x] already done\n").unwrap();
+        assert!(
+            !state.has_unfinished_progress_on_disk(),
+            "全 completed 不算未完成进度"
+        );
+
+        state.begin_new_turn();
+
+        assert!(
+            state.current_todos.is_none(),
+            "新一轮必须清空已完成任务列表"
+        );
+        assert!(
+            wyj_core::progress::read_progress(&root).is_none(),
+            "陈旧全完成 progress.md 应被删掉"
         );
     }
 
@@ -12595,6 +12638,24 @@ mod todo_stats_tests {
         let items = state.current_todos.as_ref().expect("应从磁盘灌进面板");
         assert_eq!(items.len(), 3);
         assert_eq!(state.focused_todo_id.as_deref(), Some("p2"));
+    }
+
+    #[test]
+    fn load_progress_panel_from_disk_skips_all_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = wyj_core::project_root(dir.path());
+        wyj_core::progress::write_progress(&root, "- [x] old-a\n- [x] old-b\n").unwrap();
+        let mut state = make_state();
+        state.cwd = dir.path().to_path_buf();
+        state.load_progress_panel_from_disk();
+        assert!(
+            state.current_todos.is_none(),
+            "/new 或 /clear 后不应回填已全部完成的旧清单"
+        );
+        assert!(
+            wyj_core::progress::read_progress(&root).is_none(),
+            "跳过回填时应顺手删掉全完成的陈旧 progress.md"
+        );
     }
 
     // ── 新一轮对话清空任务板 ─────────────────────────────────────────────
