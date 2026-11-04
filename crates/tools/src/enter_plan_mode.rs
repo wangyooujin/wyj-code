@@ -45,28 +45,6 @@ pub struct EnterPlanModeTool {
     sensitivity: PlanSensitivity,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plan_sensitivity_parse_aliases() {
-        assert_eq!(
-            PlanSensitivity::parse("conservative"),
-            PlanSensitivity::Conservative
-        );
-        assert_eq!(
-            PlanSensitivity::parse("proactive"),
-            PlanSensitivity::Proactive
-        );
-        assert_eq!(
-            PlanSensitivity::parse("aggressive"),
-            PlanSensitivity::Proactive
-        );
-        assert_eq!(PlanSensitivity::parse(""), PlanSensitivity::Conservative);
-    }
-}
-
 impl EnterPlanModeTool {
     pub fn new(sensitivity: PlanSensitivity) -> Self {
         Self { sensitivity }
@@ -117,5 +95,27 @@ impl Tool for EnterPlanModeTool {
                 "User declined to enter plan mode. Stay in the current execution mode and proceed with the task; do not call EnterPlanMode again for the same request unless the user asks to plan first.",
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_sensitivity_parse_aliases() {
+        assert_eq!(
+            PlanSensitivity::parse("conservative"),
+            PlanSensitivity::Conservative
+        );
+        assert_eq!(
+            PlanSensitivity::parse("proactive"),
+            PlanSensitivity::Proactive
+        );
+        assert_eq!(
+            PlanSensitivity::parse("aggressive"),
+            PlanSensitivity::Proactive
+        );
+        assert_eq!(PlanSensitivity::parse(""), PlanSensitivity::Conservative);
     }
 }
