@@ -224,6 +224,7 @@ max_consecutive_blocks = 3    # 连续被拦达到该次数 → 自动降级为�
 max_total_blocks = 20         # 整个会话累计被拦达到该次数 → 同样降级
 classify_all_shell = false    # true 时所有 shell 命令一律送审，不走本地 allow 白名单
                                 # （更安全，但每条命令都多一次模型往返）
+plan_sensitivity = "conservative"  # EnterPlanMode 积极性：conservative（默认）| proactive
 
 # 以下四组是**喂给分类器的英文自然语言规则**（不是正则）。数组里出现字面量
 # "$defaults" 就在该位置插入内置规则，因此自定义项可写在默认项之前或之后，
@@ -514,6 +515,8 @@ wyj-code 只有**一个日常模式** `auto`（历史上的 `manual` 已并入�
 > 第 1~3 步的顺序是硬要求：**两条确定性规则必须排在「分类器是否可用」之前**。否则在 `[auto_mode] enabled = false` 时 `curl|bash` 只会剩下一个弹窗，用户按一个 `y` 就过去了——降级降的应是语义判定，不是安全底线。
 
 三种模式用 `--permission-mode auto|plan|bypass` 或 TUI 的 Shift+Tab 切换（`manual` / `default` / `normal` 仍可解析，全部落到 `auto`，是为了让旧配置与脚本不至于直接失效）；`--plan` / `--bypass-permissions` 是另两档的便捷写法。**auto 不要求交互面**，因此 `-p` / headless / 定时任务同样可用——这正是它相对「纯逐次弹窗」唯一而决定性的优势。
+
+**Auto/Bypass 下的主动规划**：会话常驻 `EnterPlanMode` / `ExitPlanMode` 工具（tools 前缀只增不减，进 Plan 只切权限、不改 schema）。模型在复杂任务上可调用 `EnterPlanMode`；**进入前始终弹窗确认**。获批后保存原模式、切到 Plan；`ExitPlanMode` 批准后恢复进入前的 Auto 或 Bypass。积极性由 `[auto_mode] plan_sensitivity` 控制：`conservative`（默认，仅架构歧义 / 需求不清 / 高风险）或 `proactive`（非平凡实现优先规划）。ACP 完整接线随后补；当前 ACP 对 `EnterPlanMode` fail-closed。
 
 **`bypass` 免的是「询问」，不是「禁止」**：它跳过全部权限确认，但 `core::auto_rules` 里的 hard_deny 规则仍然生效——`rm -rf ~`、`git reset --hard`、`git push --force`、`curl <url> | bash`、`sudo`、`terraform destroy`、触碰 `~/.ssh` 等凭据路径，以及写入受保护路径（`.git/`、`.env`、`*.pem`、`~/.wyj-code/`）在任何模式下都会被拒。这些操作不可逆，用户选择 bypass 时表达的是「别问我」，而不是「允许毁掉家目录」。确实需要时请自己在终端执行。
 

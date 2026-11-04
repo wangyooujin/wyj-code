@@ -15,15 +15,15 @@ use dialogs::*;
 
 use crate::app::{
     fmt_tokens, format_elapsed, format_hms, ActionMenu, AgentsDialog, AppState, AskQuestionDialog,
-    AskQuestionStage, Attachment, ChatMessage, EffortPickerDialog, EvolutionDialog, EvolutionRow,
-    ExecModeConfirmDialog, ExtensionsDialog, FlatRow, InProgressAnswer, InputOwner, McpConnStatus,
-    McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, ModelPickerDialog,
-    PermissionDialog, PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab,
-    ProfileDialog, ProfileFieldKind, ProfileInputField, ProfileOverlay, ProfileRow,
-    SessionConflictDialog, SessionPickerState, SettingsDialog, SettingsFieldKind,
-    SettingsInputField, SettingsOverlay, SkillsBrowseSource, SkillsDialog, SkillsDialogTab,
-    SkillsOverlay, SubAgentStatus, SubAgentUiState, TodoExecutionEntry, TodoRuntimeStats, UiFocus,
-    PROFILE_FIELD_SPECS, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_SPECS,
+    AskQuestionStage, Attachment, ChatMessage, EffortPickerDialog, EnterPlanDialog,
+    EvolutionDialog, EvolutionRow, ExecModeConfirmDialog, ExtensionsDialog, FlatRow,
+    InProgressAnswer, InputOwner, McpConnStatus, McpDialog, McpDialogTab, McpOverlay, MemoryDialog,
+    MemoryRow, MessageRole, ModelPickerDialog, PermissionDialog, PlanApprovalDialog, PluginOverlay,
+    PluginsDialog, PluginsDialogTab, ProfileDialog, ProfileFieldKind, ProfileInputField,
+    ProfileOverlay, ProfileRow, SessionConflictDialog, SessionPickerState, SettingsDialog,
+    SettingsFieldKind, SettingsInputField, SettingsOverlay, SkillsBrowseSource, SkillsDialog,
+    SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, TodoExecutionEntry,
+    TodoRuntimeStats, UiFocus, PROFILE_FIELD_SPECS, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_SPECS,
 };
 use crate::input::{is_atomic_marker, InputBox, ATTACHMENT_MARKER, PASTE_MARKER};
 use crate::markdown::{
@@ -785,6 +785,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
                 draw_plan_approval_panel(f, dlg, chunks[1]);
             }
         }
+        BottomPanel::EnterPlan => {
+            if let Some(dlg) = &state.enter_plan_dialog {
+                draw_enter_plan_dialog(f, dlg, chunks[1]);
+            }
+        }
         BottomPanel::SubAgents => {
             draw_sub_agents_panel(f, state, chunks[1]);
         }
@@ -994,6 +999,7 @@ enum BottomPanel {
     SkillTrust,
     ExecModeConfirm,
     PlanApproval,
+    EnterPlan,
     SubAgents,
     ShellProcesses,
 }
@@ -1066,6 +1072,10 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     if state.exec_mode_confirm.is_some() {
         // 待发送预览 + 三个选项 + hint
         return (8u16.min(area_height), BottomPanel::ExecModeConfirm);
+    }
+    if state.enter_plan_dialog.is_some() {
+        // 说明 + 可选 reason + 两档选项 + hint
+        return (9u16.min(area_height), BottomPanel::EnterPlan);
     }
     if state.plan_dialog.is_some() {
         // 计划正文已作为普通消息并入应用内聊天流，
@@ -3545,6 +3555,9 @@ fn thinking_status_label(state: &AppState) -> String {
     //      `current_op` 判定，否则秒表会把"等审批的时间"算成"命令跑了多久"。
     if state.permission_dialog.is_some() {
         return wyj_i18n::tr("spinner.waiting_approval");
+    }
+    if state.enter_plan_dialog.is_some() {
+        return wyj_i18n::tr("spinner.enter_plan");
     }
     if state.plan_dialog.is_some() {
         return wyj_i18n::tr("spinner.reviewing_plan");

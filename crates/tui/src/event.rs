@@ -80,6 +80,11 @@ pub enum AgentEvent {
         plan: String,
         response_tx: tokio::sync::oneshot::Sender<bool>,
     },
+    /// EnterPlanMode：模型请求进入 Plan，需用户确认
+    EnterPlanRequest {
+        reason: String,
+        response_tx: tokio::sync::oneshot::Sender<bool>,
+    },
     /// Agent 忙碌期间排队的补充消息已被消费并合并进 session
     Injected,
     /// 分组管理面板"拉取模型列表"结果（entry 下标, field 下标, 拉取结果）

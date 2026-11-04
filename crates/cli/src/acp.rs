@@ -895,6 +895,11 @@ async fn permission_bridge(
                 };
                 let _ = response_tx.send(!matches!(result, PermissionDecision::Deny));
             }
+            // ACP 完整 EnterPlanMode 状态机（pre_plan_mode 恢复）留待后续；
+            // 现阶段 fail-closed，避免半吊子切模式把会话卡在无法退出的 Plan。
+            UiAskRequest::EnterPlanMode { response_tx, .. } => {
+                let _ = response_tx.send(false);
+            }
             UiAskRequest::Questions { response_tx, .. } => {
                 // ACP elicitation is optional and not advertised. Fail closed instead of silently
                 // fabricating answers.

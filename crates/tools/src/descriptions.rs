@@ -23,7 +23,50 @@ pub const TODO_WRITE: &str = "Create and update the task list shown in the TUI p
 
 pub const ASK_QUESTION: &str = "Presents the user a structured questionnaire (1-4 questions, each with 2-4 options) and waits for their answers. Use it only at genuine decision points — ambiguous requirements or choices only the user can make. Do not use it for anything you can resolve yourself from the code or sensible defaults. An \"Other\" free-text option is appended to every question automatically.";
 
-pub const EXIT_PLAN_MODE: &str = "Call this when you are in plan mode and have finished designing the implementation plan. Pass the complete plan (Markdown) as the `plan` parameter; the user reviews it and, on approval, execution mode is enabled automatically. Do not ask for approval in prose — this tool IS the approval request.";
+pub const EXIT_PLAN_MODE: &str = "Call this when you are in plan mode and have finished designing the implementation plan. Pass the complete plan (Markdown) as the `plan` parameter; the user reviews it and, on approval, the previous execution mode is restored automatically. Do not ask for approval in prose — this tool IS the approval request.";
+
+/// Auto/Bypass 下模型主动请求进入 Plan（偏保守：默认档）。
+pub const ENTER_PLAN_MODE_CONSERVATIVE: &str = r#"Request entering plan mode so you can explore and design an approach before changing code. The user must approve. Use this only when the implementation approach is genuinely unclear or high-impact.
+
+## When to use
+Use EnterPlanMode when ANY of these apply:
+1. Significant architectural ambiguity — multiple reasonable approaches that meaningfully affect the codebase
+2. Unclear requirements — you need to explore and clarify before you can make progress
+3. High-risk or hard-to-revert changes — schema/migrations, auth, permissions, destructive refactors
+4. Large multi-module work where local choices would break global consistency
+
+## When NOT to use
+Skip plan mode when you can reasonably infer the right approach:
+- Straightforward tasks even if they touch multiple files
+- Specific requests with a clear implementation path
+- Features that follow an obvious existing pattern (button, endpoint, typo, null check)
+- Bug fixes that are clear once the root cause is understood
+- Pure research/exploration (use the Agent tool with Explore instead)
+- The user already said to just start ("just do it", "implement X")
+
+When in doubt, prefer starting work and using AskQuestion for a single concrete choice rather than a full planning phase. This tool REQUIRES user approval."#;
+
+/// Auto/Bypass 下模型主动请求进入 Plan（偏积极）。
+pub const ENTER_PLAN_MODE_PROACTIVE: &str = r#"Request entering plan mode so you can explore and design an approach before changing code. The user must approve. Prefer this for non-trivial implementation work so you get sign-off before writing code.
+
+## When to use
+Prefer EnterPlanMode for implementation tasks unless they are simple. Use it when ANY of these apply:
+1. New feature implementation with open design choices
+2. Multiple valid approaches (caching, state management, protocols, …)
+3. Changes that affect existing behavior or structure
+4. Architectural decisions between patterns or technologies
+5. Likely multi-file work (more than 2–3 files)
+6. Unclear requirements that need exploration first
+7. User preferences matter — if you would call AskQuestion about the approach, enter plan mode instead
+
+## When NOT to use
+Only skip for simple tasks:
+- Single-line or few-line fixes (typos, obvious bugs, small tweaks)
+- Adding a single function with clear requirements
+- Tasks where the user gave very specific, detailed instructions
+- Pure research/exploration (use the Agent tool with Explore instead)
+
+If unsure, err on the side of planning. This tool REQUIRES user approval."#;
 
 /// SubAgent 工具描述模板：`{types}` 处由运行时替换为可用类型列表。
 pub const SUB_AGENT_TEMPLATE: &str = "Use this tool when you need to launch a new agent to handle complex, multi-faceted work that requires multiple steps or involves a research task. Each subagent operates independently with its own context, so when delegating work, provide clear, specific instructions about what the subagent should accomplish and any constraints or requirements it should follow.\n\nWhen using the Agent tool, you can specify the `subagent_type` to indicate which agent variant to use:\n\n{types}\n\nEach subagent has its own context window — the only context it sees is what you put in `prompt` and what it returns to you in its final message. Intermediate tool calls, file reads, and exploration output stay inside the subagent and do NOT pollute your main conversation.\n\nDelegate only when parallelism or context isolation is worth the cost — a subagent carries its own system prompt and tool schemas. Prefer spawning a subagent when:\n- the task is open-ended and you would otherwise need to read many files yourself (use Explore to keep that output out of the main context);\n- two or more independent multi-step tracks can run in parallel — call multiple Agent tools in one response;\n- a self-contained write/refactor/investigation would drown the main conversation in intermediate reads.\n\nDo NOT delegate routine coding you can finish with a few Read/Grep/Glob/Edit calls (one-line fix, known-file tweak, typo, single-file change). Multiple Agent calls in one response run concurrently. With `run_in_background=true` the agent runs in the background and its final result is injected into the conversation when ready; with `false` (default) the call blocks until the subagent finishes.\n\nIf a subagent stops early (you interrupt it, it hits its turn limit, or it fails), what you get back is a handoff rather than a bare error: its last stated position, the files it read and modified, commands it ran, and the errors it hit. That is enough to resume the work without replaying its history — decide explicitly whether to finish it yourself, spawn a fresh agent seeded with that position, or report the blockage. Do not restart from scratch when the handoff already tells you where it stopped.";

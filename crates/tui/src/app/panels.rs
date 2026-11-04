@@ -96,11 +96,7 @@ impl AppState {
             .rev()
             .find(|t| t.status == TodoStatus::InProgress)
             .map(|t| t.id.clone());
-        self.current_todos = if items.is_empty() {
-            None
-        } else {
-            Some(items)
-        };
+        self.current_todos = if items.is_empty() { None } else { Some(items) };
         self.ensure_selected_todo();
     }
 

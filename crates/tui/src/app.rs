@@ -47,7 +47,7 @@ use wyj_tools::{
     ctx::{install_global_tool_output_sink, UiAskRequest},
     PermissionMode,
 };
-use wyj_tools::{ExitPlanModeTool, TodoStore, ToolCtx};
+use wyj_tools::{TodoStore, ToolCtx};
 
 /// 后台 shell 任务退出时，读取多少字节的输出尾部喂给模型（喂之前还会再经
 /// `truncate_head_tail` 收口到 4KB）。留 64KB 是为了覆盖「模型正要关心
@@ -627,6 +627,38 @@ pub struct PermissionDialog {
     pub response_tx: tokio::sync::oneshot::Sender<wyj_tools::PermissionDecision>,
     /// ↑↓ 选中的选项下标（对应 [`Self::choices`]）
     pub selected: usize,
+}
+
+/// EnterPlanMode 确认对话框：仅「进入 / 继续执行」两档（无 Always）。
+#[derive(Debug)]
+pub struct EnterPlanDialog {
+    /// 模型给出的短说明（可空）
+    pub reason: String,
+    pub response_tx: tokio::sync::oneshot::Sender<bool>,
+    /// 0 = 进入 plan，1 = 继续当前模式
+    pub selected: usize,
+}
+
+impl EnterPlanDialog {
+    pub fn new(reason: String, response_tx: tokio::sync::oneshot::Sender<bool>) -> Self {
+        Self {
+            reason,
+            response_tx,
+            selected: 0,
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn move_down(&mut self) {
+        self.selected = (self.selected + 1).min(1);
+    }
+
+    pub fn approve(&self) -> bool {
+        self.selected == 0
+    }
 }
 
 impl PermissionDialog {
@@ -2107,6 +2139,10 @@ pub struct AppState {
     pub ask_question_dialog: Option<AskQuestionDialog>,
     /// ExitPlanMode 触发的计划批准对话框
     pub plan_dialog: Option<PlanApprovalDialog>,
+    /// EnterPlanMode 触发的「是否进入 Plan」确认框
+    pub enter_plan_dialog: Option<EnterPlanDialog>,
+    /// 进入 Plan 前的模式（Exit 批准后恢复）；手动 Shift+Tab 离开 Plan 时清空。
+    pub pre_plan_mode: Option<AgentMode>,
     /// 检测到计划已批准仍在 plan 模式发消息时的确认对话框
     pub exec_mode_confirm: Option<ExecModeConfirmDialog>,
     /// 真实 scrollback 冻结边界。`messages[..frozen_up_to]` 已通过
@@ -2558,6 +2594,8 @@ impl AppState {
             read_only_session: false,
             ask_question_dialog: None,
             plan_dialog: None,
+            enter_plan_dialog: None,
+            pre_plan_mode: None,
             exec_mode_confirm: None,
             frozen_up_to: 0,
             welcome_frozen: false,
@@ -2980,6 +3018,9 @@ impl AppState {
         if let Some(dlg) = self.plan_dialog.take() {
             let _ = dlg.response_tx.send(false);
         }
+        if let Some(dlg) = self.enter_plan_dialog.take() {
+            let _ = dlg.response_tx.send(false);
+        }
         self.exec_mode_confirm = None;
         self.clear_pending_uploads();
         self.injector = None;
@@ -3125,6 +3166,7 @@ impl AppState {
         if self.permission_dialog.is_some()
             || self.ask_question_dialog.is_some()
             || self.plan_dialog.is_some()
+            || self.enter_plan_dialog.is_some()
             || self.exec_mode_confirm.is_some()
         {
             self.last_turn_activity = Instant::now();
@@ -3152,6 +3194,9 @@ impl AppState {
             let _ = dlg.response_tx.send(None);
         }
         if let Some(dlg) = self.plan_dialog.take() {
+            let _ = dlg.response_tx.send(false);
+        }
+        if let Some(dlg) = self.enter_plan_dialog.take() {
             let _ = dlg.response_tx.send(false);
         }
         self.exec_mode_confirm = None;
@@ -3425,21 +3470,23 @@ fn has_plan_approved(messages: &[Message]) -> bool {
     false
 }
 
-/// plan 模式下返回注入了 ExitPlanMode 工具和 system prompt 的 agent 副本，否则直接 Arc::clone
-fn plan_turn_agent(base: &Arc<Agent>, mode: &AgentMode) -> Arc<Agent> {
-    if !matches!(mode, AgentMode::Plan) {
-        return Arc::clone(base);
+/// 历史命名保留：Enter/ExitPlanMode 已在装配期常驻（见 `assembly::CONDITIONAL_CORE_TOOLS`），
+/// Plan 指引走 volatile（`Agent::push_request_volatile_tail`），不再 clone + append_system，
+/// 否则进 Plan 会打穿 tools/system 缓存前缀。
+fn plan_turn_agent(base: &Arc<Agent>, _mode: &AgentMode) -> Arc<Agent> {
+    Arc::clone(base)
+}
+
+/// 进入 Plan 前记下原先模式，供 ExitPlanMode 批准后恢复（Auto 或 Bypass）。
+fn remember_pre_plan_mode(state: &mut AppState) {
+    if state.pre_plan_mode.is_none() && !matches!(state.mode, AgentMode::Plan) {
+        state.pre_plan_mode = Some(state.mode.clone());
     }
-    let mut a = (**base).clone();
-    a.register_tool(Arc::new(ExitPlanModeTool));
-    // ExitPlanMode 不在全局 ALWAYS_VISIBLE 里（非 Plan 会话不该付这份 schema）。
-    // register_tool 只 upsert catalog，不自动 expose——这里必须显式常驻，
-    // 否则 lazy 折叠会让模型「写完计划却调不出退出工具」。
-    if let Some(state) = a.lazy_tool_state() {
-        state.expose("ExitPlanMode");
-    }
-    let a = a.append_system(wyj_core::prompts::PLAN_TURN);
-    Arc::new(a)
+}
+
+/// ExitPlanMode / 手动离开 Plan 时恢复进入前的模式；无记录则回 Auto。
+fn take_restore_mode(state: &mut AppState) -> AgentMode {
+    state.pre_plan_mode.take().unwrap_or(AgentMode::Auto)
 }
 
 /// 给重建出的 Agent 挂上工具事件回调（ToolStart/ToolEnd → AgentEvent，
@@ -5791,6 +5838,15 @@ async fn tui_main(
                 }
                 Ok(UiAskRequest::ExitPlanMode { plan, response_tx }) => {
                     state.apply_agent_event(AgentEvent::PlanApprovalRequest { plan, response_tx });
+                }
+                Ok(UiAskRequest::EnterPlanMode {
+                    reason,
+                    response_tx,
+                }) => {
+                    state.apply_agent_event(AgentEvent::EnterPlanRequest {
+                        reason,
+                        response_tx,
+                    });
                 }
                 Ok(UiAskRequest::ToolPermission {
                     tool_name,
@@ -8501,9 +8557,10 @@ async fn tui_main(
                                         current_session_id.clone(),
                                         session_store.as_ref(),
                                     );
-                                    // 切换至执行模式；switch_mode 同步更新 shared_permission，
-                                    // 对正在运行的这一轮（ExitPlanMode 调用所在的 turn）立即生效。
-                                    let new_mode = AgentMode::Auto;
+                                    // 恢复进入 Plan 前的模式（Auto 或 Bypass）；
+                                    // switch_mode 同步更新 shared_permission，对正在
+                                    // 运行的这一轮立即生效。
+                                    let new_mode = take_restore_mode(&mut state);
                                     switch_mode(
                                         &shared_mode,
                                         &shared_permission,
@@ -8511,14 +8568,15 @@ async fn tui_main(
                                         &permission_constraints,
                                     )
                                     .await;
-                                    state.mode = new_mode;
+                                    state.mode = new_mode.clone();
                                     // Agent 会继续执行后续工具，恢复 spinner；批准分支
                                     // 也负责把 is_thinking 写回 true（PlanApprovalRequest
                                     // 阶段刻意不再预设 false，避免吞掉 Ctrl+C 中断路径）。
                                     state.is_thinking = true;
-                                    state.messages.push(ChatMessage::system(
-                                        "已批准计划，切换至执行模式。".to_string(),
-                                    ));
+                                    state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                                        "mode.plan_approved",
+                                        &[("mode", new_mode.label())],
+                                    )));
                                 }
                             }
                             PlanApprovalOutcome::Reject => {
@@ -8543,6 +8601,70 @@ async fn tui_main(
                                 state.interrupt();
                                 state.enqueue_message(OutgoingMessage::plain(text));
                             }
+                        }
+                        continue;
+                    }
+
+                    // ①.4 EnterPlanMode：是否进入 Plan
+                    if state.enter_plan_dialog.is_some() {
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            if let Some(dlg) = state.enter_plan_dialog.take() {
+                                let _ = dlg.response_tx.send(false);
+                            }
+                            state.interrupt();
+                            continue;
+                        }
+                        match key.code {
+                            KeyCode::Up | KeyCode::Left => {
+                                if let Some(dlg) = &mut state.enter_plan_dialog {
+                                    dlg.move_up();
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Right => {
+                                if let Some(dlg) = &mut state.enter_plan_dialog {
+                                    dlg.move_down();
+                                }
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                if let Some(dlg) = state.enter_plan_dialog.take() {
+                                    let approved = dlg.approve();
+                                    // 先切模式再 send：Agent 在 enter_plan_mode 返回后
+                                    // 的下一轮请求就要看到 Plan 权限与 volatile 指引。
+                                    if approved {
+                                        remember_pre_plan_mode(&mut state);
+                                        let new_mode = AgentMode::Plan;
+                                        switch_mode(
+                                            &shared_mode,
+                                            &shared_permission,
+                                            new_mode.clone(),
+                                            &permission_constraints,
+                                        )
+                                        .await;
+                                        state.mode = new_mode;
+                                        state.messages.push(ChatMessage::system(wyj_i18n::tr(
+                                            "mode.enter_plan_approved",
+                                        )));
+                                    } else {
+                                        state.messages.push(ChatMessage::system(wyj_i18n::tr(
+                                            "mode.enter_plan_declined",
+                                        )));
+                                    }
+                                    let _ = dlg.response_tx.send(approved);
+                                    state.is_thinking = true;
+                                }
+                            }
+                            KeyCode::Esc => {
+                                if let Some(dlg) = state.enter_plan_dialog.take() {
+                                    let _ = dlg.response_tx.send(false);
+                                }
+                                state.messages.push(ChatMessage::system(wyj_i18n::tr(
+                                    "mode.enter_plan_declined",
+                                )));
+                                state.is_thinking = true;
+                            }
+                            _ => {}
                         }
                         continue;
                     }
@@ -8574,7 +8696,7 @@ async fn tui_main(
                                                 current_session_id.clone(),
                                                 session_store.as_ref(),
                                             );
-                                            let new_mode = AgentMode::Auto;
+                                            let new_mode = take_restore_mode(&mut state);
                                             switch_mode(
                                                 &shared_mode,
                                                 &shared_permission,
@@ -8582,9 +8704,12 @@ async fn tui_main(
                                                 &permission_constraints,
                                             )
                                             .await;
-                                            state.mode = new_mode;
+                                            state.mode = new_mode.clone();
                                             state.messages.push(ChatMessage::system(
-                                                "已切换至执行模式。".to_string(),
+                                                wyj_i18n::tr_fmt(
+                                                    "mode.switched",
+                                                    &[("mode", new_mode.label())],
+                                                ),
                                             ));
                                             state.push_user(dlg.pending_display.clone());
                                             state.begin_new_turn();
@@ -9155,8 +9280,16 @@ async fn tui_main(
 
                     // Shift+Tab → 循环切换模式
                     if key.code == KeyCode::BackTab {
+                        let prev = state.mode.clone();
                         let new_mode = cycle_mode(&state.mode);
                         let label = new_mode.label();
+                        if matches!(new_mode, AgentMode::Plan) {
+                            remember_pre_plan_mode(&mut state);
+                        } else if matches!(prev, AgentMode::Plan) {
+                            // 手动离开 Plan：丢掉「Exit 后恢复」记忆，避免之后
+                            // 误回到过期的 pre_plan_mode。
+                            state.pre_plan_mode = None;
+                        }
                         switch_mode(
                             &shared_mode,
                             &shared_permission,
@@ -9281,8 +9414,10 @@ async fn tui_main(
                                     if let Some(gate) = auto_gate.as_ref() {
                                         gate.enable_classifier();
                                     }
+                                    state.pre_plan_mode = None;
                                     AgentMode::Auto
                                 } else {
+                                    remember_pre_plan_mode(&mut state);
                                     AgentMode::Plan
                                 };
                                 switch_mode(
@@ -12424,7 +12559,10 @@ mod todo_stats_tests {
         state.apply_agent_event(AgentEvent::TurnDone { truncated: false });
         let body = wyj_core::progress::read_progress(&wyj_core::project_root(dir.path()))
             .expect("TurnDone 应收口后写回 progress.md");
-        assert!(body.contains("[x]"), "in_progress 应收口成 completed: {body}");
+        assert!(
+            body.contains("[x]"),
+            "in_progress 应收口成 completed: {body}"
+        );
     }
 
     #[test]
@@ -12449,11 +12587,8 @@ mod todo_stats_tests {
     fn load_progress_panel_from_disk_seeds_current_todos() {
         let dir = tempfile::tempdir().unwrap();
         let root = wyj_core::project_root(dir.path());
-        wyj_core::progress::write_progress(
-            &root,
-            "- [x] done\n- [~] active\n- [ ] next\n",
-        )
-        .unwrap();
+        wyj_core::progress::write_progress(&root, "- [x] done\n- [~] active\n- [ ] next\n")
+            .unwrap();
         let mut state = make_state();
         state.cwd = dir.path().to_path_buf();
         state.load_progress_panel_from_disk();

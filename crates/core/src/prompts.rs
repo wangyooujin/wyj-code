@@ -271,11 +271,14 @@ pub fn git_status_snapshot(cwd: &std::path::Path) -> Option<String> {
 /// headless --plan 模式
 pub const PLAN_MODE: &str = "You are in plan mode: analyze the codebase and produce a plan, but do NOT modify any files or run state-changing commands. Only read-only operations are allowed.";
 
-/// TUI 逐轮 Plan 模式（注册了 ExitPlanMode 工具）
+/// TUI 逐轮 Plan 模式指引（注入 volatile / EnterPlanMode 的 tool_result，不进 stable system）。
 pub const PLAN_TURN: &str = r#"Plan mode is active. Investigate the task with read-only tools first, then present your implementation plan by calling the ExitPlanMode tool with the complete plan (Markdown) as the `plan` parameter. Do NOT edit files or run state-changing commands before the user approves the plan. Bash is restricted to read-only commands (ls, cat, git status, git log, etc.)."#;
 
-/// headless 单次问答（-p）：AskQuestion 不可用
-pub const NON_INTERACTIVE: &str = "You are running non-interactively: the user cannot answer questions. Do not call AskQuestion; make reasonable assumptions, state them briefly, and proceed.";
+/// EnterPlanMode 获批后的 tool_result 正文（与 [`PLAN_TURN`] 对齐，但面向「刚切入」）。
+pub const ENTERED_PLAN_MODE: &str = r#"Entered plan mode. Explore the codebase with read-only tools, use AskQuestion if you need to clarify approaches, then call ExitPlanMode with the complete Markdown plan when ready. Do NOT edit files or run state-changing commands until the plan is approved. Bash is restricted to read-only commands (ls, cat, git status, git log, etc.)."#;
+
+/// headless 单次问答（-p）：AskQuestion / EnterPlanMode 不可用
+pub const NON_INTERACTIVE: &str = "You are running non-interactively: the user cannot answer questions or approve mode switches. Do not call AskQuestion or EnterPlanMode; make reasonable assumptions, state them briefly, and proceed.";
 
 /// Auto 模式分类器的 system prompt（对齐 Claude Code 的 classifier）。
 ///

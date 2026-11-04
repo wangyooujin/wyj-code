@@ -119,6 +119,7 @@ thinking:
 spinner:
   thinking: "Thinking"
   waiting_approval: "Waiting for approval"
+  enter_plan: "Confirm enter plan"
   reviewing_plan: "Reviewing plan"
   queuing_message: "Queuing message"
   stream_rate: "{rate} tok/s"
@@ -936,13 +937,16 @@ effort:
 mode:
   switched: "Switched to {mode} mode"
   switched_to_plan: "Switched to plan mode. Describe what you'd like to analyze or plan."
+  plan_approved: "Plan approved. Restored {mode} mode and starting implementation."
+  enter_plan_approved: "Entered plan mode. The agent will research first, then submit a plan."
+  enter_plan_declined: "Declined plan mode; staying in the current execution mode."
 
 selection:
   copied: "Copied {chars} characters"
   copy_failed: "Copy failed: {error}"
 
 auto:
-  mode_notice: "Auto mode: most actions run without prompting; dangerous ones are still blocked. Shift+Tab switches to plan / bypass."
+  mode_notice: "Auto mode: most actions run without prompting; dangerous ones are still blocked; complex tasks may ask to enter plan first. Shift+Tab switches to plan / bypass."
   degraded_to_confirm: "The auto classifier blocked too many actions in a row, so the model classifier has been switched off: dangerous commands are still blocked by the hard rules, and everything else now asks you one by one. Run /plan auto to turn the classifier back on."
 
 cwd:
@@ -1064,6 +1068,11 @@ dialog:
   permission_choice_always: "Always allow this"
   permission_choice_project: "Allow for this project (won't ask again)"
   permission_choice_deny: "Deny"
+  enter_plan_title: " Enter plan mode? "
+  enter_plan_body: "The agent wants to plan before changing code. Approving allows read-only exploration until you review the plan."
+  enter_plan_reason_label: "Reason: "
+  enter_plan_choice_enter: "Enter plan mode"
+  enter_plan_choice_stay: "Stay in current mode and execute"
   project_trust_approve: "Trust and connect"
   project_trust_skip: "Skip for now"
   skill_trust_approve: "Trust and enable"

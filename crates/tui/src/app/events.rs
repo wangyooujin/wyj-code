@@ -577,6 +577,16 @@ impl AppState {
                 self.plan_dialog = Some(PlanApprovalDialog::new(response_tx));
             }
 
+            AgentEvent::EnterPlanRequest {
+                reason,
+                response_tx,
+            } => {
+                // 同 PlanApproval：Agent 卡在 enter_plan_mode().await，保持
+                // is_thinking，否则 Ctrl+C 中断路径失效。
+                self.enter_plan_dialog =
+                    Some(crate::app::EnterPlanDialog::new(reason, response_tx));
+            }
+
             AgentEvent::SubAgent(ev) => self.apply_sub_agent_event(ev),
 
             AgentEvent::ShellKilled(id) => {

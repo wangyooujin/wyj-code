@@ -104,6 +104,11 @@ pub trait ToolContext: Send + Sync {
     async fn exit_plan_mode(&self, _plan: &str) -> bool {
         false
     }
+    /// 请求进入 plan 模式并等待用户批准。`reason` 为模型给出的短说明（可空）。
+    /// 无交互表面默认拒绝。
+    async fn enter_plan_mode(&self, _reason: &str) -> bool {
+        false
+    }
     /// 逐调用工具权限确认：在执行一个 `needs_permission` 的工具前调用，
     /// 返回 true 表示放行、false 表示用户拒绝。`summary` 为展示给用户的操作摘要
     /// （如 bash 命令、目标文件）。默认拒绝，避免无 UI / 子 Agent fail-open。

@@ -106,6 +106,7 @@ impl AgentMode {
                 "ask_question",
                 "write",
                 "bash",
+                "enter_plan_mode",
                 "exit_plan_mode",
             ]),
             _ => None,
@@ -527,6 +528,14 @@ pub struct AutoModeCfg {
     pub max_total_blocks: u32,
     /// true 时所有 shell 命令一律送审，不再走确定性 allow 白名单（更安全更慢）。
     pub classify_all_shell: bool,
+    /// Auto/Bypass 下模型调用 `EnterPlanMode` 的积极性。
+    ///
+    /// - `"conservative"`（默认）：仅在架构歧义、需求不清、高风险或多方案时进入。
+    /// - `"proactive"`：非平凡实现任务优先进入（亦接受别名 `aggressive`）。
+    ///
+    /// 进 Plan 前**始终**弹窗询问用户（与 Claude Code 一致）；本字段只改工具描述
+    /// 里「何时该请求」的指引，不关掉确认。
+    pub plan_sensitivity: String,
     /// 分类器规则文本（英文自然语言规则，非正则）。数组中出现字面量
     /// `"$defaults"` 就在该位置插入内置规则；不写则整段替换内置规则。
     pub hard_deny: Vec<String>,
@@ -544,6 +553,7 @@ impl Default for AutoModeCfg {
             max_consecutive_blocks: 3,
             max_total_blocks: 20,
             classify_all_shell: false,
+            plan_sensitivity: "conservative".into(),
             hard_deny: Vec::new(),
             soft_deny: Vec::new(),
             allow: Vec::new(),
@@ -756,9 +766,7 @@ pub struct ToolsCfg {
 
 impl Default for ToolsCfg {
     fn default() -> Self {
-        Self {
-            todo_enabled: true,
-        }
+        Self { todo_enabled: true }
     }
 }
 
@@ -2950,6 +2958,7 @@ context_window = 200000
         assert_eq!(cfg.auto_mode.max_consecutive_blocks, 3);
         assert_eq!(cfg.auto_mode.max_total_blocks, 20);
         assert!(!cfg.auto_mode.classify_all_shell);
+        assert_eq!(cfg.auto_mode.plan_sensitivity, "conservative");
         assert!(cfg.auto_mode.allow.is_empty(), "未配置时展开由 core 负责");
 
         let cfg: Config = toml::from_str(
@@ -2958,6 +2967,7 @@ context_window = 200000
 enabled = false
 classifier_profile = "cheap"
 classify_all_shell = true
+plan_sensitivity = "proactive"
 max_consecutive_blocks = 1
 allow = ["$defaults", "允许推送到 staging"]
 "#,
@@ -2966,6 +2976,7 @@ allow = ["$defaults", "允许推送到 staging"]
         assert!(!cfg.auto_mode.enabled);
         assert_eq!(cfg.auto_mode.classifier_profile, "cheap");
         assert!(cfg.auto_mode.classify_all_shell);
+        assert_eq!(cfg.auto_mode.plan_sensitivity, "proactive");
         assert_eq!(cfg.auto_mode.max_consecutive_blocks, 1);
         assert_eq!(cfg.auto_mode.allow, vec!["$defaults", "允许推送到 staging"]);
     }

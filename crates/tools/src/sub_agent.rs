@@ -411,6 +411,7 @@ pub(crate) fn derive_sub_agent_permission_mode(
                                     | "Agent"
                                     | "computer"
                                     | "app_computer"
+                                    | "EnterPlanMode"
                                     | "ExitPlanMode"
                             )
                         })

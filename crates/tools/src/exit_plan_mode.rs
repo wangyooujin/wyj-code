@@ -42,7 +42,7 @@ impl Tool for ExitPlanModeTool {
         let approved = ctx.exit_plan_mode(plan).await;
         if approved {
             Ok(ToolResult::ok(
-                "User approved the plan. Execution mode is now enabled — proceed with the implementation.",
+                "User approved the plan. The previous execution mode is restored — proceed with the implementation.",
             ))
         } else {
             Ok(ToolResult::ok(

@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex};
 
 use wyj_core::{Agent, AgentRoute};
 use wyj_tools::{
-    AskQuestionTool, MemoryTool, SubAgentTool, TodoWriteTool, ToolRegistry, WebSearchTool,
+    AskQuestionTool, EnterPlanModeTool, ExitPlanModeTool, MemoryTool, PlanSensitivity,
+    SubAgentTool, TodoWriteTool, ToolRegistry, WebSearchTool,
 };
 
 /// 装配工具注册表所需的、跨首建/重建保持不变的依赖。
@@ -93,12 +94,17 @@ pub fn build_tool_registry(
     // 写入时双写 TodoStore + `.wyj-code/progress.md`（压缩注入 / 跨会话）。
     if cfg.tools.todo_enabled {
         let root = wyj_core::project_root(deps.cwd);
-        registry.register_arc(Arc::new(TodoWriteTool::new(
-            deps.todo_store.clone(),
-            root,
-        )));
+        registry.register_arc(Arc::new(TodoWriteTool::new(deps.todo_store.clone(), root)));
     }
     registry.register_arc(Arc::new(AskQuestionTool::new()));
+
+    // Plan 进出工具会话内常驻：tools 前缀只增不减（见根 CLAUDE.md）。
+    // 进 Plan 靠权限模式约束写入，不靠中途增删 schema；Enter 的描述按
+    // `[auto_mode].plan_sensitivity` 在装配时选定。
+    registry.register_arc(Arc::new(EnterPlanModeTool::new(PlanSensitivity::parse(
+        &cfg.auto_mode.plan_sensitivity,
+    ))));
+    registry.register_arc(Arc::new(ExitPlanModeTool));
 
     // WebSearch：仅当 `[search]` 配置可用（后端已声明且 key 存在）时注册。未配置时
     // 模型看不到该工具，避免它调用一个必然失败的工具白跑一趟。
@@ -287,6 +293,7 @@ impl AgentCoreConfig {
 /// 这里——走 ToolSearch，把固定预填压到编码主路径。
 const CONDITIONAL_CORE_TOOLS: &[&str] = &[
     "TodoWrite",
+    "EnterPlanMode",
     "ExitPlanMode",
     "window_capture",
     "app_computer",

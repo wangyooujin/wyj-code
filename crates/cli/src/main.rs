@@ -2662,10 +2662,7 @@ async fn main() -> Result<()> {
         plugin_output_style: None,
         aux_usage: Some(aux_usage.clone()),
         session_memory: session_memory.clone(),
-        progress_root: cfg
-            .tools
-            .todo_enabled
-            .then(|| wyj_core::project_root(&cwd)),
+        progress_root: cfg.tools.todo_enabled.then(|| wyj_core::project_root(&cwd)),
     }
     .apply(agent);
 
@@ -5465,7 +5462,13 @@ mod cli_tests {
             .iter()
             .map(|t| t.name().to_string())
             .collect();
-        for forbidden in ["Agent", "TodoWrite", "AskQuestion", "ExitPlanMode"] {
+        for forbidden in [
+            "Agent",
+            "TodoWrite",
+            "AskQuestion",
+            "EnterPlanMode",
+            "ExitPlanMode",
+        ] {
             assert!(!names.iter().any(|n| n == forbidden));
         }
     }

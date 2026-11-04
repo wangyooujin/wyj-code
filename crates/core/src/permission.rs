@@ -28,6 +28,7 @@ pub const PLAN_ALLOWED_TOOLS: &[&str] = &[
     "Edit",
     "Bash",
     "BashOutput",
+    "EnterPlanMode",
     "ExitPlanMode",
     "TodoWrite",
     "Memory",

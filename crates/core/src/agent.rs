@@ -1406,18 +1406,22 @@ impl Agent {
         (sent, candidate)
     }
 
-    /// 把「与内容无关、每轮可变」的 volatile 三段按真实请求的顺序追加到
-    /// `out`：模型兼容 suffix → 工具可用性名单 → 语言提醒。
+    /// 把「与内容无关、每轮可变」的 volatile 段按真实请求的顺序追加到
+    /// `out`：模型兼容 suffix → 工具可用性名单 →（可选）Plan 模式指引 → 语言提醒。
     ///
     /// 语言提醒必须在最后（它的全部价值就是位置，见
     /// `response_language_reminder_is_the_last_system_section`）。抽出成
     /// 公共函数是为了让 `compact_context` 能复用同一份拼装——压缩请求的
     /// system 必须与主对话逐字节相同才能命中缓存。
+    ///
+    /// Plan 指引走 volatile 而不是 `append_system`：进/出 Plan 是权限切换，
+    /// 不应改写 tools/system 的 stable 前缀（否则整段历史 cache miss）。
     fn push_request_volatile_tail(
         &self,
         route: &AgentRoute,
         request_tools: &[ToolDefinition],
         out: &mut String,
+        is_plan_mode: bool,
     ) {
         if let Some(capabilities) = &route.capabilities {
             let suffix = wyj_api::PromptPolicy::compatibility_suffix(capabilities);
@@ -1444,6 +1448,12 @@ impl Agent {
             &attached_tool_names,
             &hidden_sources,
         ));
+        if is_plan_mode {
+            out.push_str("\n\n");
+            out.push_str("<system-reminder>\n");
+            out.push_str(crate::prompts::PLAN_TURN);
+            out.push_str("\n</system-reminder>");
+        }
         if let Some(language) = &self.response_language {
             out.push_str("\n\n");
             out.push_str(&crate::prompts::response_language_reminder(language));
@@ -2225,6 +2235,7 @@ impl Agent {
                     &route,
                     &request_tools,
                     &mut request_system_volatile,
+                    ctx.is_plan_mode(),
                 );
                 let request_system = wyj_api::SystemPrompt {
                     stable: &system_stable,
@@ -4439,7 +4450,9 @@ impl Agent {
             // 从未发过请求：按当前 route 现拼尾部三段。此时不存在子目录
             // reminder（本轮还没触达过任何目录），因此与真实请求一致。
             let mut fresh = String::new();
-            self.push_request_volatile_tail(&route, &request_tools, &mut fresh);
+            // compact 无 ToolContext：沿用上次请求快照优先；现拼时按非 Plan
+            // 处理——Plan 指引若当时生效，会已在 snapshot 里。
+            self.push_request_volatile_tail(&route, &request_tools, &mut fresh, false);
             fresh
         } else {
             snapshot

@@ -14,6 +14,56 @@
 
 use super::*;
 
+// ─── EnterPlanMode 确认 ───────────────────────────────────────────────────────
+
+/// 模型请求进入 Plan：两档（进入 / 继续执行），无 Always。
+pub(super) fn draw_enter_plan_dialog(f: &mut Frame, dlg: &EnterPlanDialog, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Theme::permission_dialog())
+        .title(Span::styled(
+            wyj_i18n::tr("dialog.enter_plan_title"),
+            Theme::permission_dialog(),
+        ));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let max_w = (inner.width as usize).saturating_sub(2).max(20);
+    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        wyj_i18n::tr("dialog.enter_plan_body"),
+        Theme::dim(),
+    ))];
+    if !dlg.reason.trim().is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(wyj_i18n::tr("dialog.enter_plan_reason_label"), Theme::dim()),
+            Span::raw(truncate_chars(&dlg.reason, max_w.saturating_sub(8))),
+        ]));
+    }
+    lines.push(Line::from(""));
+    for (index, label_key) in [
+        "dialog.enter_plan_choice_enter",
+        "dialog.enter_plan_choice_stay",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        lines.push(choice_row(
+            index == dlg.selected,
+            &wyj_i18n::tr(label_key),
+            max_w,
+        ));
+    }
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr("dialog.hint_nav_select_cancel"),
+        Theme::highlight(),
+    )));
+
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
+}
+
 // ─── 权限对话框（分级授权） ────────────────────────────────────────────────────
 
 /// 权限确认框：Category A 底部常驻面板（对齐 Claude Code Inline 模式），

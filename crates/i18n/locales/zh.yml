@@ -118,6 +118,7 @@ thinking:
 spinner:
   thinking: "思考中"
   waiting_approval: "等待批准"
+  enter_plan: "确认是否进入 plan"
   reviewing_plan: "审阅计划"
   queuing_message: "消息排队中"
   stream_rate: "{rate} tok/s"
@@ -933,13 +934,16 @@ effort:
 mode:
   switched: "已切换至 {mode} 模式"
   switched_to_plan: "已切换至 plan 模式。请描述你想分析或规划的内容。"
+  plan_approved: "已批准计划，恢复至 {mode} 模式并开始执行。"
+  enter_plan_approved: "已进入 plan 模式。模型将先调研再提交计划。"
+  enter_plan_declined: "已拒绝进入 plan 模式，继续当前执行模式。"
 
 selection:
   copied: "已复制 {chars} 个字符"
   copy_failed: "复制失败：{error}"
 
 auto:
-  mode_notice: "auto 模式：多数操作自动放行，危险操作仍会硬拦。Shift+Tab 切 plan / bypass。"
+  mode_notice: "auto 模式：多数操作自动放行，危险操作仍会硬拦；复杂任务可能先请你确认进入 plan。Shift+Tab 切 plan / bypass。"
   degraded_to_confirm: "auto 分类器连续拦截过多，已停用模型分类器：危险命令仍按硬规则拦截，其余操作改为逐次弹窗确认。使用 /plan auto 可重新启用分类器。"
 
 cwd:
@@ -1059,6 +1063,11 @@ dialog:
   permission_choice_always: "始终允许此类"
   permission_choice_project: "允许本项目（后续不再询问）"
   permission_choice_deny: "拒绝"
+  enter_plan_title: " 进入 plan 模式？ "
+  enter_plan_body: "模型建议先规划再改代码。批准后仅允许只读探索，完成计划后再请你审阅。"
+  enter_plan_reason_label: "原因："
+  enter_plan_choice_enter: "进入 plan 模式"
+  enter_plan_choice_stay: "继续当前模式执行"
   project_trust_approve: "信任并连接"
   project_trust_skip: "本次跳过"
   skill_trust_approve: "信任并启用"

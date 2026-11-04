@@ -71,6 +71,11 @@ pub enum UiAskRequest {
         plan: String,
         response_tx: tokio::sync::oneshot::Sender<bool>,
     },
+    /// EnterPlanMode：模型请求切到 Plan，需用户确认。`reason` 为模型给出的短说明。
+    EnterPlanMode {
+        reason: String,
+        response_tx: tokio::sync::oneshot::Sender<bool>,
+    },
     /// 逐调用工具权限确认请求：tool_name 为工具名，action_summary 为操作摘要
     ToolPermission {
         tool_name: String,
@@ -320,6 +325,22 @@ impl ToolContext for ToolCtx {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let req = UiAskRequest::ExitPlanMode {
             plan: plan.to_string(),
+            response_tx,
+        };
+        if tx.send(req).await.is_err() {
+            return false;
+        }
+        response_rx.await.unwrap_or(false)
+    }
+
+    async fn enter_plan_mode(&self, reason: &str) -> bool {
+        let tx = match &self.ui_ask_tx {
+            Some(t) => t,
+            None => return false,
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let req = UiAskRequest::EnterPlanMode {
+            reason: reason.to_string(),
             response_tx,
         };
         if tx.send(req).await.is_err() {
