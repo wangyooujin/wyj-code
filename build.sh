@@ -7,6 +7,7 @@
 #   ./build.sh uninstall          — 卸载二进制，保留 ~/.wyj-code/ 下的配置与记忆
 #   ./build.sh uninstall --purge — 卸载二进制，并在二次确认后彻底删除 ~/.wyj-code/
 #   ./build.sh release            — 交互式确认版本号后自动 bump Cargo.toml + commit + tag + push，触发 GitHub Actions Release
+#                                   若上次在「本地已打 tag、远端还没有」处中断，再跑一次会提示只补推
 #
 # 交叉编译（需要对应工具链）:
 #   ./build.sh cross linux-x86_64
@@ -17,6 +18,34 @@ set -euo pipefail
 BINARY="wyj-code"
 VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
 OUT_DIR="dist"
+
+# 把当前分支与 annotated tag 一并推到 origin，并校验远端真有该 tag。
+# Release workflow 只监听 `push: tags: v*.*.*`——分支推上去、tag 没推上去等于没发版。
+push_release_refs() {
+    local branch="$1"
+    local version="$2"
+    local tag="v${version}"
+
+    echo "推送 ${branch} 与 ${tag} 到 origin..."
+    # 一次 push 两个 ref：同一次认证；任一失败整句非零，避免「分支上去了、tag 静默没出去」。
+    if ! git push origin \
+        "refs/heads/${branch}:refs/heads/${branch}" \
+        "refs/tags/${tag}:refs/tags/${tag}"; then
+        echo "✗ 推送失败。本地 commit / tag 都还在，可稍后重试："
+        echo "    git push origin ${branch}"
+        echo "    git push origin ${tag}"
+        echo "  或（分支若已在远端）只补推 tag："
+        echo "    git push origin ${tag}"
+        exit 1
+    fi
+
+    if ! git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+        echo "✗ git push 返回成功，但远端仍看不到 ${tag}。请手动执行："
+        echo "    git push origin ${tag}"
+        exit 1
+    fi
+    echo "✓ 已推送 ${tag}，GitHub Actions Release workflow 即将触发"
+}
 
 build_release() {
     echo "构建 release 版本 v${VERSION}..."
@@ -125,6 +154,26 @@ release_version() {
         exit 1
     fi
 
+    # 半成品恢复：上次 bump + 打 tag 成功，但 push tag 没出去（或分支 push 失败
+    # 触发 set -e 提前退出）。此时 Cargo.toml 已是新版本、本地有 tag、远端没有。
+    # 再跑 release 若直接建议 VERSION+1 会发错版本；这里先把卡住的 tag 补推完。
+    if git rev-parse "v${VERSION}" >/dev/null 2>&1 \
+        && ! git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+        echo ""
+        echo "⚠ 检测到未完成的 release："
+        echo "  Cargo.toml = ${VERSION}，本地有 tag v${VERSION}，远端没有。"
+        echo "  （常见原因：上次 git push 分支失败后脚本因 set -e 退出，tag 从未推送）"
+        echo ""
+        local resume
+        read -r -p "只补推 master + v${VERSION} 触发 GitHub Release？输入 yes 确认: " resume
+        if [ "$resume" = "yes" ]; then
+            push_release_refs "$current_branch" "$VERSION"
+            exit 0
+        fi
+        echo "已取消。若要发更新的版本，请先处理本地 tag（例如删除或先推上去）。"
+        exit 0
+    fi
+
     echo "运行 cargo test..."
     cargo test --locked
     echo "运行 cargo clippy..."
@@ -141,7 +190,7 @@ release_version() {
     echo "确认发布流程："
     echo "  1. 更新 Cargo.toml 版本号并提交 (chore: bump version to <version>)"
     echo "  2. 打 tag v<version>"
-    echo "  3. push 当前分支 + push tag 到 origin（触发 GitHub Actions Release）"
+    echo "  3. 一次 push 分支 + tag 到 origin，并校验远端 tag（触发 GitHub Actions Release）"
     echo ""
     local reply
     read -r -p "回车使用建议版本 ${suggested_version}，或输入自定义版本号（如 1.1.0），输入其他内容取消: " reply
@@ -173,11 +222,9 @@ release_version() {
     git add Cargo.toml Cargo.lock
     git commit -m "chore: bump version to ${new_version}"
 
-    # 阶段五：打 tag + push
+    # 阶段五：打 tag + 推送（分支与 tag 同一次 push，失败时打印可重试命令）
     git tag -a "v${new_version}" -m "v${new_version}"
-    git push origin "$current_branch"
-    git push origin "v${new_version}"
-    echo "✓ 已推送 v${new_version}，GitHub Actions Release workflow 即将触发"
+    push_release_refs "$current_branch" "$new_version"
 }
 
 CMD="${1:-build}"
