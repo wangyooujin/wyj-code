@@ -215,11 +215,18 @@ impl ToolCtx {
     /// 静默抹掉，用户表现为下次启动又要重新按一遍 `a`；而旧的裸 `fs::write` 在并发
     /// 时还会截出半截 JSON，`load_allowed_tools` 的 `if let Ok` 把它当空列表 ——
     /// 该项目的「始终允许」于是**整体**失效一次。锁 + 原子替换 + 取并集三者缺一不可。
+    ///
+    /// 锁必须落在旁路的 `allowed_tools.json.lock` 上，**不能**对数据文件本身
+    /// `filelock::acquire`：后者拿到锁后会 `set_len(0)` 写 PID，等于先把名单毁掉，
+    /// 「锁内读盘合并」读到的永远是 PID 垃圾，跨进程并集形同虚设；写失败或崩溃
+    /// 还会把无法解析的残片留给下次 `load_allowed_tools`，表现为始终允许只在
+    /// 当次内存生效、重启后又弹窗。
     fn persist_allowed_tools(&self) {
         let Some(path) = &self.allowed_tools_path else {
             return;
         };
-        let guard = match wyj_config::filelock::acquire(path, "project tool allowlist") {
+        let lock_path = path.with_extension("json.lock");
+        let guard = match wyj_config::filelock::acquire(&lock_path, "project tool allowlist") {
             Ok(guard) => guard,
             Err(e) => {
                 tracing::warn!("获取 allowed_tools 写锁失败: {e}");
@@ -487,13 +494,16 @@ mod tests {
     }
 
     fn tmp_base() -> PathBuf {
+        // 并行测试里同纳秒撞车会共用一个目录，表现为「写了但另一条用例读不到」。
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "wyj-ctx-{}-{}",
+            "wyj-ctx-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -555,6 +565,93 @@ mod tests {
         let mut ctx2 = ToolCtx::new(&cwd);
         ctx2.load_allowed_tools(&base);
         assert!(ctx2.always_allowed.read().unwrap().contains("Bash"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 钉子：锁必须旁路到 `*.json.lock`，数据文件在持锁期间仍是合法 JSON。
+    ///
+    /// 旧实现把 `filelock::acquire` 直接打在 `allowed_tools.json` 上——拿到锁
+    /// 立刻 truncate 写 PID——于是「锁内读盘合并」永远读到垃圾，写失败/崩溃
+    /// 还会把残片留给下次 load，表现为始终允许重启后失效。
+    #[test]
+    fn allowed_tools_lock_does_not_corrupt_data_file() {
+        let base = tmp_base();
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut ctx = ToolCtx::new(&cwd);
+        ctx.load_allowed_tools(&base);
+        let data_path = ctx.allowed_tools_path.clone().unwrap();
+        let lock_path = data_path.with_extension("json.lock");
+
+        ctx.always_allowed.write().unwrap().insert("Bash".into());
+        ctx.persist_allowed_tools();
+
+        let on_disk: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(&data_path).unwrap()).unwrap();
+        assert_eq!(on_disk, vec!["Bash".to_string()]);
+        assert!(
+            lock_path.exists(),
+            "锁应落在旁路的 {}.lock，而不是数据文件本身",
+            data_path.display()
+        );
+
+        // 持锁期间数据文件必须仍可解析——否则并发 load 会把名单当成空。
+        let _guard =
+            wyj_config::filelock::acquire(&lock_path, "test hold allowlist lock").unwrap();
+        let during_lock: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(&data_path).unwrap()).unwrap();
+        assert_eq!(during_lock, vec!["Bash".to_string()]);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 钉子：两个进程各自只批准一个工具时，后写者必须并进先写者的条目，
+    /// 而不是用自己的内存快照整份覆盖。这是「始终允许重启后丢一半」的根因。
+    #[test]
+    fn allowed_tools_persist_merges_with_disk_instead_of_overwriting() {
+        let base = tmp_base();
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut writer_a = ToolCtx::new(&cwd);
+        writer_a.load_allowed_tools(&base);
+        writer_a
+            .always_allowed
+            .write()
+            .unwrap()
+            .insert("Bash".into());
+        writer_a.persist_allowed_tools();
+
+        // 模拟另一进程：启动时磁盘上已有 Bash，本进程只批准了 Edit。
+        let mut writer_b = ToolCtx::new(&cwd);
+        writer_b.load_allowed_tools(&base);
+        assert!(writer_b.always_allowed.read().unwrap().contains("Bash"));
+        // 刻意只保留本进程新批的工具，复现「内存不完整」时的写回。
+        writer_b.always_allowed.write().unwrap().clear();
+        writer_b
+            .always_allowed
+            .write()
+            .unwrap()
+            .insert("Edit".into());
+        writer_b.persist_allowed_tools();
+
+        let on_disk: Vec<String> = serde_json::from_str(
+            &std::fs::read_to_string(writer_b.allowed_tools_path.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            on_disk,
+            vec!["Bash".to_string(), "Edit".to_string()],
+            "后写必须并进盘上已有条目，不能整份覆盖"
+        );
+
+        let mut reloaded = ToolCtx::new(&cwd);
+        reloaded.load_allowed_tools(&base);
+        let loaded = reloaded.always_allowed.read().unwrap().clone();
+        assert!(loaded.contains("Bash"));
+        assert!(loaded.contains("Edit"));
 
         std::fs::remove_dir_all(&base).ok();
     }

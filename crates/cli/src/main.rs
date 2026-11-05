@@ -2239,6 +2239,12 @@ async fn main() -> Result<()> {
 
     // 初始工具上下文权限（headless/single-shot 模式用；TUI 模式在 spawn 闭包内动态创建）
     let mut tool_ctx = ToolCtx::new(&cwd);
+    // 载入项目级「始终允许」：TUI 里选过 AllowAlways 的工具，在 `-p` / headless /
+    // ACP 下也应免问（AskUser 落到 confirm_tool 时靠这份名单短路）。不载入等于
+    // 非 TUI 入口永远看不到跨会话授权。
+    if let Ok(config_base) = wyj_config::config_dir() {
+        tool_ctx.load_allowed_tools(&config_base);
+    }
     // 子 Agent 用量回灌通道。TUI 侧在每个回合的 ToolCtx 上单独挂（见
     // `crates/tui/src/app.rs`）；headless / `-p` / ACP 只有这一个 ctx，
     // 不挂的话子 Agent 的 token 在这些模式下仍然全部丢失。

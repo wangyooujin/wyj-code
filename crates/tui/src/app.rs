@@ -10294,6 +10294,7 @@ async fn tui_main(
                                         let shared_permission_c = shared_permission.clone();
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
                                         let plugin_runtime_c = plugin_runtime.clone();
+                                        let auto_gate_c = auto_gate.clone();
                                         // async move 会把外层变量搬进闭包，先 clone 一份
                                         // 留在闭包外用（下一轮循环还要再取）。
                                         let permission_constraints_c =
@@ -10312,9 +10313,16 @@ async fn tui_main(
                                             ctx.sub_usage =
                                                 Some(Arc::new(wyj_core::SubUsageTotals::default()));
                                             ctx.permission_mode = shared_permission_c;
+                                            ctx.auto_gate = auto_gate_c;
                                             ctx.ui_ask_tx = Some(ui_ask_tx_clone);
                                             // 同 spawn_agent_turn：plan 文档授权要每回合重注入。
                                             permission_constraints_c.apply_to_ctx(&ctx);
+                                            // 同 spawn_agent_turn：始终允许名单必须每回合载入，
+                                            // 否则 Skill 展开路径上 AllowAlways 只活在内存里，
+                                            // 重启后又弹窗。
+                                            if let Ok(config_base) = wyj_config::config_dir() {
+                                                ctx.load_allowed_tools(&config_base);
+                                            }
                                             let turn_agent =
                                                 plan_turn_agent(&agent_c, &current_mode);
                                             let tx2 = tx.clone();
@@ -10434,6 +10442,7 @@ async fn tui_main(
                                         let shared_permission_c = shared_permission.clone();
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
                                         let plugin_runtime_c = plugin_runtime.clone();
+                                        let auto_gate_c = auto_gate.clone();
                                         // async move 会把外层变量搬进闭包，先 clone 一份
                                         // 留在闭包外用（下一轮循环还要再取）。
                                         let permission_constraints_c =
@@ -10452,9 +10461,14 @@ async fn tui_main(
                                             ctx.sub_usage =
                                                 Some(Arc::new(wyj_core::SubUsageTotals::default()));
                                             ctx.permission_mode = shared_permission_c.clone();
+                                            ctx.auto_gate = auto_gate_c;
                                             ctx.ui_ask_tx = Some(ui_ask_tx_clone);
                                             // 同 spawn_agent_turn：plan 文档授权要每回合重注入。
                                             permission_constraints_c.apply_to_ctx(&ctx);
+                                            // 同 spawn_agent_turn：始终允许名单必须每回合载入。
+                                            if let Ok(config_base) = wyj_config::config_dir() {
+                                                ctx.load_allowed_tools(&config_base);
+                                            }
                                             let turn_agent =
                                                 plan_turn_agent(&agent_c, &current_mode);
 

@@ -23,7 +23,12 @@
 //! ```no_run
 //! # fn save(list: &[String]) -> anyhow::Result<()> {
 //! let path = std::path::Path::new("/tmp/x.json");
-//! let _guard = wyj_config::filelock::acquire(path, "authorized tool list")?;
+//! // 锁文件必须与数据文件分离：`acquire` 会 truncate 并写入 PID，
+//! // 锁在数据路径上等于先毁掉要合并的内容。
+//! let _guard = wyj_config::filelock::acquire(
+//!     &path.with_extension("json.lock"),
+//!     "authorized tool list",
+//! )?;
 //! let mut current = std::fs::read_to_string(path).unwrap_or_default();
 //! // ... 在临界区内重新读盘、合并、落盘 ...
 //! # let _ = current; let _ = list;
