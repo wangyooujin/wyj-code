@@ -77,7 +77,7 @@ pub fn build_tool_registry(
         // 会话检索与 claim 检索挂在同一个工具上：模型判断「查记忆」时不该
         // 还要先分清「查提取过的事实」还是「翻原始对话」——一次调用先试
         // search，找不到再 search_sessions 是更自然的用法。
-        let mut tool = MemoryTool::new(memory.clone());
+        let mut tool = MemoryTool::new(memory.clone()).with_session_id(deps.session_id.clone());
         if let Some(sessions) = &deps.sessions {
             tool = tool.with_sessions(sessions.clone());
         }
@@ -91,7 +91,7 @@ pub fn build_tool_registry(
 
     // 任务列表由 `[tools].todo_enabled` 门控：未注册的工具不产生 schema，
     // 模型目录里根本看不到，也就不会浪费 LLM 往返去更新它。
-    // 写入时双写 TodoStore + `.wyj-code/progress.md`（压缩注入 / 跨会话）。
+    // 写入时双写 TodoStore + `.wyj-code/progress.md`（同会话压缩注入）。
     if cfg.tools.todo_enabled {
         let root = wyj_core::project_root(deps.cwd);
         registry.register_arc(Arc::new(TodoWriteTool::new(deps.todo_store.clone(), root)));

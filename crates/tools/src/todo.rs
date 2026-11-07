@@ -115,7 +115,8 @@ impl TodoStore {
 
 pub struct TodoWriteTool {
     store: Arc<Mutex<TodoStore>>,
-    /// 项目根：每次写入同步到 `<root>/.wyj-code/progress.md`（压缩注入 / 跨会话）。
+    /// 项目根：每次写入同步到 `<root>/.wyj-code/progress.md`（同会话压缩注入；
+    /// 新对话会清掉，不把上一会话 tasklist 带进面板）。
     project_root: PathBuf,
 }
 
@@ -232,8 +233,9 @@ impl Tool for TodoWriteTool {
             store.items = items.clone();
         }
 
-        // 双写磁盘：压缩后由框架从 progress.md 重新注入；跨会话续跑可见。
-        // 全部完成或空清单时清掉文件——否则陈旧 `[x]` 会挡住新一轮清面板，
+        // 双写磁盘：压缩后由框架从 progress.md 重新注入；同会话 `-c` resume
+        // 也可回填面板。新对话 / `/new` / `/clear` 会清掉该文件。
+        // 全部完成或空清单时也清掉——否则陈旧 `[x]` 会挡住新一轮清面板，
         // 也会被压缩注入背进上下文。
         let disk_note = if items.iter().any(|t| t.status != TodoStatus::Completed) {
             let md = todos_to_progress_markdown(&items);

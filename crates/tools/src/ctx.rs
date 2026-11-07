@@ -193,6 +193,19 @@ impl ToolCtx {
             .map_err(|reason| reason.message)
     }
 
+    /// 与 `is_allowed` / `confirm_tool` 共用同一份 `evaluate` 输入，避免两处各拼
+    /// 一次 `PermissionRequest` 后字段漂移。
+    fn evaluate_tool(&self, name: &str, input: &Value) -> PermissionVerdict {
+        let request = PermissionRequest {
+            mode: self.permission_mode.read().unwrap().clone(),
+            surface: *self.execution_surface.read().unwrap(),
+            tool_name: name.to_string(),
+            input: input.clone(),
+            cwd: self.cwd.clone(),
+        };
+        self.permission_policy.read().unwrap().evaluate(&request)
+    }
+
     /// 按当前 cwd 所属项目（git 仓库根）载入「始终允许」列表并设定持久化路径。
     /// `config_base` 为 `~/.wyj-code`。载入失败静默忽略（视为空列表）。
     pub fn load_allowed_tools(&mut self, config_base: &Path) {
@@ -278,14 +291,8 @@ impl ToolContext for ToolCtx {
     }
 
     fn denial_reason(&self, name: &str, input: &Value) -> Option<String> {
-        let request = PermissionRequest {
-            mode: self.permission_mode.read().unwrap().clone(),
-            surface: *self.execution_surface.read().unwrap(),
-            tool_name: name.to_string(),
-            input: input.clone(),
-            cwd: self.cwd.clone(),
-        };
-        match self.permission_policy.read().unwrap().evaluate(&request) {
+        match self.evaluate_tool(name, input) {
+            // Ask 不是拒绝：`is_allowed` 放行后由 `confirm_tool` 弹窗授权单文档。
             PermissionVerdict::Allow | PermissionVerdict::Ask(_) => None,
             PermissionVerdict::Deny(reason) => {
                 tracing::warn!(tool = %name, code = reason.code, "{}", reason.message);
@@ -357,20 +364,31 @@ impl ToolContext for ToolCtx {
     }
 
     async fn confirm_tool(&self, name: &str, summary: &str) -> bool {
-        // 只有 Auto 需要弹窗：闸门判 Allow 时压根不会走到这里，只有判 AskUser
-        // （含「压根没装闸门」与「分类器已停用降级」）才落下来——所以 Auto 必须
-        // 走真实弹窗路径，否则这两条会变成无声放行。
-        // AutoApprove(Bypass)/Allowlist(Plan) 则不弹窗（Allowlist 的准入已由
-        // is_allowed 前置把关）。
-        {
-            let mode = self.permission_mode.read().unwrap();
-            if !matches!(&*mode, PermissionMode::Auto) {
-                return true;
+        // 弹窗面：
+        // - Auto：闸门判 AskUser（或没装闸门 / 分类器降级）才落到这里；
+        // - Plan 的 Write/Edit：`evaluate` 对规划目录外的文档返回 Ask，必须弹窗
+        //   后写入 `plan_document_grants`——此前这里对非 Auto 一律 `return true`，
+        //   Ask 被 `is_allowed` 当成放行，任意 .md 可在 Plan 下无声写入。
+        // Bypass / Allowlist：准入已由 `is_allowed` 把关，不弹窗。
+        let mode = self.permission_mode.read().unwrap().clone();
+        match &mode {
+            PermissionMode::AutoApprove | PermissionMode::Allowlist(_) => return true,
+            PermissionMode::Plan(_) => {
+                if !matches!(name, "Write" | "Edit") {
+                    return true;
+                }
+                // Write/Edit 的 summary 就是 file_path（见各自 `action_summary`）。
+                match self.evaluate_tool(name, &serde_json::json!({ "file_path": summary })) {
+                    PermissionVerdict::Allow => return true,
+                    PermissionVerdict::Deny(_) => return false,
+                    PermissionVerdict::Ask(_) => {}
+                }
             }
-        }
-        // 已获当前项目授权的工具直接放行。
-        if self.always_allowed.read().unwrap().contains(name) {
-            return true;
+            PermissionMode::Auto => {
+                if self.always_allowed.read().unwrap().contains(name) {
+                    return true;
+                }
+            }
         }
         // 无 UI 通道（headless / 子 Agent）：fail-closed。
         let tx = match &self.ui_ask_tx {
@@ -414,39 +432,52 @@ impl ToolContext for ToolCtx {
         // ——前者根本没人可问，后者有人看过并否决了。其余路径的拒绝都是真实
         // 用户决定，交给调用方的通用措辞。
         //
-        // 判据与 `confirm_tool` 逐分支对齐：非 Auto / 已项目授权 都会在
-        // `confirm_tool` 里直接返回 true，根本走不到拒绝分支。
-        if !matches!(&*self.permission_mode.read().unwrap(), PermissionMode::Auto) {
-            return None;
+        // 与 `confirm_tool` 对齐：Auto 的已项目授权 / Plan 下非 Write·Edit /
+        // Bypass·Allowlist 都会直接放行，走不到拒绝分支。
+        let no_ui = || {
+            Some(
+                "该执行面没有交互式审批通道（子 Agent / headless / 定时任务），本次操作无人可批准，因此未执行。请不要重试同一操作；改用不需要审批的方式完成任务，或如实说明受阻原因。"
+                    .to_string(),
+            )
+        };
+        match &*self.permission_mode.read().unwrap() {
+            PermissionMode::Auto => {
+                if self.always_allowed.read().unwrap().contains(name) {
+                    return None;
+                }
+                if self.ui_ask_tx.is_some() {
+                    return None;
+                }
+                no_ui()
+            }
+            PermissionMode::Plan(_) if matches!(name, "Write" | "Edit") => {
+                if self.ui_ask_tx.is_some() {
+                    return None;
+                }
+                no_ui()
+            }
+            _ => None,
         }
-        if self.always_allowed.read().unwrap().contains(name) {
-            return None;
-        }
-        if self.ui_ask_tx.is_some() {
-            return None;
-        }
-        Some(
-            "该执行面没有交互式审批通道（子 Agent / headless / 定时任务），本次操作无人可批准，因此未执行。请不要重试同一操作；改用不需要审批的方式完成任务，或如实说明受阻原因。"
-                .to_string(),
-        )
     }
 
     fn needs_dialog(&self, name: &str) -> bool {
-        // 判据与 confirm_tool 的两个「直接放行」分支严格对齐，差一个字就会
-        // 出现「Agent 以为不弹框、把多个调用排进并发组，结果同时弹出 N 个
-        // 对话框」——那正好破坏 `needs_dialog` 存在的唯一理由。
-        // Auto 也返回 true：闸门判定要 await 分类器、判定为 AskUser 时还要弹窗，
-        // 两者都会阻塞。这些调用必须串行，否则会同时弹出 N 个对话框。
-        if !matches!(&*self.permission_mode.read().unwrap(), PermissionMode::Auto) {
-            return false;
+        // 判据与 confirm_tool 的「会 await UI」路径对齐，差一个字就会出现
+        // 「Agent 以为不弹框、把多个调用排进并发组，结果同时弹出 N 个对话框」。
+        match &*self.permission_mode.read().unwrap() {
+            PermissionMode::Auto => {
+                if self.always_allowed.read().unwrap().contains(name) {
+                    return false;
+                }
+                // 无 UI 时 confirm_tool fail-closed（不 await），仍按会弹框处理，
+                // 让这类上下文退回串行的旧行为。
+                true
+            }
+            // Plan Write/Edit 可能 Ask 弹窗（规划目录外的文档）。规划目录内的写
+            // evaluate 为 Allow、confirm_tool 立刻放行——这里仍报 true 只丢掉
+            // 并发，符合「宁可串行，不可多弹框」。
+            PermissionMode::Plan(_) => matches!(name, "Write" | "Edit"),
+            PermissionMode::AutoApprove | PermissionMode::Allowlist(_) => false,
         }
-        if self.always_allowed.read().unwrap().contains(name) {
-            return false;
-        }
-        // 无 UI 通道时 confirm_tool 直接 fail-closed 返回 false（并不 await），
-        // 但那种情况下调用压根不会被执行，仍按会弹框处理，让这类上下文
-        // 退回串行的旧行为。
-        true
     }
 
     fn is_plan_mode(&self) -> bool {
@@ -509,8 +540,7 @@ mod tests {
         dir
     }
 
-    /// 钉子：`needs_dialog` 的两个 false 分支必须与 `confirm_tool` 的两个
-    /// 「直接放行、不发 UiAskRequest」分支一字不差地对齐。
+    /// 钉子：`needs_dialog` 与 `confirm_tool` 的「会 await UI」路径对齐。
     ///
     /// 错位的后果是双向的，且都很难在别处被发现：
     /// `needs_dialog` 判 false 而 `confirm_tool` 仍发请求 → Agent 把多个调用
@@ -526,7 +556,7 @@ mod tests {
         let mut ctx = ToolCtx::new(&cwd);
         ctx.load_allowed_tools(&base);
 
-        // Prompt 模式 + 未授权：会弹框。
+        // Auto + 未授权：会弹框。
         *ctx.permission_mode.write().unwrap() = PermissionMode::Auto;
         assert!(ctx.needs_dialog("Bash"));
         assert!(ctx.needs_dialog("Edit"));
@@ -536,15 +566,107 @@ mod tests {
         assert!(!ctx.needs_dialog("Bash"), "已 AllowAlways 的工具不该再弹框");
         assert!(ctx.needs_dialog("Edit"), "只授权了 Bash，Edit 仍需弹框");
 
-        // 其余模式一律不弹框。
-        for mode in [
-            PermissionMode::AutoApprove,
-            PermissionMode::Plan(HashSet::new()),
-        ] {
-            *ctx.permission_mode.write().unwrap() = mode.clone();
-            assert!(!ctx.needs_dialog("Bash"), "{mode:?} 不该弹框");
-            assert!(!ctx.needs_dialog("Edit"), "{mode:?} 不该弹框");
-        }
+        // Bypass：不弹框。
+        *ctx.permission_mode.write().unwrap() = PermissionMode::AutoApprove;
+        assert!(!ctx.needs_dialog("Bash"));
+        assert!(!ctx.needs_dialog("Edit"));
+
+        // Plan：只有 Write/Edit 可能 Ask 弹窗；Bash 等白名单工具不弹。
+        *ctx.permission_mode.write().unwrap() = PermissionMode::Plan(HashSet::new());
+        assert!(!ctx.needs_dialog("Bash"), "Plan Bash 不该弹框");
+        assert!(ctx.needs_dialog("Edit"), "Plan Edit 可能 Ask，必须串行");
+        assert!(ctx.needs_dialog("Write"), "Plan Write 可能 Ask，必须串行");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Plan 交互面写规划目录外的 `.md`：`is_allowed` 放行（Ask），但无 UI 时
+    /// `confirm_tool` 必须 fail-closed——此前非 Auto 直接 `return true`，任意
+    /// Markdown 可在 Plan 下无声写入。
+    #[tokio::test]
+    async fn plan_ask_document_write_is_not_silently_allowed() {
+        use serde_json::json;
+        let base = tmp_base();
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        std::fs::write(cwd.join("README.md"), "old").unwrap();
+
+        let ctx = ToolCtx::new(&cwd);
+        ctx.set_execution_surface(ExecutionSurface::TuiInteractive);
+        ctx.set_permission_mode(PermissionMode::Plan(
+            ["Write", "Edit"].into_iter().map(str::to_string).collect(),
+        ));
+
+        let input = json!({ "file_path": "README.md", "content": "x" });
+        assert!(
+            ctx.is_allowed("Write", &input),
+            "Ask 在 is_allowed 层应放行，交给 confirm_tool"
+        );
+        assert!(
+            matches!(
+                ctx.evaluate_tool("Write", &input),
+                PermissionVerdict::Ask(_)
+            ),
+            "交互面 + 规划目录外文档必须是 Ask"
+        );
+        // 无 ui_ask_tx：不得静默放行。
+        assert!(
+            !ctx.confirm_tool("Write", "README.md").await,
+            "Plan Ask 无 UI 必须 fail-closed"
+        );
+        let reason = ctx
+            .confirm_denial_reason("Write")
+            .expect("无 UI 拒绝应带具体原因");
+        assert!(reason.contains("没有交互式审批通道"), "{reason}");
+
+        // 规划目录内仍直接放行（不依赖 UI）。
+        std::fs::create_dir_all(cwd.join("doc/plan")).unwrap();
+        assert!(
+            ctx.confirm_tool("Write", "doc/plan/v1.md").await,
+            "规划目录写不应要求弹窗"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 用户批准后写入 `plan_document_grants`，同文件后续不再弹窗。
+    #[tokio::test]
+    async fn plan_ask_document_grant_sticks_for_later_writes() {
+        use serde_json::json;
+        let base = tmp_base();
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        std::fs::write(cwd.join("README.md"), "old").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut ctx = ToolCtx::new(&cwd);
+        ctx.ui_ask_tx = Some(tx);
+        ctx.set_execution_surface(ExecutionSurface::TuiInteractive);
+        ctx.set_permission_mode(PermissionMode::Plan(
+            ["Write"].into_iter().map(str::to_string).collect(),
+        ));
+
+        let input = json!({ "file_path": "README.md", "content": "x" });
+        assert!(matches!(
+            ctx.evaluate_tool("Write", &input),
+            PermissionVerdict::Ask(_)
+        ));
+
+        let allowed = confirm_with_decision(
+            &ctx,
+            &mut rx,
+            "Write",
+            "README.md",
+            PermissionDecision::AllowOnce,
+        )
+        .await;
+        assert!(allowed, "批准后应放行并记入 plan_document_grants");
+        assert!(
+            matches!(ctx.evaluate_tool("Write", &input), PermissionVerdict::Allow),
+            "授权后同文件应变 Allow"
+        );
+        // 二次写入：confirm_tool 应直接 true，不再发 UiAskRequest。
+        assert!(ctx.confirm_tool("Write", "README.md").await);
 
         std::fs::remove_dir_all(&base).ok();
     }
@@ -598,8 +720,7 @@ mod tests {
         );
 
         // 持锁期间数据文件必须仍可解析——否则并发 load 会把名单当成空。
-        let _guard =
-            wyj_config::filelock::acquire(&lock_path, "test hold allowlist lock").unwrap();
+        let _guard = wyj_config::filelock::acquire(&lock_path, "test hold allowlist lock").unwrap();
         let during_lock: Vec<String> =
             serde_json::from_str(&std::fs::read_to_string(&data_path).unwrap()).unwrap();
         assert_eq!(during_lock, vec!["Bash".to_string()]);

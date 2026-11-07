@@ -3472,15 +3472,16 @@ impl Agent {
                 // **「同一时刻至多一个对话框」靠的是"需要弹框的调用彼此串行"，
                 // 而不是 `parallel_safe = false` 本身**。所以判定并发资格时，
                 // `parallel_safe` 与 `parallel_safe_with_peer` 都为 false 的工具
-                // 还要再看它这次会不会真的阻塞在权限弹框上：Bypass / Plan 白名单 /
-                // 项目级 AllowAlways / 本轮已授权这四种情况都不会弹框，此时把
+                // 还要再看它这次会不会真的阻塞在权限弹框上：Bypass / Plan 下的
+                // 只读工具 / 项目级 AllowAlways / 本轮已授权不会弹框，此时把
                 // `Bash` 之类彼此隔离的调用排队纯属白白拉长回合——一次回合里
                 // 排 8 条只读查询，就是 8 次 LLM 往返的额外空转。
+                // Plan 的 Write/Edit 仍可能 Ask 弹窗（规划目录外文档授权）。
                 // 改这段之前先分清「同组内顺序」与「会弹框」这两种不同的约束。
                 //
                 // Auto 模式下这里**不能**假设「Auto 不会阻塞」：闸门判定要 await
-                // 分类器，闸门要求问人时还要弹窗，所以 Auto 与 Bypass/Plan 一样
-                // 落在"会阻塞"那一侧（`ToolCtx::needs_dialog` 里对应地返回 true）。
+                // 分类器，闸门要求问人时还要弹窗，所以 Auto 落在"会阻塞"那一侧
+                // （`ToolCtx::needs_dialog` 里对应地返回 true）。
                 let mut par_futs = vec![];
                 let mut seq_calls = vec![];
                 // 本批要执行的工具名（供 PostToolBatch hook 的 payload 用）。

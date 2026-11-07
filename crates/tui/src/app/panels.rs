@@ -100,9 +100,12 @@ impl AppState {
         self.ensure_selected_todo();
     }
 
-    /// 启动 / `/clear` 后：磁盘上还有**未完成**进度时灌进面板（跨会话续跑）。
-    /// 全部 `[x]` 的陈旧清单不回填，并顺手删掉文件——否则 `/new` 后仍会挂着
-    /// 上一轮已完成的 tasklist，压缩也会把死清单注回上下文。
+    /// `-c` / `--resume` 续跑同一会话时：磁盘上还有**未完成**进度则灌进面板。
+    ///
+    /// 全新会话、`/new`、`/clear` **不要**走这里——`progress.md` 是项目级文件，
+    /// 上一会话 Ctrl+C 中断留下的未完成清单若在新对话回填，用户会看到「鬼影
+    /// tasklist」。全部 `[x]` 的陈旧清单也不回填，并顺手删掉文件，避免压缩
+    /// 把死清单注回上下文。
     pub(super) fn load_progress_panel_from_disk(&mut self) {
         let items = self.read_progress_todos();
         if !progress_items_have_unfinished(&items) {
@@ -151,7 +154,10 @@ impl AppState {
         }
     }
 
-    /// 清掉会话内任务板，并删除已无未完成项意义的 progress.md。
+    /// 清掉会话内任务板、共享 TodoStore，并删除 progress.md。
+    ///
+    /// 新会话 / `/new` / `/clear` / 全新启动共用：不把上一会话的未完成清单
+    /// 带进新对话（面板与压缩注入都会读这份磁盘状态）。
     pub(super) fn clear_todo_panel_and_progress(&mut self) {
         self.current_todos = None;
         self.focused_todo_id = None;
@@ -162,6 +168,11 @@ impl AppState {
         self.todo_detail_max_scroll = 0;
         self.todo_stats.clear();
         self.todo_execution_logs.clear();
+        if let Some(store) = &self.todo_store {
+            if let Ok(mut g) = store.lock() {
+                g.items.clear();
+            }
+        }
         let root = wyj_core::project_root(&self.cwd);
         wyj_core::progress::clear_progress(&root);
     }

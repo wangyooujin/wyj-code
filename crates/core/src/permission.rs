@@ -953,6 +953,41 @@ mod tests {
         }
     }
 
+    /// 交互面下，规划目录外的文档扩展名是 Ask（交给 confirm_tool 授权），
+    /// 不是静默 Allow，也不是直接 Deny——headless 才 Deny。
+    #[test]
+    fn plan_interactive_document_outside_roots_asks_not_allows() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join("README.md"), "x").unwrap();
+        let allowed: HashSet<String> = ["Write"].into_iter().map(str::to_string).collect();
+        let policy = PermissionPolicy::default();
+        let mode = PermissionMode::Plan(allowed);
+
+        let mut interactive = request(
+            mode.clone(),
+            repo.path(),
+            "Write",
+            json!({"file_path": "README.md"}),
+        );
+        interactive.surface = ExecutionSurface::TuiInteractive;
+        assert!(
+            matches!(policy.evaluate(&interactive), PermissionVerdict::Ask(_)),
+            "TUI Plan 写 README.md 必须 Ask"
+        );
+
+        let headless = request(
+            mode,
+            repo.path(),
+            "Write",
+            json!({"file_path": "README.md"}),
+        );
+        assert!(
+            matches!(policy.evaluate(&headless), PermissionVerdict::Deny(_)),
+            "非交互面必须 Deny，不能 Ask 后被当成 Allow"
+        );
+    }
+
     #[test]
     fn explicit_plan_grant_is_exact_not_directory_wide() {
         let repo = tempfile::tempdir().unwrap();

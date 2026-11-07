@@ -38,7 +38,7 @@ Agent 循环、会话、记忆、压缩、权限策略、存储布局。根 `CLA
 - 英文常量，不走 i18n。`<env>` 带 `home` 和 `Response language: <英文名> (code)`。不要只吐 `zh`。`language = ""` 等于未配置，解析收口到 `resolve_locale`。
 - `response_language_reminder` 必须是 volatile **最后一段**。后面再拼东西，语言约束就失效。子 Agent 的 `with_system` 会抹掉语言段，覆盖后要补回。语言相关改动用新会话验证，旧会话里的英文 thinking 会自我强化。
 - tools 数组只增不减。折叠掉的工具要在可用性块里按来源报数量，写明 folded, not missing，不要展开 schema。折叠列表为空时，这块输出必须与未折叠时逐字节相同。
-- TodoWrite 默认开。开关只管注册；开启时写入 TodoStore + `.wyj-code/progress.md`（压缩后 `splice_progress_after_compact` 从磁盘重新注入）。`TODO_HINT` 仅在开启时注入。聊天流不要为它画三遍（跳过常规工具行，只留面板）。`parallel_safe = true`。`ALWAYS_VISIBLE` 含 TodoWrite 名，未注册时无 schema。独立 Progress 工具已并入 TodoWrite。
+- TodoWrite 默认开。开关只管注册；开启时写入 TodoStore + `.wyj-code/progress.md`（压缩后 `splice_progress_after_compact` 从磁盘重新注入）。`progress.md` 不绑 session：新会话 / `/new` / `/clear` / 全新启动必须清掉，只有 `-c`/`--resume` 才回填面板。`TODO_HINT` 仅在开启时注入。聊天流不要为它画三遍（跳过常规工具行，只留面板）。`parallel_safe = true`。`ALWAYS_VISIBLE` 含 TodoWrite 名，未注册时无 schema。独立 Progress 工具已并入 TodoWrite。
 - Skill 不是工具。名单按 name 排序后冻进 stable 段。禁令是「不要自己去翻任何 skill 目录」，不是禁某几个路径。不要做成工具：正文会被 `persist_cap` 截断，`allowed-tools` 在 `Tool::run` 里不生效，子 Agent 会继承，市场上下载的正文也没有信任门控。
 - 不可信文本（子 Agent 报告、网页、后台 shell 输出）过 `escape_harness_markers`。成功报告套 `<subagent-report>` 并写明其中的指令不是用户的。
 

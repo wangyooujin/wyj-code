@@ -21,6 +21,10 @@ pub struct MemoryTool {
     /// SessionStore 的路径拿不到它。缺失时 `search_sessions` action 返回明确
     /// 错误而不是静默空结果——静默空会让人以为「历史上真的没聊过」。
     sessions: Option<Arc<SessionStore>>,
+    /// 当前会话 id：write/supersede 漏传 `source_locator` 时填成
+    /// `session:<id>`。装配期注入；子 Agent / 测试可以不挂，退回
+    /// `session:current`。
+    session_id: Option<String>,
 }
 
 impl MemoryTool {
@@ -28,6 +32,7 @@ impl MemoryTool {
         Self {
             store,
             sessions: None,
+            session_id: None,
         }
     }
 
@@ -35,6 +40,22 @@ impl MemoryTool {
     pub fn with_sessions(mut self, sessions: Arc<SessionStore>) -> Self {
         self.sessions = Some(sessions);
         self
+    }
+
+    /// 挂上当前会话 id，供 write 默认 provenance 使用。
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        let id = session_id.into();
+        if !id.is_empty() {
+            self.session_id = Some(id);
+        }
+        self
+    }
+
+    fn default_source_locator(&self) -> String {
+        match &self.session_id {
+            Some(id) => format!("session:{id}"),
+            None => "session:current".to_string(),
+        }
     }
 }
 
@@ -92,7 +113,7 @@ impl Tool for MemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "Search and manage durable cross-session memory claims. Two scopes only: `global` (cross-project, requires user natural-language confirmation via `confirm_global_candidate` before activation) and `project` (auto-managed for the current working directory). Search before recurring/continuation work; write project facts directly; write inferences only as expiring hypotheses. When claims do not answer a question about past work, use `search_sessions` to look inside this project's raw conversation transcripts — claims are extracted summaries and may have missed details, while transcripts hold the original wording and command output. Use `kind: \"task\"` to track ongoing work and recovery points (Project scope only, requires task_status); use supersede for changed state, forget to undo a bad write, and reject_global_candidate when the user does not want a pending Global preference promoted. Reference claims never enter the Project Brief, so prefer facts over reference for hot context.".to_string(),
+            description: "Search and manage durable cross-session memory claims. Two scopes only: `global` (cross-project, requires user natural-language confirmation via `confirm_global_candidate` before activation) and `project` (auto-managed for the current working directory). Search before recurring/continuation work; write project facts directly; write inferences only as expiring hypotheses. For write/supersede always pass kind+title+content; scope defaults to project, source_kind to assistant, source_locator to session:<id> when omitted. When claims do not answer a question about past work, use `search_sessions` to look inside this project's raw conversation transcripts — claims are extracted summaries and may have missed details, while transcripts hold the original wording and command output. Use `kind: \"task\"` to track ongoing work and recovery points (Project scope only, requires task_status); use supersede for changed state, forget to undo a bad write, and reject_global_candidate when the user does not want a pending Global preference promoted. Reference claims never enter the Project Brief, so prefer facts over reference for hot context.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -108,15 +129,27 @@ impl Tool for MemoryTool {
                     "reason": {"type": "string", "description": "forget audit reason"},
                     "kind": {
                         "type": "string",
-                        "enum": ["instruction", "preference", "fact", "mutable_state", "event", "workflow", "hypothesis", "reference", "task"]
+                        "enum": ["instruction", "preference", "fact", "mutable_state", "event", "workflow", "hypothesis", "reference", "task"],
+                        "description": "Required for write/supersede"
                     },
-                    "scope": {"type": "string", "enum": ["global", "project"]},
-                    "title": {"type": "string"},
-                    "content": {"type": "string"},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "project"],
+                        "description": "write/supersede: defaults to project when omitted; prefer project for routine facts"
+                    },
+                    "title": {"type": "string", "description": "Required for write/supersede"},
+                    "content": {"type": "string", "description": "Required for write/supersede"},
                     "entities": {"type": "array", "items": {"type": "string"}, "description": "stable identifiers, names, tickers, paths"},
                     "tags": {"type": "array", "items": {"type": "string"}},
-                    "source_kind": {"type": "string", "enum": ["user", "tool", "assistant", "external", "legacy"]},
-                    "source_locator": {"type": "string", "description": "session/tool/path/URL and claim location"},
+                    "source_kind": {
+                        "type": "string",
+                        "enum": ["user", "tool", "assistant", "external", "legacy"],
+                        "description": "write/supersede provenance; defaults to assistant when omitted"
+                    },
+                    "source_locator": {
+                        "type": "string",
+                        "description": "session/tool/path/URL; defaults to session:<current> when omitted"
+                    },
                     "observed_at": {"type": "string", "description": "RFC3339; required for mutable_state"},
                     "expires_at": {"type": "string", "description": "RFC3339; required for hypothesis and recommended for external facts"},
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
@@ -224,25 +257,60 @@ impl Tool for MemoryTool {
                 ))
             }
             "write" | "supersede" => {
+                // schema 的 required 只能标顶层公共字段（action），不能按 action
+                // 分支；原先逐字段 `.context` 会让模型一次只补一个、连撞三次
+                // 「需要 scope / source_kind / source_locator」。真正不可缺省的
+                // 语义字段一次报齐；provenance 给安全默认值。
+                let mut missing = Vec::new();
+                if input.kind.is_none() {
+                    missing.push("kind");
+                }
+                if input
+                    .title
+                    .as_ref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    missing.push("title");
+                }
+                if input
+                    .content
+                    .as_ref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    missing.push("content");
+                }
                 let supersedes = if input.action == "supersede" {
-                    Some(input.id.clone().context("supersede 需要旧记忆 id")?)
+                    match input.id.clone().filter(|id| !id.trim().is_empty()) {
+                        Some(id) => Some(id),
+                        None => {
+                            missing.push("id");
+                            None
+                        }
+                    }
                 } else {
                     None
                 };
+                if !missing.is_empty() {
+                    return Ok(ToolResult::err(format!(
+                        "write/supersede 缺少必填字段: {}。scope 可省略（默认 project）；source_kind 可省略（默认 assistant）；source_locator 可省略（默认 session:<当前会话>）。",
+                        missing.join(", ")
+                    )));
+                }
                 let request = MemoryWriteRequest {
-                    kind: input.kind.context("write/supersede 需要 kind")?,
-                    scope: input.scope.context("write/supersede 需要 scope")?,
-                    title: input.title.context("write/supersede 需要 title")?,
-                    content: input.content.context("write/supersede 需要 content")?,
+                    kind: input.kind.expect("checked above"),
+                    scope: input.scope.unwrap_or(MemoryClaimScope::Project),
+                    title: input.title.expect("checked above"),
+                    content: input.content.expect("checked above"),
                     entities: input.entities,
                     tags: input.tags,
                     source: MemorySource {
-                        kind: input
-                            .source_kind
-                            .context("write/supersede 需要 source_kind")?,
+                        kind: input.source_kind.unwrap_or(MemorySourceKind::Assistant),
                         locator: input
                             .source_locator
-                            .context("write/supersede 需要 source_locator")?,
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| self.default_source_locator()),
                         observed_at: input.observed_at,
                     },
                     evidence: input.evidence,
@@ -335,6 +403,63 @@ mod tests {
             .unwrap();
         assert!(searched.content.contains("crates/cli/src/main.rs"));
         assert!(searched.content.contains("source"));
+    }
+
+    /// 模型常漏传 provenance：scope / source_kind / source_locator 必须有默认值，
+    /// 不能再连撞三次「需要 xxx」。
+    #[tokio::test]
+    async fn write_defaults_provenance_when_omitted() {
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryV3Store::new(base.path(), project.path()).unwrap());
+        let tool = MemoryTool::new(store.clone()).with_session_id("sess-defaults");
+        let ctx = TestCtx(project.path().to_path_buf());
+
+        let written = tool
+            .run(
+                json!({
+                    "action": "write",
+                    "kind": "fact",
+                    "title": "默认 provenance",
+                    "content": "只传了 kind/title/content"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !written.is_error,
+            "缺 provenance 应走默认而不是失败: {}",
+            written.content
+        );
+
+        let record: serde_json::Value = serde_json::from_str(&written.content).unwrap();
+        assert_eq!(record["scope"], "project");
+        assert_eq!(record["source"]["kind"], "assistant");
+        assert_eq!(record["source"]["locator"], "session:sess-defaults");
+    }
+
+    /// 真正缺的语义字段一次报齐，避免「需要 scope」→「需要 source_kind」串行。
+    #[tokio::test]
+    async fn write_reports_all_missing_semantic_fields_at_once() {
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryV3Store::new(base.path(), project.path()).unwrap());
+        let tool = MemoryTool::new(store);
+        let ctx = TestCtx(project.path().to_path_buf());
+
+        let bad = tool.run(json!({ "action": "write" }), &ctx).await.unwrap();
+        assert!(bad.is_error);
+        assert!(bad.content.contains("kind"), "{}", bad.content);
+        assert!(bad.content.contains("title"), "{}", bad.content);
+        assert!(bad.content.contains("content"), "{}", bad.content);
+        // 一次错误里点出可省略项，模型不必再猜。
+        assert!(bad.content.contains("scope 可省略"), "{}", bad.content);
+        assert!(
+            bad.content.contains("source_kind 可省略"),
+            "{}",
+            bad.content
+        );
     }
 
     #[tokio::test]

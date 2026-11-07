@@ -2913,9 +2913,11 @@ impl AppState {
         // 心跳基准随会话一起重置：新会话第一帧不能继承上一段的静默时长，
         // 否则空闲很久后立刻发消息会被看门狗当帧判死。
         self.last_turn_activity = Instant::now();
-        // 未完成的 Progress 跨会话保留：清 UI 后再从磁盘回填；全 completed 的
-        // 陈旧文件由 load 路径跳过并删除，避免 /new 后仍挂着上一轮 tasklist。
-        self.load_progress_panel_from_disk();
+        // 新会话 / `/clear` 边界：清掉面板与项目级 progress.md。
+        // 旧实现会从磁盘回填「未完成」清单，本意是跨会话续跑，但 progress.md
+        // 不绑 session_id——上一会话 Ctrl+C 中断后 `/new` 或重开新对话，仍会
+        // 挂着旧 tasklist。同会话续跑靠 `-c`/`--resume` 启动路径回填即可。
+        self.clear_todo_panel_and_progress();
     }
 
     pub fn ensure_message_ids(&mut self) {
@@ -5319,8 +5321,13 @@ async fn tui_main(
     // Progress(set) 读取面板快照（title_cb 也在 wire_tool_callback 内部设置，
     // 确保 /model 重建后仍生效）
     let agent = wire_tool_callback(agent, agent_tx.clone(), todo_store.clone());
-    // 启动时若磁盘已有 progress.md，直接填任务面板（跨会话续跑可见）
-    state.load_progress_panel_from_disk();
+    // progress.md 是项目级、不绑 session：只有 resume 同一会话才回填面板；
+    // 全新对话清掉上一会话残留，否则 Ctrl+C 后关进程再开新对话仍挂旧 tasklist。
+    if initial_messages.is_empty() {
+        state.clear_todo_panel_and_progress();
+    } else {
+        state.load_progress_panel_from_disk();
+    }
 
     // 用 RwLock 包装 agent，支持 /model 热切换
     let shared_agent = Arc::new(std::sync::RwLock::new(Arc::new(agent)));
@@ -9687,13 +9694,11 @@ async fn tui_main(
                                         state.turns = 0;
                                         state.tool_call_count = 0;
                                         state.tool_info.clear();
-                                        state.current_todos = None;
-                                        state.todo_stats.clear();
-                                        state.todo_execution_logs.clear();
-                                        state.todo_panel_expanded = false;
-                                        state.selected_todo_id = None;
-                                        state.todo_detail_open = false;
-                                        state.todo_detail_scroll = 0;
+                                        // 与 `/new` 对齐：清面板 + 删 progress.md，
+                                        // 否则清空对话后压缩仍会把旧清单注回上下文，
+                                        // 下一轮 begin_new_turn 也会因「磁盘未完成」
+                                        // 而留着幽灵任务板。
+                                        state.clear_todo_panel_and_progress();
                                         state.agents_dialog = None;
                                         state.ui_focus = UiFocus::Composer;
                                         state.sub_input_tokens = 0;
@@ -12664,11 +12669,46 @@ mod todo_stats_tests {
         state.load_progress_panel_from_disk();
         assert!(
             state.current_todos.is_none(),
-            "/new 或 /clear 后不应回填已全部完成的旧清单"
+            "全 completed 的旧清单不得回填面板"
         );
         assert!(
             wyj_core::progress::read_progress(&root).is_none(),
             "跳过回填时应顺手删掉全完成的陈旧 progress.md"
+        );
+    }
+
+    #[test]
+    fn reset_for_new_session_clears_unfinished_progress_md() {
+        // 回归：Ctrl+C 中断后 progress.md 仍有未完成项；旧实现在 /new 与
+        // 全新启动时从磁盘回填 → 新对话挂着上一会话的 tasklist。
+        let dir = tempfile::tempdir().unwrap();
+        let root = wyj_core::project_root(dir.path());
+        let store = Arc::new(std::sync::Mutex::new(TodoStore {
+            items: vec![todo("p1", TodoStatus::InProgress)],
+        }));
+        let mut state = make_state();
+        state.cwd = dir.path().to_path_buf();
+        state.todo_store = Some(store.clone());
+        state.current_todos = Some(vec![
+            todo("p1", TodoStatus::InProgress),
+            todo("p2", TodoStatus::Pending),
+        ]);
+        wyj_core::progress::write_progress(&root, "- [~] active\n- [ ] next\n").unwrap();
+        assert!(state.has_unfinished_progress_on_disk());
+
+        state.reset_for_new_session();
+
+        assert!(
+            state.current_todos.is_none(),
+            "/new 后新对话不得显示上一会话 tasklist"
+        );
+        assert!(
+            wyj_core::progress::read_progress(&root).is_none(),
+            "/new 必须删掉项目级 progress.md，避免压缩/下次启动再回填"
+        );
+        assert!(
+            store.lock().unwrap().items.is_empty(),
+            "共享 TodoStore 也要清空，否则后续 ToolEnd 兜底会再灌回面板"
         );
     }
 
