@@ -322,6 +322,7 @@ help:
     - `/profile [profile]` — Manage call profiles; no arg opens the manager, with a name switches directly (persisted as the global default). Inside the manager, press Enter on a profile → "Use for this session" applies it to the current session only: nothing is written to config.toml, and the choice is stored in the session file so `--resume` keeps using it
     - `/model [model]` — Switch the model of the current profile; no arg opens the model picker (fetches the available model list from the endpoint), with a name switches directly. **Session-only**: nothing is written to config.toml and it is not stored in the session file, so `--resume` returns to the profile's configured model. Only the model field actually used by the current mode is affected
     - `/effort [level]` — Adjust reasoning effort; no arg opens the level picker (listing only the levels the current endpoint really supports), with a level switches directly, `off` disables thinking. Stored in the session file so `--resume` keeps using it, but never written to config.toml
+    - `/density [compact|balanced|detailed]` — Switch chat activity density: no arg opens the picker; with a level switches directly. `balanced` (default) merges successful explore tools; `compact` folds a turn's successful activity into one summary row; `detailed` keeps every step. Writes config.toml. Orthogonal to `Ctrl+O` (body expand)
     - `/mcp` — Manage MCP servers (browse/search the Registry, install/upgrade/uninstall, global or project scope)
     - `/skills` — Manage Skills (add a git marketplace source, browse/install/upgrade/uninstall)
     - `/plugins` — Manage Plugins (add a plugin marketplace, browse/install/upgrade/uninstall/enable/disable)
@@ -351,7 +352,8 @@ help:
     - `Esc` — Interrupt current task
     - `Shift+Tab` — Cycle mode Normal → Plan → Bypass
     - `Ctrl+T` — Focus the task list; expand/collapse it when already focused
-    - `Ctrl+O` — Force-expand/collapse all thinking and tool result bodies (auto by default: shown while running, collapsed when done)
+    - `Ctrl+O` — Force-expand/collapse all thinking and tool result bodies (auto by default: shown while running, collapsed when done); does not change `/density`
+    - `Enter` (content focus) — Expand/collapse activity groups (explore merge rows or Compact turn summaries)
     - `Ctrl+L` — Clear screen (keeps conversation history)
     - `Ctrl+A` / `Ctrl+E` — Jump to start / end of line
     - `Ctrl+K` — Delete from cursor to end of line
@@ -933,6 +935,23 @@ effort:
     off: "Disable thinking"
     none_supported: "The current endpoint does not support reasoning levels (on/off only)"
     headless_unsupported: "[headless mode has no /effort panel; use /effort <level> to switch directly]"
+
+density:
+  desc: "Switch chat activity density: /density opens the picker, /density <level> switches directly (compact / balanced / detailed); writes config.toml"
+  switched: "Activity density switched to {level}"
+  invalid: "Unknown density '{level}' (use: compact / balanced / detailed)"
+  save_failed: "Activity density switched to {level}, but saving config.toml failed: {err}"
+  explored: "Explored {count}"
+  explored_hint: "  ·  Enter to expand"
+  turn_summary: "Worked {elapsed} · explored {explored} · edited {edits} · ran {commands}"
+  turn_summary_hint: "  ·  Enter to expand"
+  expand_hint_content: "In content focus, Enter expands/collapses activity groups; Ctrl+O still controls bodies"
+  picker:
+    title: "Activity density"
+    compact: "compact — conversation-first (fold turn activity into one summary)"
+    balanced: "balanced — default (merge explores; keep important actions visible)"
+    detailed: "detailed — step-by-step (do not merge explore tools)"
+    headless_unsupported: "[headless mode has no /density panel; use /density <level> to switch directly]"
 
 mode:
   switched: "Switched to {mode} mode"

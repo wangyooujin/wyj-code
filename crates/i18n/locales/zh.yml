@@ -319,6 +319,7 @@ help:
     - `/profile [分组名]` — 管理调用分组；无参数打开管理面板，带分组名直接切换（写盘，成为全局默认）。面板里选中分组后按 Enter →「仅本会话使用」可只对当前会话生效，不写 config.toml，随会话落盘、`--resume` 后继续生效
     - `/model [模型名]` — 切换当前分组下的模型；无参数打开模型选择器（从端点拉取可用模型列表），带模型名直接切换。**仅本次会话生效**，不写 config.toml、不随会话落盘（`--resume` 后回到分组配置的模型）；只影响当前模式实际使用的那个模型字段
     - `/effort [档位]` — 调整思考强度；无参数打开档位面板（只列当前端点真正支持的档位），带档位直接切换，`off` 关闭思考。随会话落盘、`--resume` 后继续生效，不写 config.toml
+    - `/density [compact|balanced|detailed]` — 切换聊天区活动密度：无参打开选择面板；带档位直接切换。`balanced`（默认）合并成功的探索类工具；`compact` 把回合成功活动收成一行摘要；`detailed` 逐步一行。写回 config.toml。与 `Ctrl+O`（正文展开）正交
     - `/mcp` — 管理 MCP server（浏览/搜索 Registry、安装/升级/卸载、全局或项目作用域）
     - `/skills` — 管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）
     - `/plugins` — 管理插件（添加插件市场、浏览/安装/升级/卸载/启用/禁用）
@@ -348,7 +349,8 @@ help:
     - `Esc` — 中断当前任务
     - `Shift+Tab` — 循环切换模式 Normal → Plan → Bypass
     - `Ctrl+T` — 聚焦任务列表；已聚焦时折叠/展开任务列表
-    - `Ctrl+O` — 强制展开/收起全部 thinking 与工具结果正文（默认自动：执行中展开，跑完即收）
+    - `Ctrl+O` — 强制展开/收起全部 thinking 与工具结果正文（默认自动：执行中展开，跑完即收）；不改 `/density` 档位
+    - `Enter`（内容焦点）— 展开/收起活动分组（探索合并行或 Compact 回合摘要）
     - `Ctrl+L` — 清屏（保留对话历史）
     - `Ctrl+A` / `Ctrl+E` — 跳到行首 / 行尾
     - `Ctrl+K` — 删除光标到行尾
@@ -930,6 +932,23 @@ effort:
     off: "关闭思考"
     none_supported: "当前端点不支持思考档位（只认开关）"
     headless_unsupported: "[headless 模式不支持 /effort 面板，请用 /effort <档位> 直接切换]"
+
+density:
+  desc: "切换聊天区活动密度：/density 打开选择面板，/density <档位> 直接切换（compact / balanced / detailed），写回 config.toml"
+  switched: "活动密度已切换为 {level}"
+  invalid: "未知密度 '{level}'（可用：compact / balanced / detailed）"
+  save_failed: "活动密度已切换为 {level}，但写入 config.toml 失败：{err}"
+  explored: "探索了 {count} 处"
+  explored_hint: "  ·  Enter 展开"
+  turn_summary: "工作了 {elapsed} · 探索 {explored} · 改了 {edits} · 跑了 {commands}"
+  turn_summary_hint: "  ·  Enter 展开"
+  expand_hint_content: "内容焦点下 Enter 展开/收起活动分组；Ctrl+O 仍控制正文"
+  picker:
+    title: "活动密度"
+    compact: "compact — 对话优先（回合活动收成一行摘要）"
+    balanced: "balanced — 默认（探索工具合并，关键动作逐步可见）"
+    detailed: "detailed — 逐步展开（不合并探索工具）"
+    headless_unsupported: "[headless 模式不支持 /density 面板，请用 /density <档位> 直接切换]"
 
 mode:
   switched: "已切换至 {mode} 模式"

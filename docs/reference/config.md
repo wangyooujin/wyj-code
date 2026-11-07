@@ -281,6 +281,13 @@ mouse = "auto"                 # 鼠标报告（DEC 1000/1002/1006）策略，�
 scrollbar = true               # 内容区右侧是否绘制应用内细滚动条（│ / ┃，less/vim 观感）。
                                 # 只在内容超出视口时出现，宽度 < 3 列的终端不画；
                                 # 出现后可用鼠标拖动滑块或点击轨道跳转。
+activity_density = "balanced"  # 聊天区活动密度（v0.3.x+），三态：
+                                #   "compact"   对话优先：回合内成功活动收成一行摘要；
+                                #   "balanced"  默认：写盘/Bash/失败逐步可见，成功的探索类
+                                #               工具（Read/Grep/Glob/…）合并为 Explored N；
+                                #   "detailed"  探索类也不合并，逐步一行标题。
+                                # 与 Ctrl+O（thinking/工具正文自动↔全展开）正交。
+                                # `/density` 可循环切换并写回本字段。
 
 [context_edit]                   # tool-result context editing（v0.2.26+）：
                                 # 超阈值时先把过期工具输出外部化到 CAS，
@@ -390,6 +397,8 @@ mouse = "auto"                   # 鼠标报告策略三态：auto（按 TERM �
 # mouse_capture = true           # **已废弃**：v0.3.18 前的布尔字段，等价于 on/off，不再写回
 scrollbar = true                 # 内容区右侧是否绘制应用内细滚动条（│/┃）。
                                  # 只在内容超出视口时出现，宽度 < 3 列的终端不画
+activity_density = "balanced"    # 聊天活动密度：compact / balanced（默认）/ detailed；
+                                 # 与 Ctrl+O 正文展开正交；`/density` 写回
 
 [evolution]                      # 基于真实 Episode 的本地自进化
 enabled = true                   # 总开关。关掉后完全不记录 Episode、不生成候选

@@ -27,6 +27,7 @@
 - 系统通知用 `markdown::wrap_plain_text_spans` 折行。不要交给 `Paragraph` 的 `WordWrapper`（中文没有空格，会被拦腰截断）。
 - 子 Agent 详情是把 trace **翻译**成聊天消息再走同一条渲染管线，按事件条数缓存。不要在面板里铺原始 trace。交接摘要一行，报错进正文。
 - 实时工具输出两道闸：`tool_use_id` 已登记，且 `is_thinking`。中断后泵仍可能推来尾帧。
+- **活动密度**（`[ui].activity_density` / `/density`）与 `Ctrl+O` 正交：前者管「合并几层活动行」，后者管 thinking/工具**正文**自动↔全展开。默认 `balanced`：相邻 ≥2 条成功探索工具（Read/Grep/Glob/CodeSearch/WebFetch/WebSearch/ToolSearch/Memory/ContextRecall）合并为 `Explored N`；`compact` 把回合内成功活动收成一行摘要（失败、进行中、授权、Plan、AskQuestion、用户 `!` bash 永不进合并桶）；`detailed` 不合并。分组展开用内容焦点 `Enter`（`activity_groups_expanded`），`Ctrl+O` 为 true 时探索组也强制展开。只改呈现层，不改 `ChatMessage` 入库。
 
 ## 输入与鼠标
 
@@ -48,7 +49,7 @@
 ## 渲染时不要退回去的行为
 
 - `draw_chat` 只把视口里的行交给 `Paragraph`。`scroll` 是 `u16`，整段历史塞进去会卡，也会滚不到底。高度按物理行算。
-- `Ctrl+O` 是「自动 ↔ 全展开」，不是「全折叠 ↔ 全展开」。正在执行的步骤保持展开。Edit/Write 折叠态仍显示最多约 20 行 diff；不要把这个例外扩到 Bash 这类大输出。
+- `Ctrl+O` 是「自动 ↔ 全展开」，不是「全折叠 ↔ 全展开」。正在执行的步骤保持展开。Edit/Write 折叠态仍显示最多约 20 行 diff；不要把这个例外扩到 Bash 这类大输出。不要用 `Ctrl+O` 去改密度档——那是 `/density` 的事。
 - 退出前排空在途的按键 release，panic hook 无条件 `PopKeyboardEnhancementFlags`。否则 Ghostty 的 `CSI u` 会漏进 shell，提示符后多出 `9;5;3u`。
 - 鼠标报告只开 1000/1002/1006，不要开 1003，也不要改用 crossterm 的 `EnableMouseCapture`。
 - 不要再试 Inline viewport 来做贴底。那条路已经因为光标查询竞态失败过。

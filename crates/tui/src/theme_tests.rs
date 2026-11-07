@@ -84,6 +84,8 @@ fn slot_color(slot: &str) -> Color {
 /// 测试模块里必然有裸 `Color::`——它们就是在断言这些颜色，不该被这条规则扫到。
 fn production_source(file: &str) -> String {
     let source = match file {
+        "activity_density.rs" => include_str!("activity_density.rs"),
+        "app/density_panel.rs" => include_str!("app/density_panel.rs"),
         "render.rs" => include_str!("render.rs"),
         "markdown.rs" => include_str!("markdown.rs"),
         "welcome.rs" => include_str!("welcome.rs"),
@@ -130,6 +132,14 @@ fn production_source(file: &str) -> String {
 #[test]
 fn no_hardcoded_colors_outside_theme() {
     let files = [
+        (
+            "activity_density.rs",
+            production_source("activity_density.rs"),
+        ),
+        (
+            "app/density_panel.rs",
+            production_source("app/density_panel.rs"),
+        ),
         ("render.rs", production_source("render.rs")),
         ("markdown.rs", production_source("markdown.rs")),
         ("welcome.rs", production_source("welcome.rs")),

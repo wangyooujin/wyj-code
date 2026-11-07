@@ -856,6 +856,52 @@ impl MouseMode {
     }
 }
 
+/// 聊天区活动密度：控制工具调用 / 探索步骤在主视图里占多少行。
+///
+/// 与 `Ctrl+O`（thinking / 工具**正文**自动 ↔ 全展开）正交——本枚举只改
+/// 「有没有合并行、合并到哪一层」，不决定正文是否摊开。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivityDensity {
+    /// 对话优先：回合内成功活动收成一行摘要，展开后回落 Balanced。
+    Compact,
+    /// 默认：写盘 / Bash / 失败等逐步可见；成功的探索类工具合并为 `Explored N`。
+    #[default]
+    Balanced,
+    /// 探索类也不合并，逐步一行标题（接近未分组时的时间线）。
+    Detailed,
+}
+
+impl ActivityDensity {
+    /// 解析 `/density` 参数或配置字符串。未知值返回 `None`。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "compact" | "c" => Some(Self::Compact),
+            "balanced" | "b" | "normal" | "default" => Some(Self::Balanced),
+            "detailed" | "d" | "full" | "verbose" => Some(Self::Detailed),
+            _ => None,
+        }
+    }
+
+    /// 配置 / 状态栏用的稳定英文名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Balanced => "balanced",
+            Self::Detailed => "detailed",
+        }
+    }
+
+    /// `/density` 无参时按 Compact → Balanced → Detailed → Compact 循环。
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Compact => Self::Balanced,
+            Self::Balanced => Self::Detailed,
+            Self::Detailed => Self::Compact,
+        }
+    }
+}
+
 /// `[ui]` 节 —— TUI 展示区的交互开关。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -873,6 +919,8 @@ pub struct UiCfg {
     ///
     /// 只在内容超出视口时出现，宽度 < 3 列的终端不画；出现后可用鼠标拖动。
     pub scrollbar: bool,
+    /// 聊天区活动密度（`"compact"` / `"balanced"` / `"detailed"`），默认 `balanced`。
+    pub activity_density: ActivityDensity,
 }
 
 impl UiCfg {
@@ -892,6 +940,7 @@ impl Default for UiCfg {
             mouse: MouseMode::Auto,
             mouse_capture: None,
             scrollbar: true,
+            activity_density: ActivityDensity::Balanced,
         }
     }
 }
@@ -2401,8 +2450,8 @@ context_window = 200000
 #[cfg(test)]
 mod subagent_cfg_tests {
     use super::{
-        ComputerUseCfg, Config, EvolutionCfg, ForegroundFallback, MouseMode, Profile, Provider,
-        RoutingRole, SubAgentCfg, UiCfg, WireProtocol,
+        ActivityDensity, ComputerUseCfg, Config, EvolutionCfg, ForegroundFallback, MouseMode,
+        Profile, Provider, RoutingRole, SubAgentCfg, UiCfg, WireProtocol,
     };
 
     #[test]
@@ -2897,6 +2946,7 @@ context_window = 200000
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.ui.mouse, MouseMode::Auto);
         assert!(cfg.ui.scrollbar);
+        assert_eq!(cfg.ui.activity_density, ActivityDensity::Balanced);
         // 常见终端（xterm-256color / screen / tmux）都判定为开启。
         assert!(cfg.ui.mouse.resolve(Some("xterm-256color")));
         assert!(cfg.ui.mouse.resolve(Some("screen-256color")));
@@ -2916,6 +2966,18 @@ context_window = 200000
         assert_eq!(cfg.ui.mouse, MouseMode::On);
         assert!(cfg.ui.mouse.resolve(Some("dumb")));
         assert!(!cfg.ui.scrollbar);
+    }
+
+    #[test]
+    fn ui_cfg_activity_density_parses_and_cycles() {
+        let cfg: Config = toml::from_str("[ui]\nactivity_density = \"compact\"\n").unwrap();
+        assert_eq!(cfg.ui.activity_density, ActivityDensity::Compact);
+        let cfg: Config = toml::from_str("[ui]\nactivity_density = \"detailed\"\n").unwrap();
+        assert_eq!(cfg.ui.activity_density, ActivityDensity::Detailed);
+        assert_eq!(ActivityDensity::parse("b"), Some(ActivityDensity::Balanced));
+        assert_eq!(ActivityDensity::Balanced.cycle(), ActivityDensity::Detailed);
+        assert_eq!(ActivityDensity::Detailed.cycle(), ActivityDensity::Compact);
+        assert_eq!(ActivityDensity::Compact.cycle(), ActivityDensity::Balanced);
     }
 
     /// 旧字段 `mouse_capture` 仍要生效（用户可能还没改配置），但不会被写回。

@@ -1,5 +1,6 @@
 //! wyj-tui — ratatui 终端 UI
 
+mod activity_density;
 pub mod app;
 pub mod event;
 mod hyperlink;

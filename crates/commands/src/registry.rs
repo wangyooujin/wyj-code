@@ -120,6 +120,13 @@ pub enum CommandResult {
     /// `Some(id)` 直接选中并展开该任务的实时输出；`None` 定位到最近一个任务
     /// （TUI 侧实现；headless 不支持面板）。
     OpenShellsPanel(Option<String>),
+    /// 打开活动密度选择面板（`/density` 无参触发）。
+    OpenDensityPicker,
+    /// 设置聊天区活动密度（`/density <level>` 触发）。
+    ///
+    /// 取值是 `compact` / `balanced` / `detailed`。
+    /// TUI / headless 都写回 `config.toml` 的 `[ui].activity_density`。
+    SetActivityDensity(String),
 }
 
 #[derive(Debug, Clone)]
@@ -668,6 +675,7 @@ mod busy_whitelist_tests {
             "agents",
             "config",
             "cwd",
+            "density",
             "doctor",
             "effort",
             "extensions",

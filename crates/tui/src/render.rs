@@ -13,17 +13,21 @@ mod dialogs;
 /// 前逐字一致，而实现落在 `render/dialogs.rs`。
 use dialogs::*;
 
+use crate::activity_density::{
+    collect_turn_activity_stats, format_turn_activity_summary, is_successful_explore_pair,
+};
 use crate::app::{
     fmt_tokens, format_elapsed, format_hms, ActionMenu, AgentsDialog, AppState, AskQuestionDialog,
-    AskQuestionStage, Attachment, ChatMessage, EffortPickerDialog, EnterPlanDialog,
-    EvolutionDialog, EvolutionRow, ExecModeConfirmDialog, ExtensionsDialog, FlatRow,
-    InProgressAnswer, InputOwner, McpConnStatus, McpDialog, McpDialogTab, McpOverlay, MemoryDialog,
-    MemoryRow, MessageRole, ModelPickerDialog, PermissionDialog, PlanApprovalDialog, PluginOverlay,
-    PluginsDialog, PluginsDialogTab, ProfileDialog, ProfileFieldKind, ProfileInputField,
-    ProfileOverlay, ProfileRow, SessionConflictDialog, SessionPickerState, SettingsDialog,
-    SettingsFieldKind, SettingsInputField, SettingsOverlay, SkillsBrowseSource, SkillsDialog,
-    SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, TodoExecutionEntry,
-    TodoRuntimeStats, UiFocus, PROFILE_FIELD_SPECS, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_SPECS,
+    AskQuestionStage, Attachment, ChatMessage, DensityPickerDialog, EffortPickerDialog,
+    EnterPlanDialog, EvolutionDialog, EvolutionRow, ExecModeConfirmDialog, ExtensionsDialog,
+    FlatRow, InProgressAnswer, InputOwner, McpConnStatus, McpDialog, McpDialogTab, McpOverlay,
+    MemoryDialog, MemoryRow, MessageRole, ModelPickerDialog, PermissionDialog, PlanApprovalDialog,
+    PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog, ProfileFieldKind,
+    ProfileInputField, ProfileOverlay, ProfileRow, SessionConflictDialog, SessionPickerState,
+    SettingsDialog, SettingsFieldKind, SettingsInputField, SettingsOverlay, SkillsBrowseSource,
+    SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState,
+    TodoExecutionEntry, TodoRuntimeStats, UiFocus, PROFILE_FIELD_SPECS, SETTINGS_FIELD_COUNT,
+    SETTINGS_FIELD_SPECS,
 };
 use crate::input::{is_atomic_marker, InputBox, ATTACHMENT_MARKER, PASTE_MARKER};
 use crate::markdown::{
@@ -42,7 +46,7 @@ use ratatui::{
 };
 use std::collections::HashMap;
 use std::time::Instant;
-use wyj_config::AgentMode;
+use wyj_config::{ActivityDensity, AgentMode};
 use wyj_core::tool::{AskQuestionSpec, QuestionAnswer};
 use wyj_core::ClaudeMdSource;
 use wyj_tools::todo::{is_todo_collapsible, TodoStatus};
@@ -863,6 +867,9 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     // 思考强度面板叠加在最顶层（/effort）
     if let Some(dialog) = &state.effort_picker {
         draw_effort_picker(f, dialog, area);
+    }
+    if let Some(dialog) = &state.density_picker {
+        draw_density_picker(f, dialog, area);
     }
 
     // 所有浮层都完成后再扫描最终 Buffer，避免被面板覆盖的聊天链接仍落在坐标表中。
@@ -2280,6 +2287,8 @@ pub(crate) fn build_pending_chat_lines(
             spinner_frame: state.spinner_frame,
             output_expanded: state.output_expanded,
             live_tool_out: &live_tool_out,
+            activity_density: state.activity_density,
+            activity_groups_expanded: state.activity_groups_expanded,
         },
         &mut is_first_user,
     ));
@@ -2736,10 +2745,15 @@ struct MessageRangeRenderArgs<'a> {
     spinner_frame: usize,
     output_expanded: bool,
     live_tool_out: &'a std::collections::HashMap<usize, String>,
+    activity_density: ActivityDensity,
+    activity_groups_expanded: bool,
 }
 
 /// 渲染 `messages[range]` 为 `Vec<Line>`。`is_first_user` 携带"区间开始前是否已
 /// 出现过 User 消息"的状态，供完整消息流与流式尾部共用同一份逻辑。
+///
+/// 密度规则见 `crates/tui/CLAUDE.md`「活动密度」：Compact 收成回合摘要，
+/// Balanced 合并相邻成功探索工具，Detailed 不合并。`Ctrl+O` 只影响正文。
 fn render_message_range(
     args: MessageRangeRenderArgs<'_>,
     is_first_user: &mut bool,
@@ -2752,6 +2766,8 @@ fn render_message_range(
         spinner_frame,
         live_tool_out,
         output_expanded,
+        activity_density,
+        activity_groups_expanded,
     } = args;
     let ctx = ChatRenderCtx {
         max_content_width,
@@ -2760,31 +2776,239 @@ fn render_message_range(
         output_expanded,
         live_tool_out,
     };
+    let explore_expanded = activity_groups_expanded
+        || output_expanded
+        || activity_density == ActivityDensity::Detailed;
+    let compact_collapsed =
+        activity_density == ActivityDensity::Compact && !activity_groups_expanded;
+
     let mut lines = vec![];
-    let mut i = range.start;
-    while i < range.end {
-        if !lines.is_empty() {
-            lines.push(Line::from(""));
+    if compact_collapsed {
+        render_compact_range(
+            &mut lines,
+            messages,
+            range,
+            is_first_user,
+            &ctx,
+            explore_expanded,
+        );
+    } else {
+        render_balanced_range(
+            &mut lines,
+            messages,
+            range.start,
+            range.end,
+            is_first_user,
+            &ctx,
+            explore_expanded,
+        );
+    }
+    lines
+}
+
+/// Compact：按 User 切回合；成功活动收成一行摘要，失败/进行中/回答等仍逐步露出。
+fn render_compact_range(
+    lines: &mut Vec<Line<'static>>,
+    messages: &[ChatMessage],
+    range: std::ops::Range<usize>,
+    is_first_user: &mut bool,
+    ctx: &ChatRenderCtx<'_>,
+    explore_expanded: bool,
+) {
+    let mut turn_starts: Vec<usize> = Vec::new();
+    for idx in range.start..range.end {
+        if matches!(messages[idx].role, MessageRole::User) {
+            turn_starts.push(idx);
         }
+    }
+    if turn_starts.is_empty() {
+        // 区间里没有 User（例如子 Agent 轨迹）：退回 Balanced 路径。
+        render_balanced_range(
+            lines,
+            messages,
+            range.start,
+            range.end,
+            is_first_user,
+            ctx,
+            explore_expanded,
+        );
+        return;
+    }
+
+    // 前缀：第一个 User 之前的残留（罕见，resume 边界）。
+    if turn_starts[0] > range.start {
+        render_balanced_range(
+            lines,
+            messages,
+            range.start,
+            turn_starts[0],
+            is_first_user,
+            ctx,
+            explore_expanded,
+        );
+    }
+
+    for (ti, &start) in turn_starts.iter().enumerate() {
+        let end = turn_starts
+            .get(ti + 1)
+            .copied()
+            .unwrap_or(range.end)
+            .min(range.end);
+        render_compact_turn(
+            lines,
+            messages,
+            start,
+            end,
+            is_first_user,
+            ctx,
+            explore_expanded,
+        );
+    }
+}
+
+fn render_compact_turn(
+    lines: &mut Vec<Line<'static>>,
+    messages: &[ChatMessage],
+    start: usize,
+    end: usize,
+    is_first_user: &mut bool,
+    ctx: &ChatRenderCtx<'_>,
+    explore_expanded: bool,
+) {
+    let turn = &messages[start..end];
+    let stats = collect_turn_activity_stats(turn);
+    if !stats.has_foldable_activity {
+        render_balanced_range(
+            lines,
+            messages,
+            start,
+            end,
+            is_first_user,
+            ctx,
+            explore_expanded,
+        );
+        return;
+    }
+
+    // User 行
+    push_render_gap(lines);
+    render_chat_message(lines, &messages[start], start, is_first_user, ctx);
+    trim_trailing_blank_lines(lines);
+
+    // 回合活动摘要（含 TurnSummary 耗时，若有）
+    push_render_gap(lines);
+    let mut summary = format_turn_activity_summary(&stats);
+    summary.push_str(&wyj_i18n::tr("density.turn_summary_hint"));
+    lines.push(Line::from(vec![
+        Span::styled("  ▸ ", Theme::dim()),
+        Span::styled(summary, Theme::dim()),
+    ]));
+
+    // 其余：跳过可折叠成功工具对 / Thinking / TurnSummary；保留失败、进行中、回答等。
+    let mut i = start + 1;
+    while i < end {
+        let msg = &messages[i];
+        if matches!(msg.role, MessageRole::Thinking | MessageRole::TurnSummary) {
+            i += 1;
+            continue;
+        }
+        if matches!(msg.role, MessageRole::ToolCall) {
+            if let Some(next) = messages.get(i + 1).filter(|r| {
+                i + 1 < end
+                    && matches!(r.role, MessageRole::ToolResult)
+                    && r.sequence_no == msg.sequence_no
+            }) {
+                if !next.is_error {
+                    // 成功工具：已进摘要，跳过整对。
+                    i += 2;
+                    continue;
+                }
+                push_render_gap(lines);
+                render_tool_result_block(lines, Some(msg), next, ctx);
+                trim_trailing_blank_lines(lines);
+                i += 2;
+                continue;
+            }
+        }
+        push_render_gap(lines);
+        render_chat_message(lines, msg, i, is_first_user, ctx);
+        trim_trailing_blank_lines(lines);
+        i += 1;
+    }
+}
+
+/// Balanced / Detailed / Compact-展开：逐步渲染，可选合并相邻成功探索工具。
+fn render_balanced_range(
+    lines: &mut Vec<Line<'static>>,
+    messages: &[ChatMessage],
+    start: usize,
+    end: usize,
+    is_first_user: &mut bool,
+    ctx: &ChatRenderCtx<'_>,
+    explore_expanded: bool,
+) {
+    let mut i = start;
+    while i < end {
+        if matches!(messages[i].role, MessageRole::ToolCall) && !explore_expanded {
+            if let Some(group_end) = peek_explore_group_end(messages, i, end) {
+                let count = (group_end - i) / 2;
+                if count >= 2 {
+                    push_render_gap(lines);
+                    let mut label =
+                        wyj_i18n::tr_fmt("density.explored", &[("count", &count.to_string())]);
+                    if !ctx.output_expanded {
+                        label.push_str(&wyj_i18n::tr("density.explored_hint"));
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled("  ▸ ", Theme::dim()),
+                        Span::styled(label, Theme::dim()),
+                    ]));
+                    i = group_end;
+                    continue;
+                }
+            }
+        }
+
+        push_render_gap(lines);
         let msg = &messages[i];
         if matches!(msg.role, MessageRole::ToolCall) {
             if let Some(next) = messages.get(i + 1) {
-                if i + 1 < range.end
+                if i + 1 < end
                     && matches!(next.role, MessageRole::ToolResult)
                     && next.sequence_no == msg.sequence_no
                 {
-                    render_tool_result_block(&mut lines, Some(msg), next, &ctx);
-                    trim_trailing_blank_lines(&mut lines);
+                    render_tool_result_block(lines, Some(msg), next, ctx);
+                    trim_trailing_blank_lines(lines);
                     i += 2;
                     continue;
                 }
             }
         }
-        render_chat_message(&mut lines, msg, i, is_first_user, &ctx);
-        trim_trailing_blank_lines(&mut lines);
+        render_chat_message(lines, msg, i, is_first_user, ctx);
+        trim_trailing_blank_lines(lines);
         i += 1;
     }
-    lines
+}
+
+/// 从 `i` 起连续成功探索对的结束下标（不含）；不足 2 对返回 `None`。
+fn peek_explore_group_end(messages: &[ChatMessage], i: usize, end: usize) -> Option<usize> {
+    let mut j = i;
+    let mut pairs = 0usize;
+    while j + 1 < end && is_successful_explore_pair(&messages[j], &messages[j + 1]) {
+        pairs += 1;
+        j += 2;
+    }
+    if pairs >= 2 {
+        Some(j)
+    } else {
+        None
+    }
+}
+
+fn push_render_gap(lines: &mut Vec<Line<'static>>) {
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
 }
 
 /// 聊天区可用内容列数。
@@ -3092,6 +3316,8 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
             // 子 Agent 的内部工具输出不走主会话的实时通道：它的实时输出由
             // 轨迹里的 ToolEnd 落盘事件承担。
             live_tool_out: &HashMap::new(),
+            activity_density: state.activity_density,
+            activity_groups_expanded: state.activity_groups_expanded,
         },
         &mut is_first_user,
     ));
@@ -4613,6 +4839,24 @@ mod tool_result_fold_tests {
         output_expanded: bool,
         live_tool_out: &HashMap<usize, String>,
     ) -> Vec<String> {
+        render_messages_with_density(
+            messages,
+            width,
+            output_expanded,
+            live_tool_out,
+            ActivityDensity::Detailed,
+            false,
+        )
+    }
+
+    fn render_messages_with_density(
+        messages: &[ChatMessage],
+        width: usize,
+        output_expanded: bool,
+        live_tool_out: &HashMap<usize, String>,
+        activity_density: ActivityDensity,
+        activity_groups_expanded: bool,
+    ) -> Vec<String> {
         let mut is_first_user = true;
         rendered_text(render_message_range(
             MessageRangeRenderArgs {
@@ -4623,9 +4867,212 @@ mod tool_result_fold_tests {
                 spinner_frame: 0,
                 output_expanded,
                 live_tool_out,
+                activity_density,
+                activity_groups_expanded,
             },
             &mut is_first_user,
         ))
+    }
+
+    fn explore_pair(seq: usize, name: &str, arg: &str) -> [ChatMessage; 2] {
+        let mut call = message(MessageRole::ToolCall, &format!("{name}({arg})"));
+        call.sequence_no = Some(seq);
+        call.tool_name = Some(name.to_string());
+        let mut result = message(MessageRole::ToolResult, "ok");
+        result.sequence_no = Some(seq);
+        result.tool_name = Some(name.to_string());
+        result.display_summary = "ok".to_string();
+        [call, result]
+    }
+
+    #[test]
+    fn balanced_merges_consecutive_successful_explore_tools() {
+        let mut messages = vec![message(MessageRole::User, "look around")];
+        for (i, (name, arg)) in [("Read", "a.rs"), ("Grep", "foo"), ("Glob", "*.rs")]
+            .into_iter()
+            .enumerate()
+        {
+            messages.extend(explore_pair(i + 1, name, arg));
+        }
+        let rendered = render_messages_with_density(
+            &messages,
+            100,
+            false,
+            &HashMap::new(),
+            ActivityDensity::Balanced,
+            false,
+        );
+        let joined = rendered.join("\n");
+        assert!(
+            joined.contains("3") && (joined.contains("探索") || joined.contains("Explored")),
+            "Balanced 应合并为 Explored 3：{joined}"
+        );
+        assert!(
+            !joined.contains("Read(a.rs)"),
+            "合并后不应再逐条露出 Read：{joined}"
+        );
+    }
+
+    #[test]
+    fn balanced_keeps_failed_explore_out_of_the_merge() {
+        let mut messages = vec![message(MessageRole::User, "search")];
+        messages.extend(explore_pair(1, "Read", "a.rs"));
+        messages.extend(explore_pair(2, "Grep", "foo"));
+        let mut failed = explore_pair(3, "Grep", "bar");
+        failed[1].is_error = true;
+        failed[1].display_summary = "failed".to_string();
+        messages.extend(failed);
+
+        let rendered = render_messages_with_density(
+            &messages,
+            100,
+            false,
+            &HashMap::new(),
+            ActivityDensity::Balanced,
+            false,
+        );
+        let joined = rendered.join("\n");
+        assert!(
+            joined.contains("2") && (joined.contains("探索") || joined.contains("Explored")),
+            "前两条成功应合并：{joined}"
+        );
+        assert!(
+            joined.contains("Grep(bar)") || joined.contains("failed"),
+            "失败的 Grep 必须单独成行：{joined}"
+        );
+    }
+
+    #[test]
+    fn detailed_does_not_merge_explore_tools() {
+        let mut messages = vec![message(MessageRole::User, "look")];
+        messages.extend(explore_pair(1, "Read", "a.rs"));
+        messages.extend(explore_pair(2, "Grep", "foo"));
+        let rendered = render_messages_with_density(
+            &messages,
+            100,
+            false,
+            &HashMap::new(),
+            ActivityDensity::Detailed,
+            false,
+        );
+        let joined = rendered.join("\n");
+        assert!(joined.contains("Read(a.rs)"), "{joined}");
+        assert!(joined.contains("Grep(foo)"), "{joined}");
+        assert!(
+            !joined.contains("Explored") && !joined.contains("探索了"),
+            "Detailed 不应出现合并行：{joined}"
+        );
+    }
+
+    #[test]
+    fn compact_collapses_successful_turn_activity_into_one_summary() {
+        let mut messages = vec![message(MessageRole::User, "fix login")];
+        messages.extend(explore_pair(1, "Read", "auth.rs"));
+        messages.extend(explore_pair(2, "Grep", "token"));
+        let mut edit = explore_pair(3, "Edit", "auth.rs");
+        // Edit 不在 explore 白名单，但成功活动仍进 Compact 摘要。
+        edit[0].tool_name = Some("Edit".to_string());
+        edit[1].tool_name = Some("Edit".to_string());
+        messages.extend(edit);
+        let mut bash = explore_pair(4, "Bash", "cargo test");
+        bash[0].tool_name = Some("Bash".to_string());
+        bash[1].tool_name = Some("Bash".to_string());
+        messages.extend(bash);
+        messages.push(message(MessageRole::Assistant, "fixed"));
+
+        let rendered = render_messages_with_density(
+            &messages,
+            100,
+            false,
+            &HashMap::new(),
+            ActivityDensity::Compact,
+            false,
+        );
+        let joined = rendered.join("\n");
+        assert!(
+            joined.contains("工作了") || joined.contains("Worked"),
+            "Compact 应有回合摘要：{joined}"
+        );
+        assert!(joined.contains("fixed"), "助手回答必须保留：{joined}");
+        assert!(
+            !joined.contains("Read(auth.rs)"),
+            "成功探索不应逐步露出：{joined}"
+        );
+        assert!(
+            !joined.contains("Edit(auth.rs)"),
+            "成功 Edit 应进摘要：{joined}"
+        );
+    }
+
+    #[test]
+    fn compact_keeps_in_flight_and_failed_tools_visible() {
+        let mut messages = vec![message(MessageRole::User, "run")];
+        messages.extend(explore_pair(1, "Read", "a.rs"));
+        let mut failed = explore_pair(2, "Bash", "boom");
+        failed[0].tool_name = Some("Bash".to_string());
+        failed[1].tool_name = Some("Bash".to_string());
+        failed[1].is_error = true;
+        messages.extend(failed);
+        // 进行中：只有 ToolCall
+        let mut live = message(MessageRole::ToolCall, "Bash(sleep 10)");
+        live.sequence_no = Some(3);
+        live.tool_name = Some("Bash".to_string());
+        messages.push(live);
+
+        let rendered = render_messages_with_density(
+            &messages,
+            100,
+            false,
+            &HashMap::new(),
+            ActivityDensity::Compact,
+            false,
+        );
+        let joined = rendered.join("\n");
+        assert!(
+            joined.contains("工作了") || joined.contains("Worked"),
+            "成功 Read 应进摘要：{joined}"
+        );
+        assert!(
+            joined.contains("Bash(boom)") || joined.contains("failed"),
+            "失败 Bash 必须露出：{joined}"
+        );
+        assert!(
+            joined.contains("Bash(sleep 10)"),
+            "进行中 Bash 必须露出：{joined}"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_expands_explore_groups_without_changing_density() {
+        let mut messages = vec![message(MessageRole::User, "look")];
+        messages.extend(explore_pair(1, "Read", "a.rs"));
+        messages.extend(explore_pair(2, "Grep", "foo"));
+        let collapsed = render_messages_with_density(
+            &messages,
+            100,
+            false,
+            &HashMap::new(),
+            ActivityDensity::Balanced,
+            false,
+        );
+        let expanded = render_messages_with_density(
+            &messages,
+            100,
+            true, // Ctrl+O
+            &HashMap::new(),
+            ActivityDensity::Balanced,
+            false,
+        );
+        let collapsed_joined = collapsed.join("\n");
+        let expanded_joined = expanded.join("\n");
+        assert!(
+            collapsed_joined.contains("探索") || collapsed_joined.contains("Explored"),
+            "{collapsed_joined}"
+        );
+        assert!(
+            expanded_joined.contains("Read(a.rs)") && expanded_joined.contains("Grep(foo)"),
+            "Ctrl+O 应强制展开探索组：{expanded_joined}"
+        );
     }
 
     fn sub_agent(status: SubAgentStatus) -> SubAgentUiState {
@@ -6644,6 +7091,8 @@ fn foo() {}
                 spinner_frame: 0,
                 output_expanded: true,
                 live_tool_out: &HashMap::new(),
+                activity_density: ActivityDensity::Detailed,
+                activity_groups_expanded: false,
             },
             &mut is_first_user,
         );
@@ -6934,6 +7383,8 @@ fn foo() {}
                 spinner_frame: 0,
                 output_expanded: true,
                 live_tool_out: &HashMap::new(),
+                activity_density: ActivityDensity::Detailed,
+                activity_groups_expanded: false,
             },
             &mut is_first_user,
         );

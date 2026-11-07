@@ -2897,6 +2897,20 @@ pub(super) fn draw_effort_picker(f: &mut Frame, dialog: &EffortPickerDialog, are
     draw_profile_list_overlay(f, area, "effort.picker.title", items, dialog.selected);
 }
 
+pub(super) fn draw_density_picker(f: &mut Frame, dialog: &DensityPickerDialog, area: Rect) {
+    let items: Vec<String> = (0..dialog.item_count())
+        .map(|i| {
+            let label = dialog.item_label(i);
+            if dialog.item_value(i) == Some(dialog.current) {
+                format!("● {label}")
+            } else {
+                label
+            }
+        })
+        .collect();
+    draw_profile_list_overlay(f, area, "density.picker.title", items, dialog.selected);
+}
+
 /// 三个面板(`/mcp`/`/skills`/`/plugins`)共用的"操作菜单"浮层：选中某一行按 Enter
 /// 弹出，Up/Down 选、Enter 确认、Esc 逐级返回。居中定位而非贴边行——列表可能
 /// 滚动，行级定位在选中行贴近屏幕边缘时会被截断，故直接复用
