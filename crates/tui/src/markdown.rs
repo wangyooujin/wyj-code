@@ -1632,8 +1632,8 @@ pub fn render_thinking_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_
 ///
 /// 与 [`render_streaming_markdown`] 同源（未闭合围栏不画框），额外打开
 /// thinking 的两条规则（软换行保留、围栏退化成引用式）。流式期间每帧只喂
-/// 尾部 [`render::LIVE_TAIL_LINES`] 行，输入有硬上界，解析成本与整段思考
-/// 的长度无关。
+/// 尾部源码窗（`THINKING_LIVE_SOURCE_LINES`），再截成固定物理视口，解析成本
+/// 与整段思考的长度无关。
 pub fn render_streaming_thinking_markdown(
     lines: &mut Vec<Line<'static>>,
     text: &str,

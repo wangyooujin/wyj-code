@@ -1163,24 +1163,35 @@ struct ChatRenderCtx<'a> {
     live_tool_out: &'a std::collections::HashMap<usize, String>,
 }
 
-/// 执行中实时输出块显示的尾部行数。
+/// 工具执行中实时输出块显示的尾部行数。
 ///
 /// 定这个值是终端高度的直觉：够看清一段命令在干什么，又不至于把屏幕刷满。
 /// 完整正文始终保留在工具结果里，跑完后自动收起，需要回看再按 Ctrl+O。
 const LIVE_TAIL_LINES: usize = 15;
 
-/// 取正文尾部最多 [`LIVE_TAIL_LINES`] 行，并返回被截掉的行数。
+/// 流式 thinking 正文视口的**物理行**数（状态行另计，合计恒定 4）。
+///
+/// 比工具输出更紧：思考是旁白，对齐 Claude Code「默认少占面积、Ctrl+O 看全文」
+/// 的观感。高度从第一帧就占满（不足空行垫），超出只在视口内取尾，避免贴底
+/// 跟随时整屏抖动。定稿后折叠成一行头 + 一行尾部摘要，展开仍走 Ctrl+O。
+const THINKING_LIVE_TAIL_LINES: usize = 3;
+
+/// markdown 前先取的源码行上限。视口只有 3 物理行，但折行 / 列表会把一行源码
+/// 撑成多行；多取一点再截物理尾，既不扫全文，又尽量让视口里都是「最新念头」。
+const THINKING_LIVE_SOURCE_LINES: usize = THINKING_LIVE_TAIL_LINES * 8;
+
+/// 取正文尾部最多 `max_lines` 行，并返回被截掉的行数。
 ///
 /// 工具实时输出与流式 thinking 共用这一个取尾逻辑（两者都只关心「最新的一段
-/// 正在发生什么」）。用 `rsplit` 是因为它是反向惰性迭代器：取 N 行只解码 N 行，
-/// 正文再长也不必全文折行——thinking 缓冲能长到几十 KB，每帧全量重排正是当初
-/// 「整屏换行比机器慢」的成因。
-fn live_tail(body: &str) -> (Vec<&str>, usize) {
+/// 正在发生什么」），行数上限各自传入。用 `rsplit` 是因为它是反向惰性迭代器：
+/// 取 N 行只解码 N 行，正文再长也不必全文折行——thinking 缓冲能长到几十 KB，
+/// 每帧全量重排正是当初「整屏换行比机器慢」的成因。
+fn live_tail(body: &str, max_lines: usize) -> (Vec<&str>, usize) {
     let total = body.bytes().filter(|b| *b == b'\n').count() + 1;
-    let skipped = total.saturating_sub(LIVE_TAIL_LINES);
+    let skipped = total.saturating_sub(max_lines);
     let mut lines: Vec<&str> = body
         .rsplit('\n')
-        .take(LIVE_TAIL_LINES)
+        .take(max_lines)
         .map(str::trim_end)
         .collect();
     lines.reverse();
@@ -1231,7 +1242,7 @@ fn render_live_tool_output(lines: &mut Vec<Line<'static>>, tail: &str, ctx: &Cha
     if body.is_empty() {
         return;
     }
-    let (tail_lines, skipped) = live_tail(body);
+    let (tail_lines, skipped) = live_tail(body, LIVE_TAIL_LINES);
 
     let frame = SPINNER_FRAMES[ctx.spinner_frame % SPINNER_FRAMES.len()];
     let mut first = true;
@@ -1302,7 +1313,7 @@ fn render_full_command(
 /// thinking 块的渲染方式。流式（`AppState.thinking_buf`）与定稿
 /// （`ChatMessage::Thinking`）两条数据路径共用同一个渲染入口。
 struct ThinkingRenderOpts<'a> {
-    /// 仍在流式累积：只画一行状态，**完全不碰 `content`**。
+    /// 仍在流式累积：固定高度视口（1 状态 + [`THINKING_LIVE_TAIL_LINES`] 正文）。
     live: bool,
     /// 定稿后是否展开正文。
     expanded: bool,
@@ -1365,9 +1376,47 @@ fn thinking_fold_summary(content: &str, max_cols: usize) -> Option<String> {
     })
 }
 
+/// 流式 thinking 的固定高度正文视口：恒为 [`THINKING_LIVE_TAIL_LINES`] 物理行。
+///
+/// 先按源码窗 [`THINKING_LIVE_SOURCE_LINES`] 取尾并 markdown（含围栏配平），
+/// 再截成物理行尾部；不足空行垫满。空行计入预算——丢掉它们会导致视口高度
+/// 随段落间距抖动，正是要消灭的那种跳动。
+fn render_live_thinking_viewport(content: &str, max_content_width: usize) -> Vec<Line<'static>> {
+    let width = max_content_width.saturating_sub(4).max(1);
+    let body = content.trim_end();
+    let mut rendered: Vec<Line<'static>> = vec![];
+    if !body.is_empty() {
+        let (tail_lines, skipped) = live_tail(body, THINKING_LIVE_SOURCE_LINES);
+        let mut tail_text = tail_lines.join("\n");
+        // 取尾可能把围栏的**开启行**切掉，只剩闭合行。markdown 会把它当成
+        // 新的开启行，把后面所有正常思考都吃进代码块。补一个开启行把它配平。
+        if fence_open_before(body, skipped) {
+            tail_text.insert_str(0, "```\n");
+        }
+        render_streaming_thinking_markdown(&mut rendered, &tail_text, width);
+        for line in &mut rendered {
+            if line.spans.is_empty() {
+                // 空行保留：占视口名额，避免段间距被吃掉后高度跳变。
+                continue;
+            }
+            let mut spans = vec![Span::raw("    ")];
+            spans.append(&mut line.spans);
+            *line = Line::from(spans);
+        }
+        if rendered.len() > THINKING_LIVE_TAIL_LINES {
+            rendered.drain(0..rendered.len() - THINKING_LIVE_TAIL_LINES);
+        }
+    }
+    while rendered.len() < THINKING_LIVE_TAIL_LINES {
+        rendered.push(Line::from(""));
+    }
+    rendered
+}
+
 /// thinking 块的两个态（`ThinkingRenderOpts.live`）：
 ///
-/// - **流式中**：一行状态 + 尾部 [`LIVE_TAIL_LINES`] 行思考正文，跑完即收起。
+/// - **流式中**：一行状态 + 固定 [`THINKING_LIVE_TAIL_LINES`] **物理行**正文视口
+///   （合计恒 4 行；不足垫空、超出取尾；不显示 omitted）。跑完即收起。
 /// - **定稿后**：折叠成一行元信息（耗时 + 行数 + 展开提示），下面再留
 ///   最后一句有效思考当摘要。Ctrl+O 展开全文。
 ///
@@ -1375,7 +1424,7 @@ fn thinking_fold_summary(content: &str, max_cols: usize) -> Option<String> {
 /// 旧实现固定显示前 3 行，结论永远看不到；后来改成定稿后一字不留，又让
 /// 「思考完了接下来要做什么」完全取决于模型会不会接着写正文。一行尾部摘要
 /// 两边都不重踩：历史仍然不铺开，收起后至少能看到当时想到哪了。
-/// 流式分支仍然只 `rsplit` 取尾，不扫全文。
+/// 流式分支先 `rsplit` 取源码窗再 markdown，最后按物理行截视口，不扫全文。
 fn render_thinking_block(
     lines: &mut Vec<Line<'static>>,
     content: &str,
@@ -1390,43 +1439,10 @@ fn render_thinking_block(
             wyj_i18n::tr_fmt("thinking.running", &[("frame", frame.as_str())]),
             Theme::info(),
         )));
-        // 流式期间把尾部思考显出来，让「正在想什么」可见；定稿后立刻收起。
-        // 取尾逻辑与工具实时输出块共用 `live_tail`。
-        let body = content.trim_end();
-        if body.is_empty() {
-            return;
-        }
-        let (tail_lines, skipped) = live_tail(body);
-        let width = max_content_width.saturating_sub(4).max(1);
-        // 尾部同样是 markdown：流式期间模型已经在写列表 / 围栏了，逐行原样
-        // 输出会让这几行在半秒内先"乱"一遍再变整齐，比不格式化更刺眼。
-        // 输入是尾部 30 行，解析成本与整段思考长度无关。
-        let mut tail_text = tail_lines.join("\n");
-        // 取尾可能把围栏的**开启行**切掉，只剩闭合行。markdown 会把它当成
-        // 新的开启行，把后面所有正常思考都吃进代码块。补一个开启行把它配平。
-        if fence_open_before(body, skipped) {
-            tail_text.insert_str(0, "```\n");
-        }
-        let mut rendered: Vec<Line<'static>> = vec![];
-        render_streaming_thinking_markdown(&mut rendered, &tail_text, width);
-        for line in &mut rendered {
-            if line.spans.is_empty() {
-                continue;
-            }
-            let mut spans = vec![Span::raw("    ")];
-            spans.append(&mut line.spans);
-            *line = Line::from(spans);
-        }
-        lines.append(&mut rendered);
-        if skipped > 0 {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "    {}",
-                    wyj_i18n::tr_fmt("thinking.live_omitted", &[("count", &skipped.to_string())])
-                ),
-                Theme::dim(),
-            )));
-        }
+        // 固定高度正文视口：从第一帧就占满 THINKING_LIVE_TAIL_LINES 物理行，
+        // 聊天区总高度不再随 delta / 折行 / 围栏开合抖动。
+        let mut viewport = render_live_thinking_viewport(content, max_content_width);
+        lines.append(&mut viewport);
         return;
     }
 
@@ -6393,11 +6409,12 @@ fn foo() {}
 
     #[test]
     fn live_thinking_tail_closes_a_fence_cut_by_the_tail_window() {
-        // 取尾可能只留下围栏的闭合行。markdown 会把它当成新的开启行，把
-        // 后面所有正常思考吞进代码块——补一个开启行配平。
+        // 源码窗可能只留下围栏的闭合行。markdown 会把它当成新的开启行，把
+        // 后面所有正常思考吞进代码块——补一个开启行配平。代码行数必须超过
+        // THINKING_LIVE_SOURCE_LINES，否则开启行还在窗内，测不到配平。
         let body = format!(
             "```\n{}\n```\n这行必须是普通思考，不能被吞进代码块",
-            (1..=LIVE_TAIL_LINES)
+            (1..=THINKING_LIVE_SOURCE_LINES)
                 .map(|i| format!("code-{i}"))
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -6416,9 +6433,9 @@ fn foo() {}
             },
         );
         let text = rendered_text(lines);
-        // 末行是「上面还有 N 行」提示；正文最后一行的普通思考必须是独立一行。
-        let body: Vec<&String> = text.iter().filter(|l| !l.contains("more lines")).collect();
-        let last = body.last().unwrap();
+        assert_eq!(text.len(), THINKING_LIVE_TAIL_LINES + 1, "{text:?}");
+        // 正文视口最后一行的普通思考必须是独立一行（不带代码块左边线）。
+        let last = text.last().unwrap();
         assert!(
             last.contains("普通思考"),
             "围栏配平失败，尾部被当成代码块：{text:?}"
@@ -6441,9 +6458,8 @@ fn foo() {}
 
     #[test]
     fn live_thinking_block_shows_tail_only_and_stays_cheap() {
-        // 流式期间要把思考显出来，但**只取尾部 LIVE_TAIL_LINES 行**。
-        // 这条钉的是性能不变式而非视觉：thinking_buf 能长到几十 KB，若每帧把
-        // 全文折行一遍再截断，就回到了「整屏换行比机器慢」的老问题。
+        // 流式期间要把思考显出来，但高度恒定：1 状态 + THINKING_LIVE_TAIL_LINES
+        // 物理行。这条同时钉性能（不扫全文）与视觉（无 omitted、高度不跳）。
         let body = (1..=5_000)
             .map(|i| format!("line-{i}"))
             .collect::<Vec<_>>()
@@ -6463,33 +6479,33 @@ fn foo() {}
         );
 
         let text = rendered_text(lines);
-        // 状态行 + 尾窗行 + 1 行截断提示
-        assert_eq!(text.len(), LIVE_TAIL_LINES + 2, "{}", text.len());
+        // 状态行 + 固定正文视口；不再有 omitted 行
+        assert_eq!(text.len(), THINKING_LIVE_TAIL_LINES + 1, "{}", text.len());
+        assert!(
+            text.iter()
+                .all(|l| !l.contains("more lines") && !l.contains("还有")),
+            "live 不得显示 omitted：{text:?}"
+        );
         // 首行是状态行（文案走 i18n，这里只断言它不含正文）
         assert!(!text[0].contains("line-"), "{}", text[0]);
-        // 尾部是最新内容，不是开头
-        let last = &text[LIVE_TAIL_LINES];
+        // 尾部是最新内容，不是开头（短行 1:1 折行时物理尾 = 源码尾）
+        let last = text.last().unwrap();
         assert!(last.contains("line-5000"), "{}", last);
-        // 尾窗第一行与被折叠行数都由 LIVE_TAIL_LINES 推出：改尾窗不必手改这两处
-        let first_tail = 5_000 - LIVE_TAIL_LINES + 1;
+        let first_tail = 5_000 - THINKING_LIVE_TAIL_LINES + 1;
         assert!(
             text[1].contains(&format!("line-{first_tail}")),
             "{}",
             text[1]
         );
-        assert!(!text[1].contains("line-1 "), "不应渲染开头内容");
-        assert!(
-            text[text.len() - 1].contains(&(5_000 - LIVE_TAIL_LINES).to_string()),
-            "截断提示应给出被折叠的行数：{}",
-            text[text.len() - 1]
-        );
+        assert!(!text[1].contains("line-1"), "不应渲染开头内容");
     }
 
     #[test]
-    fn live_thinking_block_tolerates_empty_buffer() {
-        let mut lines = vec![];
+    fn live_thinking_block_pads_empty_and_short_buffers_to_fixed_height() {
+        // 选项 A：从第一帧就占满固定高度，短内容用空行垫，避免贴底跟随抖动。
+        let mut empty = vec![];
         render_thinking_block(
-            &mut lines,
+            &mut empty,
             "",
             80,
             ThinkingRenderOpts {
@@ -6500,7 +6516,28 @@ fn foo() {}
                 cache: None,
             },
         );
-        assert_eq!(rendered_text(lines).len(), 1, "空缓冲只出状态行");
+        assert_eq!(
+            rendered_text(empty).len(),
+            THINKING_LIVE_TAIL_LINES + 1,
+            "空缓冲也要垫满视口"
+        );
+
+        let mut short = vec![];
+        render_thinking_block(
+            &mut short,
+            "只有一行",
+            80,
+            ThinkingRenderOpts {
+                live: true,
+                expanded: false,
+                elapsed_secs: None,
+                spinner_frame: 0,
+                cache: None,
+            },
+        );
+        let text = rendered_text(short);
+        assert_eq!(text.len(), THINKING_LIVE_TAIL_LINES + 1, "{text:?}");
+        assert!(text.iter().any(|l| l.contains("只有一行")), "{text:?}");
     }
 
     #[test]
