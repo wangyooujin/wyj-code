@@ -348,8 +348,8 @@ help:
     - `Ctrl+C` — 中断当前任务（二次按下退出程序）
     - `Esc` — 中断当前任务
     - `Shift+Tab` — 循环切换模式 Normal → Plan → Bypass
-    - `Ctrl+T` — 聚焦任务列表；已聚焦时折叠/展开任务列表
-    - `Ctrl+O` — 展开/收起回合活动摘要、thinking 与工具结果正文（默认 compact：成功探索/命令收成一行；文件修改始终露出；执行中的步骤保持展开）
+    - `Ctrl+T` — 聚焦任务列表；已聚焦某任务时展开/收起该任务下的步骤摘要
+    - `Ctrl+O` — 已聚焦某任务时展开/收起该任务步骤下的执行内容（bash/read/write 等）；未聚焦任务时展开/收起回合活动摘要、thinking 与工具结果正文
     - `Ctrl+L` — 清屏（保留对话历史）
     - `Ctrl+A` / `Ctrl+E` — 跳到行首 / 行尾
     - `Ctrl+K` — 删除光标到行尾
@@ -525,8 +525,8 @@ hooks:
   command_line: "({timeout}s) `{command}`"
 
 todo:
-  focus_hint: "↑↓ 选择   Enter/Space 展开任务下步骤   Esc 返回输入框"
-  detail_hint: "↑↓ 滚动步骤   PageUp/PageDown 翻页   Enter/Space 或 Esc 收起步骤"
+  focus_hint: "↑↓ 选择   Enter/Space 展开步骤与执行   Esc 返回输入框"
+  detail_hint: "↑↓ 滚动   Enter/Space 收起执行并返回   Esc 返回列表"
 
 agents:
   desc: "打开 Agent 类型目录（内置 + 自定义定义文件）"

@@ -1,12 +1,13 @@
-//! 消息流内嵌 tasklist：轻量标题 + 每任务下 compact 执行摘要。
+//! 消息流内嵌 tasklist：任务 → 步骤摘要 → 执行内容。
+//!
+//! - `Ctrl+T`（聚焦任务后）展开/收起该任务下的步骤摘要
+//! - `Ctrl+O`（聚焦任务后）展开/收起步骤下的具体执行（bash/read/write 等）
 
 use super::*;
 use std::collections::HashSet;
 
-/// 进行中任务下默认露出的执行步骤行数（跟尾滚动）。
+/// 进行中任务步骤未展开时，默认露出的跟尾行数。
 pub(super) const TODO_LIVE_VIEWPORT: usize = 4;
-/// 已完成任务下默认露出的末尾步骤数；超出用 +N 提示。
-pub(super) const TODO_COMPLETED_PREVIEW: usize = 4;
 
 /// 收集已归因到任一 todo 的消息 id（主聊天归并用）。
 pub(super) fn attributed_todo_message_ids(
@@ -37,6 +38,43 @@ pub(super) fn should_skip_attributed_tool_message(
     ids.contains(&msg.id)
 }
 
+/// 有 tasklist 时，面板插在本轮「工作消息」之后、「最终助手正文」之前。
+///
+/// 根因：旧实现把 todos 挂在 `messages` + `streaming_buf` **之后**，最终回复
+/// 永远画在列表上方，跟随时列表又贴在输入框附近——看起来像停靠底部。
+/// 正确顺序是：本轮工具/思考 → 任务列表 → 最终输出 / 流式正文。
+pub(super) fn todo_panel_split_index(
+    messages: &[ChatMessage],
+    attributed: Option<&HashSet<u64>>,
+) -> usize {
+    let last_user = messages
+        .iter()
+        .rposition(|m| matches!(m.role, MessageRole::User));
+    let turn_start = last_user.unwrap_or(0);
+
+    let mut last_work: Option<usize> = None;
+    for (i, m) in messages.iter().enumerate().skip(turn_start) {
+        let attributed_hit = attributed.is_some_and(|ids| ids.contains(&m.id));
+        let is_work = attributed_hit
+            || matches!(
+                m.role,
+                MessageRole::Thinking
+                    | MessageRole::ToolCall
+                    | MessageRole::ToolResult
+                    | MessageRole::TurnSummary
+            );
+        if is_work {
+            last_work = Some(i);
+        }
+    }
+
+    match last_work {
+        Some(i) => i + 1,
+        // 本轮还没有工具/思考：跟在最近一条用户消息后，流式最终回复仍能落在面板下。
+        None => last_user.map(|i| i + 1).unwrap_or(messages.len()),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum StepKind {
     Done,
@@ -47,9 +85,37 @@ enum StepKind {
 struct CompactStep {
     kind: StepKind,
     text: String,
+    /// 成对的 ToolCall；Note 为 None。
+    call: Option<ChatMessage>,
+    /// 对应 ToolResult（若已结束）。
+    result: Option<ChatMessage>,
 }
 
-/// 把 todo 执行日志压成 compact 步骤（工具一对一行；Note 一行）。
+/// 从 `Read(path)` / `Bash(cmd)` 标题里抽出括号内参数，作步骤摘要的宾语。
+fn tool_arg_from_title(content: &str) -> &str {
+    if let Some(start) = content.find('(') {
+        if let Some(end) = content.rfind(')') {
+            if end > start + 1 {
+                return content[start + 1..end].trim();
+            }
+        }
+    }
+    content.trim()
+}
+
+/// 步骤层文案：动词短语 + 短参数（「读取 · app.rs」），不是裸工具注册名。
+fn step_semantic_text(msg: &ChatMessage) -> String {
+    let name = msg.tool_name.as_deref().unwrap_or("Tool");
+    let activity = tool_activity_label(name);
+    let arg = tool_arg_from_title(&msg.content);
+    if arg.is_empty() {
+        activity
+    } else {
+        truncate_line(&format!("{activity} · {arg}"), 72)
+    }
+}
+
+/// 把 todo 执行日志压成步骤（工具一对一行；Note 一行）。
 fn collect_compact_steps(
     log: &[TodoExecutionEntry],
     messages: &[ChatMessage],
@@ -65,6 +131,8 @@ fn collect_compact_steps(
                     steps.push(CompactStep {
                         kind: StepKind::Note,
                         text: trimmed.to_string(),
+                        call: None,
+                        result: None,
                     });
                 }
                 i += 1;
@@ -81,18 +149,25 @@ fn collect_compact_steps(
                                 && m.sequence_no.is_some()
                                 && m.sequence_no == msg.sequence_no
                         });
-                        let label = truncate_line(&msg.content, 72);
+                        // 失败 Bash：单独成步无阅读价值（模型常自愈重试），跳过。
                         if let Some(res) = result {
-                            let mut text = label;
+                            if is_failed_command_pair(msg, res) {
+                                i += 1;
+                                continue;
+                            }
+                        }
+                        let mut text = step_semantic_text(msg);
+                        if let Some(res) = result {
                             if res.is_error {
                                 text.push_str(" ✗");
                             }
                             steps.push(CompactStep {
                                 kind: StepKind::Done,
                                 text,
+                                call: Some(msg.clone()),
+                                result: Some(res.clone()),
                             });
                         } else {
-                            let mut text = label;
                             if let Some(seq) = msg.sequence_no {
                                 if let Some(tail) = live_tool_out.get(&seq) {
                                     let last = tail
@@ -102,16 +177,15 @@ fn collect_compact_steps(
                                         .unwrap_or("")
                                         .trim();
                                     if !last.is_empty() {
-                                        text = truncate_line(
-                                            &format!("{text} · {last}"),
-                                            72,
-                                        );
+                                        text = truncate_line(&format!("{text} · {last}"), 72);
                                     }
                                 }
                             }
                             steps.push(CompactStep {
                                 kind: StepKind::Live,
                                 text,
+                                call: Some(msg.clone()),
+                                result: None,
                             });
                         }
                         i += 1;
@@ -121,23 +195,25 @@ fn collect_compact_steps(
                         let has_call = msg.sequence_no.is_some_and(|seq| {
                             log.iter().any(|e| {
                                 matches!(e, TodoExecutionEntry::Message(mid)
-                                    if messages.iter().any(|m| {
-                                        m.id == *mid
-                                            && matches!(m.role, MessageRole::ToolCall)
-                                            && m.sequence_no == Some(seq)
-                                    }))
+                                if messages.iter().any(|m| {
+                                    m.id == *mid
+                                        && matches!(m.role, MessageRole::ToolCall)
+                                        && m.sequence_no == Some(seq)
+                                }))
                             })
                         });
                         if !has_call {
                             let name = msg.tool_name.as_deref().unwrap_or("Tool");
                             let summary = if msg.display_summary.is_empty() {
-                                name.to_string()
+                                tool_activity_label(name)
                             } else {
-                                format!("{name} · {}", msg.display_summary)
+                                format!("{} · {}", tool_activity_label(name), msg.display_summary)
                             };
                             steps.push(CompactStep {
                                 kind: StepKind::Done,
                                 text: truncate_line(&summary, 72),
+                                call: None,
+                                result: Some(msg.clone()),
                             });
                         }
                         i += 1;
@@ -161,7 +237,7 @@ fn push_step_line(
 ) {
     let (glyph, style) = match step.kind {
         StepKind::Done => (
-            "✓ ".to_string(),
+            "· ".to_string(),
             Style::default()
                 .fg(Theme::muted_color())
                 .add_modifier(Modifier::DIM),
@@ -185,11 +261,153 @@ fn push_step_line(
     ]));
 }
 
-/// 在任务名下画出 compact 执行摘要；对需要滚动的视口返回 (scroll, max_scroll)。
+/// 在步骤下画出执行层：工具标题 + 完整命令 + 结果/实时输出。
+fn push_step_execution(
+    lines: &mut Vec<Line<'static>>,
+    step: &CompactStep,
+    live_tool_out: &HashMap<usize, String>,
+    max_content_width: usize,
+    spinner_frame: usize,
+) {
+    let indent = "      ";
+    let width = max_content_width.saturating_sub(indent.len()).max(8);
+
+    if let Some(call) = &step.call {
+        let title = truncate_line(&call.content, width.saturating_sub(4));
+        let mut spans = vec![
+            Span::raw(indent.to_string()),
+            Span::styled("⏺ ".to_string(), Theme::tool_call()),
+            Span::styled(title.clone(), Theme::tool_call()),
+        ];
+        if let Some(res) = &step.result {
+            if let Some(secs) = res.elapsed_secs.filter(|&s| s > 0.0) {
+                spans.push(Span::styled(
+                    format!(" · {}", format_elapsed(secs)),
+                    Theme::dim(),
+                ));
+            }
+            if res.is_error {
+                spans.push(Span::styled(" · failed", Theme::error()));
+            }
+        }
+        lines.push(Line::from(spans));
+
+        // 完整命令（标题被截断时）
+        if let Some(cmd) = call.full_command.as_deref() {
+            if !title.contains(cmd) {
+                for raw in cmd.lines() {
+                    for part in wrap_line(raw, width) {
+                        lines.push(Line::from(Span::styled(
+                            format!("{indent}  {part}"),
+                            Theme::dim(),
+                        )));
+                    }
+                }
+            }
+        }
+
+        if let Some(res) = &step.result {
+            push_exec_result_body(lines, res, indent, width);
+        } else if let Some(seq) = call.sequence_no {
+            if let Some(tail) = live_tool_out.get(&seq) {
+                let frame = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
+                lines.push(Line::from(Span::styled(
+                    format!("{indent}{frame} …"),
+                    Theme::info(),
+                )));
+                let take = LIVE_TAIL_LINES.min(8);
+                let body_lines: Vec<&str> = tail.lines().rev().take(take).collect();
+                for raw in body_lines.into_iter().rev() {
+                    for part in wrap_line(raw, width.saturating_sub(2)) {
+                        lines.push(Line::from(Span::styled(
+                            format!("{indent}  {part}"),
+                            Theme::tool_result(),
+                        )));
+                    }
+                }
+            }
+        }
+    } else if let Some(res) = &step.result {
+        let name = res.tool_name.as_deref().unwrap_or("Tool");
+        lines.push(Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(format!("⏺ {name}"), Theme::tool_call()),
+        ]));
+        push_exec_result_body(lines, res, indent, width);
+    }
+}
+
+fn push_exec_result_body(
+    lines: &mut Vec<Line<'static>>,
+    result: &ChatMessage,
+    indent: &str,
+    width: usize,
+) {
+    let summary = if result.display_summary.is_empty() {
+        if result.is_error {
+            "failed".to_string()
+        } else {
+            "done".to_string()
+        }
+    } else {
+        truncate_line(&result.display_summary, width.saturating_sub(4))
+    };
+    lines.push(Line::from(vec![
+        Span::raw(indent.to_string()),
+        Span::styled("⎿ ".to_string(), Theme::dim()),
+        Span::styled(
+            summary,
+            if result.is_error {
+                Theme::error()
+            } else {
+                Theme::dim()
+            },
+        ),
+    ]));
+
+    // 执行层展开 = 要看具体输出。Edit/Write 出 diff 预览；其余出正文尾部。
+    let content = result.content.as_str();
+    if content.is_empty() {
+        return;
+    }
+    let max_lines = if is_diff_result(result) {
+        COLLAPSED_DIFF_MAX_LINES
+    } else {
+        40
+    };
+    let all: Vec<&str> = content.lines().collect();
+    let omitted = all.len().saturating_sub(max_lines);
+    let shown = if omitted > 0 {
+        &all[all.len() - max_lines..]
+    } else {
+        &all[..]
+    };
+    if omitted > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("{indent}  … +{omitted}"),
+            Theme::dim(),
+        )));
+    }
+    let body_style = if result.is_error {
+        Theme::error()
+    } else {
+        Theme::tool_result()
+    };
+    for raw in shown {
+        for part in wrap_line(raw, width.saturating_sub(2)) {
+            lines.push(Line::from(Span::styled(
+                format!("{indent}  {part}"),
+                body_style,
+            )));
+        }
+    }
+}
+
+/// 在任务名下画出步骤 / 执行两层；对需要滚动的视口返回 (scroll, max_scroll)。
 ///
-/// - `Completed`：默认末尾 `TODO_COMPLETED_PREVIEW` 行；`detail_open` 时全量。
-/// - `InProgress`：默认 `TODO_LIVE_VIEWPORT` 跟尾；选中且 `detail_open` 时全量可滚。
-/// - `Pending`：无摘要。
+/// - `steps_open`：画出步骤摘要行
+/// - `exec_open`：在每步下画出具体执行内容
+/// - 步骤未开且进行中：跟尾预览若干步；完成态默认不预览（需 Ctrl+T）
 #[allow(clippy::too_many_arguments)]
 pub(super) fn push_todo_execution_summary(
     lines: &mut Vec<Line<'static>>,
@@ -199,7 +417,8 @@ pub(super) fn push_todo_execution_summary(
     live_tool_out: &HashMap<usize, String>,
     spinner_frame: usize,
     selected: bool,
-    detail_open: bool,
+    steps_open: bool,
+    exec_open: bool,
     detail_scroll: u16,
     max_content_width: usize,
 ) -> (u16, u16) {
@@ -217,49 +436,42 @@ pub(super) fn push_todo_execution_summary(
         return (detail_scroll, 0);
     }
 
-    let full = detail_open && selected;
-    let viewport = if full {
-        steps.len().max(1)
-    } else if matches!(item.status, TodoStatus::InProgress) {
-        TODO_LIVE_VIEWPORT
-    } else {
-        TODO_COMPLETED_PREVIEW
-    };
-
-    let mut body: Vec<Line<'static>> = Vec::new();
-    let step_width = max_content_width.saturating_sub(2).max(8);
-
-    if !full && matches!(item.status, TodoStatus::Completed) && steps.len() > viewport {
-        let omitted = steps.len() - viewport;
-        body.push(Line::from(Span::styled(
-            format!("    · +{omitted}"),
-            Theme::dim(),
-        )));
-        for step in steps.iter().skip(omitted) {
-            push_step_line(&mut body, step, spinner_frame, step_width);
-        }
-        for line in body {
-            lines.push(line);
+    // 步骤未展开：进行中跟尾预览；完成态不画步骤（用户 Ctrl+T 再看）。
+    if !steps_open {
+        if matches!(item.status, TodoStatus::InProgress) {
+            let viewport = TODO_LIVE_VIEWPORT.min(steps.len());
+            let skip = steps.len().saturating_sub(viewport);
+            let step_width = max_content_width.saturating_sub(2).max(8);
+            if skip > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("    · +{skip}"),
+                    Theme::dim(),
+                )));
+            }
+            for step in steps.iter().skip(skip) {
+                push_step_line(lines, step, spinner_frame, step_width);
+            }
         }
         return (0, 0);
     }
 
+    let step_width = max_content_width.saturating_sub(2).max(8);
+    let mut body: Vec<Line<'static>> = Vec::new();
     for step in &steps {
         push_step_line(&mut body, step, spinner_frame, step_width);
+        if exec_open {
+            push_step_execution(
+                &mut body,
+                step,
+                live_tool_out,
+                max_content_width,
+                spinner_frame,
+            );
+        }
     }
 
-    let max_scroll = body.len().saturating_sub(viewport.min(body.len()));
-    let scroll = if full && selected {
-        (detail_scroll as usize).min(max_scroll)
-    } else {
-        // 进行中默认贴尾；完成态预览已在上面处理。
-        max_scroll
-    };
-    for line in body.into_iter().skip(scroll).take(viewport) {
-        lines.push(line);
-    }
-    (
-        scroll as u16,
-        max_scroll.min(u16::MAX as usize) as u16,
-    )
+    // 步骤/执行展开后整段画进聊天流，由 chat_scroll 负责；此处不再做内部视口裁剪。
+    let _ = (selected, detail_scroll);
+    lines.extend(body);
+    (0, 0)
 }

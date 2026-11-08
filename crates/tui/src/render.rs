@@ -15,30 +15,27 @@ mod todo_inline;
 use dialogs::*;
 use todo_inline::{
     attributed_todo_message_ids, push_todo_execution_summary, should_skip_attributed_tool_message,
+    todo_panel_split_index,
 };
 
 use crate::activity_density::{
     collect_turn_activity_stats, format_turn_activity_summary, is_compact_foldable_pair,
-    is_successful_explore_pair,
+    is_failed_command_pair, is_successful_explore_pair,
 };
 use crate::app::{
     fmt_tokens, format_elapsed, format_hms, ActionMenu, AgentsDialog, AppState, AskQuestionDialog,
-    AskQuestionStage, Attachment, ChatMessage, EffortPickerDialog,
-    EnterPlanDialog, EvolutionDialog, EvolutionRow, ExecModeConfirmDialog, ExtensionsDialog,
-    FlatRow, InProgressAnswer, InputOwner, McpConnStatus, McpDialog, McpDialogTab, McpOverlay,
-    MemoryDialog, MemoryRow, MessageRole, ModelPickerDialog, PermissionDialog, PlanApprovalDialog,
-    PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog, ProfileFieldKind,
-    ProfileInputField, ProfileOverlay, ProfileRow, SessionConflictDialog, SessionPickerState,
-    SettingsDialog, SettingsFieldKind, SettingsInputField, SettingsOverlay, SkillsBrowseSource,
-    SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState,
-    TodoExecutionEntry, TodoRuntimeStats, UiFocus, PROFILE_FIELD_SPECS, SETTINGS_FIELD_COUNT,
-    SETTINGS_FIELD_SPECS,
+    AskQuestionStage, Attachment, ChatMessage, EffortPickerDialog, EnterPlanDialog,
+    EvolutionDialog, EvolutionRow, ExecModeConfirmDialog, ExtensionsDialog, FlatRow,
+    InProgressAnswer, InputOwner, McpConnStatus, McpDialog, McpDialogTab, McpOverlay, MemoryDialog,
+    MemoryRow, MessageRole, ModelPickerDialog, PermissionDialog, PlanApprovalDialog, PluginOverlay,
+    PluginsDialog, PluginsDialogTab, ProfileDialog, ProfileFieldKind, ProfileInputField,
+    ProfileOverlay, ProfileRow, SessionConflictDialog, SessionPickerState, SettingsDialog,
+    SettingsFieldKind, SettingsInputField, SettingsOverlay, SkillsBrowseSource, SkillsDialog,
+    SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, TodoExecutionEntry,
+    TodoRuntimeStats, UiFocus, PROFILE_FIELD_SPECS, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_SPECS,
 };
 use crate::input::{is_atomic_marker, InputBox, ATTACHMENT_MARKER, PASTE_MARKER};
-use crate::markdown::{
-    display_width, render_markdown, render_streaming_markdown, render_streaming_thinking_markdown,
-    render_thinking_markdown,
-};
+use crate::markdown::{display_width, render_markdown};
 use crate::theme::Theme;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
@@ -729,12 +726,20 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
 
     // 底部面板高度：只保留真正需要固定拦截输入的控制面板。
     // TaskList / AskQuestion 作为实时信息流附加到聊天区尾部，避免互相遮挡。
+    // 流式 thinking 钉在输入框上方的固定码头（不进聊天流）。
     let (panel_height, panel_kind) = bottom_panel_size(state, area.height);
+    let thinking_dock_height = if state.thinking_buf.is_empty() {
+        0u16
+    } else {
+        // 1 状态行 + THINKING_LIVE_TAIL_LINES 正文，与 live thinking 块同高。
+        (1 + THINKING_LIVE_TAIL_LINES as u16).min(area.height)
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
+            Constraint::Length(thinking_dock_height),
             Constraint::Length(panel_height),
             Constraint::Length(completion_height),
             Constraint::Length(input_height),
@@ -756,21 +761,28 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     } else {
         draw_chat(f, state, chunks[0]);
     }
+    if thinking_dock_height > 0 {
+        draw_thinking_dock(f, state, chunks[1]);
+    }
+    let panel_chunk = chunks[2];
+    let completion_chunk = chunks[3];
+    let input_chunk = chunks[4];
+    let status_chunk = chunks[5];
     match panel_kind {
         BottomPanel::None => {}
         BottomPanel::Permission => {
             if let Some(dlg) = &state.permission_dialog {
-                draw_permission_dialog(f, dlg, chunks[1]);
+                draw_permission_dialog(f, dlg, panel_chunk);
             }
         }
         BottomPanel::SessionConflict => {
             if let Some(dlg) = &state.session_conflict {
-                draw_session_conflict_panel(f, dlg, chunks[1]);
+                draw_session_conflict_panel(f, dlg, panel_chunk);
             }
         }
         BottomPanel::ProjectTrust => {
             if let Some(servers) = &state.pending_mcp_trust {
-                draw_project_trust_panel(f, servers, state.pending_mcp_trust_selected, chunks[1]);
+                draw_project_trust_panel(f, servers, state.pending_mcp_trust_selected, panel_chunk);
             }
         }
         BottomPanel::SkillTrust => {
@@ -780,39 +792,39 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
                     infos,
                     &state.pending_skill_trust_changes,
                     state.pending_skill_trust_selected,
-                    chunks[1],
+                    panel_chunk,
                 );
             }
         }
         BottomPanel::ExecModeConfirm => {
             if let Some(dlg) = &state.exec_mode_confirm {
-                draw_exec_mode_confirm_panel(f, dlg, chunks[1]);
+                draw_exec_mode_confirm_panel(f, dlg, panel_chunk);
             }
         }
         BottomPanel::PlanApproval => {
             if let Some(dlg) = &state.plan_dialog {
-                draw_plan_approval_panel(f, dlg, chunks[1]);
+                draw_plan_approval_panel(f, dlg, panel_chunk);
             }
         }
         BottomPanel::EnterPlan => {
             if let Some(dlg) = &state.enter_plan_dialog {
-                draw_enter_plan_dialog(f, dlg, chunks[1]);
+                draw_enter_plan_dialog(f, dlg, panel_chunk);
             }
         }
         BottomPanel::SubAgents => {
-            draw_sub_agents_panel(f, state, chunks[1]);
+            draw_sub_agents_panel(f, state, panel_chunk);
         }
         BottomPanel::ShellProcesses => {
-            draw_shell_panel(f, state, chunks[1]);
+            draw_shell_panel(f, state, panel_chunk);
         }
     }
     if !state.file_completions.is_empty() {
-        draw_file_completions(f, state, chunks[2]);
+        draw_file_completions(f, state, completion_chunk);
     } else if !state.slash_completions.is_empty() {
-        draw_slash_completions(f, state, chunks[2]);
+        draw_slash_completions(f, state, completion_chunk);
     }
-    draw_input(f, state, &display_input, chunks[3], paste_hint_position);
-    draw_status(f, state, chunks[4]);
+    draw_input(f, state, &display_input, input_chunk, paste_hint_position);
+    draw_status(f, state, status_chunk);
 
     // 会话选择器叠加在最顶层
     if let Some(picker) = &state.session_picker {
@@ -1175,7 +1187,7 @@ struct ChatRenderCtx<'a> {
 ///
 /// 定这个值是终端高度的直觉：够看清一段命令在干什么，又不至于把屏幕刷满。
 /// 完整正文始终保留在工具结果里，跑完后自动收起，需要回看再按 Ctrl+O。
-const LIVE_TAIL_LINES: usize = 15;
+pub(super) const LIVE_TAIL_LINES: usize = 15;
 
 /// 流式 thinking 正文视口的**物理行**数（状态行另计，合计恒定 4）。
 ///
@@ -1212,6 +1224,7 @@ fn live_tail(body: &str, max_lines: usize) -> (Vec<&str>, usize) {
 /// 同源：按行数围栏开合，最后仍处于开启状态即视为未闭合。命中时流式尾部要补
 /// 一个开启行——否则尾部里的那个闭合围栏会被 markdown 当成新的开启围栏，
 /// 把它后面的所有正常思考都吞进代码块。
+#[allow(dead_code)] // 纯文本 thinking 不再需要围栏配平；保留供回归对照。
 fn fence_open_before(body: &str, skipped: usize) -> bool {
     if skipped == 0 {
         return false;
@@ -1386,25 +1399,18 @@ fn thinking_fold_summary(content: &str, max_cols: usize) -> Option<String> {
 
 /// 流式 thinking 的固定高度正文视口：恒为 [`THINKING_LIVE_TAIL_LINES`] 物理行。
 ///
-/// 先按源码窗 [`THINKING_LIVE_SOURCE_LINES`] 取尾并 markdown（含围栏配平），
-/// 再截成物理行尾部；不足空行垫满。空行计入预算——丢掉它们会导致视口高度
-/// 随段落间距抖动，正是要消灭的那种跳动。
+/// 先按源码窗 [`THINKING_LIVE_SOURCE_LINES`] 取尾，再纯文本折行截成物理行尾部；
+/// 不足空行垫满。不做 markdown——`#` / `**` / 围栏原样显示。
 fn render_live_thinking_viewport(content: &str, max_content_width: usize) -> Vec<Line<'static>> {
     let width = max_content_width.saturating_sub(4).max(1);
     let body = content.trim_end();
     let mut rendered: Vec<Line<'static>> = vec![];
     if !body.is_empty() {
-        let (tail_lines, skipped) = live_tail(body, THINKING_LIVE_SOURCE_LINES);
-        let mut tail_text = tail_lines.join("\n");
-        // 取尾可能把围栏的**开启行**切掉，只剩闭合行。markdown 会把它当成
-        // 新的开启行，把后面所有正常思考都吃进代码块。补一个开启行把它配平。
-        if fence_open_before(body, skipped) {
-            tail_text.insert_str(0, "```\n");
-        }
-        render_streaming_thinking_markdown(&mut rendered, &tail_text, width);
+        let (tail_lines, _skipped) = live_tail(body, THINKING_LIVE_SOURCE_LINES);
+        let tail_text = tail_lines.join("\n");
+        push_plain_text_lines(&mut rendered, &tail_text, width, Theme::dim());
         for line in &mut rendered {
             if line.spans.is_empty() {
-                // 空行保留：占视口名额，避免段间距被吃掉后高度跳变。
                 continue;
             }
             let mut spans = vec![Span::raw("    ")];
@@ -1419,6 +1425,57 @@ fn render_live_thinking_viewport(content: &str, max_content_width: usize) -> Vec
         rendered.push(Line::from(""));
     }
     rendered
+}
+
+/// 纯文本折行写入 `lines`（不做 markdown 结构转换）。
+fn push_plain_text_lines(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    max_width: usize,
+    style: Style,
+) {
+    let width = max_width.max(1);
+    for raw in content.lines() {
+        if raw.is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        let wrapped = crate::markdown::wrap_plain_text_spans(&[(raw.to_string(), style)], width);
+        for row in wrapped {
+            lines.push(Line::from(
+                row.into_iter()
+                    .map(|(text, st)| Span::styled(text, st))
+                    .collect::<Vec<_>>(),
+            ));
+        }
+    }
+}
+
+/// 输入框上方的流式 thinking 码头：固定高度，不进聊天流。
+fn draw_thinking_dock(f: &mut Frame, state: &AppState, area: Rect) {
+    if area.height == 0 || state.thinking_buf.is_empty() {
+        return;
+    }
+    let max_w = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = vec![];
+    render_thinking_block(
+        &mut lines,
+        &state.thinking_buf,
+        max_w.max(8),
+        ThinkingRenderOpts {
+            live: true,
+            expanded: false,
+            elapsed_secs: state.thinking_started.map(|t| t.elapsed().as_secs_f64()),
+            spinner_frame: state.spinner_frame,
+            cache: None,
+        },
+    );
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Theme::border());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// thinking 块的两个态（`ThinkingRenderOpts.live`）：
@@ -1488,10 +1545,7 @@ fn render_thinking_block(
         return;
     }
     // 展开即全文：用户主动行为，不再截断；超出视口由既有的 chat_scroll 滚动。
-    //
-    // 正文走 markdown 而不是逐行纯文本：真实 thinking 里约 15% 的行带 `- ` /
-    // `1.` / `|` / `**` / 围栏，原样打出来就是一屏"乱码"。行数统计仍用
-    // `clean_lines`（去空行的原始行数），那是元信息，与这里的渲染无关。
+    // 纯文本折行，不做 markdown——`#` / `**` / 围栏原样显示。
     let width = max_content_width.saturating_sub(4).max(1);
     let mut rendered = match opts.cache {
         Some(cache) => {
@@ -1500,7 +1554,7 @@ fn render_thinking_block(
                 Some((w, cached)) if *w == width => cached.clone(),
                 _ => {
                     let mut fresh: Vec<Line<'static>> = vec![];
-                    render_thinking_markdown(&mut fresh, content, width);
+                    push_plain_text_lines(&mut fresh, content, width, Theme::dim());
                     *cache = Some((width, fresh));
                     cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
                 }
@@ -1508,13 +1562,11 @@ fn render_thinking_block(
         }
         None => {
             let mut fresh: Vec<Line<'static>> = vec![];
-            render_thinking_markdown(&mut fresh, content, width);
+            push_plain_text_lines(&mut fresh, content, width, Theme::dim());
             fresh
         }
     };
-    // 统一缩进 4 格：thinking 是挂在 `⎿` 行下方的旁白，顶格会让它与正文
-    // 平起平坐；而 markdown 自己已经处理了块内层级（bullet / 引用 / 代码），
-    // 这里只加一层外层缩进，不参与块内排版。
+    // 统一缩进 4 格：thinking 是挂在旁白层，顶格会与正文平起平坐。
     for line in &mut rendered {
         if line.spans.is_empty() {
             continue;
@@ -1565,10 +1617,7 @@ fn render_chat_message(
             }
             for l in content_lines {
                 for wrapped in wrap_line(l, max_content_width.saturating_sub(2).max(1)) {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {wrapped}"),
-                        user_cont,
-                    )));
+                    lines.push(Line::from(Span::styled(format!("  {wrapped}"), user_cont)));
                 }
             }
         }
@@ -1588,14 +1637,18 @@ fn render_chat_message(
                     }
                 }
             } else {
-                // 已定稿消息的 markdown 渲染结果按宽度缓存：避免每帧对
-                // 全部历史重跑 markdown 解析（长对话下的主要渲染开销）
+                // 已定稿助手正文：纯文本折行（不做 markdown），按宽度缓存。
                 let mut cache = msg.render_cache.borrow_mut();
                 let mut rendered = match cache.as_ref() {
                     Some((w, cached)) if *w == max_content_width => cached.clone(),
                     _ => {
                         let mut fresh: Vec<Line<'static>> = vec![];
-                        render_markdown(&mut fresh, &msg.content, max_content_width);
+                        push_plain_text_lines(
+                            &mut fresh,
+                            &msg.content,
+                            max_content_width,
+                            Theme::body(),
+                        );
                         *cache = Some((max_content_width, fresh));
                         cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
                     }
@@ -2018,7 +2071,7 @@ fn render_tool_result_block(
 }
 
 /// 是否是 Edit/Write 的**成功**回执（失败时正文是错误文本，不是 diff）。
-fn is_diff_result(msg: &ChatMessage) -> bool {
+pub(super) fn is_diff_result(msg: &ChatMessage) -> bool {
     !msg.is_error
         && msg
             .tool_name
@@ -2031,7 +2084,7 @@ fn is_diff_result(msg: &ChatMessage) -> bool {
 ///
 /// 取 20 是权衡：够看完一次局部编辑的全部改动行，又不至于让新建大文件时
 /// 200 行 diff 糊满屏幕（Write 新建文件时整份内容都是 `+` 行，最容易触发）。
-const COLLAPSED_DIFF_MAX_LINES: usize = 20;
+pub(super) const COLLAPSED_DIFF_MAX_LINES: usize = 20;
 
 /// 一行 diff 在渲染前的解析结果。
 struct DiffRow<'a> {
@@ -2288,10 +2341,18 @@ pub(crate) fn build_pending_chat_lines(
     } else {
         None
     };
+    // 有 tasklist：插在本轮工作消息之后、最终助手正文之前，避免列表贴流尾。
+    let split = if state.current_todos.is_some() {
+        todo_panel_split_index(&state.messages, attributed_ids.as_ref())
+            .clamp(start, state.messages.len())
+    } else {
+        state.messages.len()
+    };
+
     lines.extend(render_message_range(
         MessageRangeRenderArgs {
             messages: &state.messages,
-            range: start..state.messages.len(),
+            range: start..split,
             max_content_width,
             sub_agents: &state.sub_agents,
             spinner_frame: state.spinner_frame,
@@ -2304,29 +2365,6 @@ pub(crate) fn build_pending_chat_lines(
         &mut is_first_user,
     ));
 
-    if !state.thinking_buf.is_empty() {
-        render_thinking_block(
-            &mut lines,
-            &state.thinking_buf,
-            max_content_width,
-            ThinkingRenderOpts {
-                live: true,
-                expanded: state.output_expanded,
-                elapsed_secs: state.thinking_started.map(|t| t.elapsed().as_secs_f64()),
-                spinner_frame: state.spinner_frame,
-                cache: None,
-            },
-        );
-    }
-
-    // 流式文本（实时输出中）
-    if !state.streaming_buf.is_empty() {
-        // 流式路径走 streaming 变体：未定稿的内容按中间态渲染（未闭合围栏不画框、
-        // 未成形表格不合并），闭合那一刻才不会整块重排。定稿消息走 `render_markdown`
-        // 并按宽度缓存，两者互不影响。
-        render_streaming_markdown(&mut lines, &state.streaming_buf, max_content_width);
-    }
-
     if let Some(items) = state.current_todos.clone() {
         let (next_scroll, next_max_scroll) = push_inline_todo_lines(
             &mut lines,
@@ -2338,7 +2376,8 @@ pub(crate) fn build_pending_chat_lines(
             state.todo_panel_expanded,
             matches!(state.ui_focus, UiFocus::Todos | UiFocus::TodoDetail),
             state.selected_todo_id.as_deref(),
-            state.todo_detail_open,
+            &state.todo_steps_expanded,
+            &state.todo_exec_expanded,
             state.todo_detail_scroll,
             &state.todo_stats,
             max_content_width,
@@ -2347,6 +2386,33 @@ pub(crate) fn build_pending_chat_lines(
         state.todo_detail_max_scroll = next_max_scroll;
     } else {
         state.todo_detail_max_scroll = 0;
+    }
+
+    lines.extend(render_message_range(
+        MessageRangeRenderArgs {
+            messages: &state.messages,
+            range: split..state.messages.len(),
+            max_content_width,
+            sub_agents: &state.sub_agents,
+            spinner_frame: state.spinner_frame,
+            output_expanded: state.output_expanded,
+            live_tool_out: &live_tool_out,
+            activity_density: state.activity_density,
+            activity_groups_expanded: state.activity_groups_expanded,
+            skip_attributed_tools: attributed_ids.as_ref(),
+        },
+        &mut is_first_user,
+    ));
+
+    // 流式 thinking 钉在输入框上方码头（`draw_thinking_dock`），不进聊天流。
+    // 流式最终正文画在任务列表之后。
+    if !state.streaming_buf.is_empty() {
+        push_plain_text_lines(
+            &mut lines,
+            &state.streaming_buf,
+            max_content_width,
+            Theme::body(),
+        );
     }
 
     if let Some(dlg) = &state.ask_question_dialog {
@@ -2367,7 +2433,8 @@ fn push_inline_todo_lines(
     expanded: bool,
     focused: bool,
     selected_todo_id: Option<&str>,
-    detail_open: bool,
+    steps_expanded: &HashSet<String>,
+    exec_expanded: &HashSet<String>,
     detail_scroll: u16,
     todo_stats: &HashMap<String, TodoRuntimeStats>,
     max_content_width: usize,
@@ -2520,6 +2587,8 @@ fn push_inline_todo_lines(
         lines.push(Line::from(spans));
 
         let log = todo_logs.get(&item.id).map(Vec::as_slice).unwrap_or(&[]);
+        let steps_open = steps_expanded.contains(&item.id);
+        let exec_open = exec_expanded.contains(&item.id);
         let (scroll, max_scroll) = push_todo_execution_summary(
             lines,
             item,
@@ -2528,33 +2597,28 @@ fn push_inline_todo_lines(
             live_tool_out,
             spinner_frame,
             is_selected,
-            detail_open,
+            steps_open,
+            exec_open,
             detail_scroll,
             max_content_width,
         );
-        // 只有当前选中任务的视口回写滚动状态（Enter 全量展开时）。
-        if is_selected && (detail_open || matches!(item.status, TodoStatus::InProgress)) {
+        // 选中且步骤/执行展开时回写滚动；进行中跟尾也要。
+        if is_selected && (steps_open || exec_open || matches!(item.status, TodoStatus::InProgress))
+        {
             next_scroll = scroll;
             next_max_scroll = max_scroll;
         }
     }
 
-    if focused && !detail_open {
+    if focused {
         lines.push(Line::from(Span::styled(
             format!("  {}", wyj_i18n::tr("todo.focus_hint")),
-            Theme::dim(),
-        )));
-    }
-    if focused && detail_open {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", wyj_i18n::tr("todo.detail_hint")),
             Theme::dim(),
         )));
     }
 
     (next_scroll, next_max_scroll)
 }
-
 
 fn push_prefixed_lines(
     lines: &mut Vec<Line<'static>>,
@@ -2827,6 +2891,11 @@ fn render_compact_turn(
                     i += 2;
                     continue;
                 }
+                if is_failed_command_pair(msg, next) {
+                    // 失败 Bash：单独成行无阅读价值，折叠态跳过。
+                    i += 2;
+                    continue;
+                }
                 push_render_gap(lines);
                 render_tool_result_block(lines, Some(msg), next, ctx);
                 trim_trailing_blank_lines(lines);
@@ -2861,8 +2930,7 @@ fn render_balanced_range(
             continue;
         }
         if matches!(msg.role, MessageRole::ToolCall) && !explore_expanded {
-            if let Some(group_end) =
-                peek_explore_group_end(messages, i, end, skip_attributed_tools)
+            if let Some(group_end) = peek_explore_group_end(messages, i, end, skip_attributed_tools)
             {
                 let count = (group_end - i) / 2;
                 if count >= 2 {
@@ -2887,6 +2955,11 @@ fn render_balanced_range(
                     && next.sequence_no == msg.sequence_no
                 {
                     if should_skip_attributed_tool_message(next, skip_attributed_tools) {
+                        i += 2;
+                        continue;
+                    }
+                    // 无成功活动、退回 Balanced 时，折叠态同样不单独露失败 Bash。
+                    if !explore_expanded && is_failed_command_pair(msg, next) {
                         i += 2;
                         continue;
                     }
@@ -3771,7 +3844,7 @@ fn thinking_status_label(state: &AppState) -> String {
 /// 这个 CLI 有哪些工具才读得懂。动词短语两头都避开。
 ///
 /// 未收录的工具回落工具名本身：新增工具不该因为漏配一条 i18n 就显示成空白。
-fn tool_activity_label(name: &str) -> String {
+pub(super) fn tool_activity_label(name: &str) -> String {
     let key = match name.to_ascii_lowercase().as_str() {
         "bash" => "tool_activity.bash",
         "read" => "tool_activity.read",
@@ -4945,14 +5018,13 @@ mod tool_result_fold_tests {
             "折叠态探索应收进摘要：{collapsed_joined}"
         );
         assert!(
-            expanded_joined.contains("Read(auth.rs)")
-                && expanded_joined.contains("Grep(token)"),
+            expanded_joined.contains("Read(auth.rs)") && expanded_joined.contains("Grep(token)"),
             "Ctrl+O 应展开 Compact 回合细节：{expanded_joined}"
         );
     }
 
     #[test]
-    fn compact_keeps_in_flight_and_failed_tools_visible() {
+    fn compact_hides_failed_bash_but_keeps_in_flight_visible() {
         let mut messages = vec![message(MessageRole::User, "run")];
         messages.extend(explore_pair(1, "Read", "a.rs"));
         let mut failed = explore_pair(2, "Bash", "boom");
@@ -4980,15 +5052,28 @@ mod tool_result_fold_tests {
             "成功 Read 应进摘要：{joined}"
         );
         assert!(
-            joined.contains("Bash(boom)") || joined.contains("failed"),
-            "失败 Bash 必须露出：{joined}"
+            !joined.contains("Bash(boom)") && !joined.contains("· failed"),
+            "失败 Bash 不应单独成行：{joined}"
         );
         assert!(
             joined.contains("Bash(sleep 10)"),
             "进行中 Bash 必须露出：{joined}"
         );
-    }
 
+        let expanded = render_messages_with_density(
+            &messages,
+            100,
+            true,
+            &HashMap::new(),
+            ActivityDensity::Compact,
+            false,
+        );
+        let expanded_joined = expanded.join("\n");
+        assert!(
+            expanded_joined.contains("Bash(boom)"),
+            "Ctrl+O 展开后失败 Bash 仍应可见：{expanded_joined}"
+        );
+    }
 
     fn sub_agent(status: SubAgentStatus) -> SubAgentUiState {
         SubAgentUiState {
@@ -5445,9 +5530,65 @@ mod tool_result_fold_tests {
     }
 
     #[test]
+    fn final_assistant_renders_below_todo_panel_not_above() {
+        // 回归：todos 曾挂在 messages 之后 → 最终回复在列表上方、列表贴流尾。
+        let mut state = make_state();
+        state.todo_panel_expanded = true;
+        state.todo_steps_expanded.insert("a".to_string());
+        state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
+            id: "a".to_string(),
+            content: "implement auth".to_string(),
+            status: wyj_tools::todo::TodoStatus::InProgress,
+            active_form: None,
+        }]);
+
+        let mut user = message(MessageRole::User, "do auth");
+        user.id = 1;
+        let mut call = message(MessageRole::ToolCall, "Read(src/auth.rs)");
+        call.id = 2;
+        call.sequence_no = Some(1);
+        call.tool_name = Some("Read".to_string());
+        let mut result = message(MessageRole::ToolResult, "ok");
+        result.id = 3;
+        result.sequence_no = Some(1);
+        result.tool_name = Some("Read".to_string());
+        let mut assistant = message(MessageRole::Assistant, "FINAL_ANSWER_BELOW_TODOS");
+        assistant.id = 4;
+        state.messages.extend([user, call, result, assistant]);
+        state
+            .todo_execution_logs
+            .insert("a".to_string(), vec![TodoExecutionEntry::Message(2)]);
+
+        let rendered: Vec<String> = build_pending_chat_lines(&mut state, 100)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        let todo_at = rendered
+            .iter()
+            .position(|l| l.contains(&wyj_i18n::tr("spinner.todo_title")))
+            .expect("todo panel");
+        let answer_at = rendered
+            .iter()
+            .position(|l| l.contains("FINAL_ANSWER_BELOW_TODOS"))
+            .expect("final answer");
+        assert!(
+            answer_at > todo_at,
+            "最终输出必须在任务列表下方：todo@{todo_at} answer@{answer_at}\n{rendered:?}"
+        );
+    }
+
+    #[test]
     fn attributed_tools_render_under_todo_not_in_main_chat() {
         let mut state = make_state();
         state.todo_panel_expanded = true;
+        state.todo_steps_expanded.insert("a".to_string());
+        state.todo_exec_expanded.insert("a".to_string());
         state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
             id: "a".to_string(),
             content: "implement auth".to_string(),
@@ -5490,8 +5631,12 @@ mod tool_result_fold_tests {
             "已归因工具不应出现在主聊天：{before:?}"
         );
         assert!(
+            after.iter().any(|l| l.contains("src/auth.rs")),
+            "已归因工具应出现在任务下步骤/执行层：{after:?}"
+        );
+        assert!(
             after.iter().any(|l| l.contains("Read(src/auth.rs)")),
-            "已归因工具应出现在任务下摘要：{after:?}"
+            "执行层展开后应看到具体调用：{after:?}"
         );
     }
 
@@ -5499,6 +5644,7 @@ mod tool_result_fold_tests {
     fn rendering_short_todo_detail_writes_back_zero_max_scroll() {
         let mut state = make_state();
         state.todo_panel_expanded = true;
+        state.todo_steps_expanded.insert("a".to_string());
         state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
             id: "a".to_string(),
             content: "short task".to_string(),
@@ -5506,8 +5652,7 @@ mod tool_result_fold_tests {
             active_form: None,
         }]);
         state.selected_todo_id = Some("a".to_string());
-        state.ui_focus = UiFocus::TodoDetail;
-        state.todo_detail_open = true;
+        state.ui_focus = UiFocus::Todos;
         state.todo_detail_scroll = 0;
         // 未渲染前先塞一个陈旧的非零值，验证渲染层确实会重新计算并回写。
         state.todo_detail_max_scroll = 99;
@@ -5536,8 +5681,8 @@ mod tool_result_fold_tests {
         assert!(
             rendered
                 .iter()
-                .any(|line| line.contains(&wyj_i18n::tr("todo.detail_hint"))),
-            "展开步骤时应有滚动提示：{rendered:?}"
+                .any(|line| line.contains(&wyj_i18n::tr("todo.focus_hint"))),
+            "聚焦任务时应有快捷键提示：{rendered:?}"
         );
     }
 
@@ -6625,7 +6770,7 @@ mod tool_result_fold_tests {
         let messages = vec![message(MessageRole::Assistant, "first response"), second];
         let rendered = render_messages(&messages, 100);
 
-        assert_eq!(rendered, vec!["  first response", "", "  second response"]);
+        assert_eq!(rendered, vec!["first response", "", "second response"]);
     }
 
     #[test]
@@ -6646,7 +6791,7 @@ mod tool_result_fold_tests {
         assert_eq!(rendered.len(), 3, "{rendered:?}");
         assert!(rendered[0].contains("Read("));
         assert!(rendered[1].trim().is_empty());
-        assert_eq!(rendered[2], "  after tool");
+        assert_eq!(rendered[2], "after tool");
 
         // 展开态：完整块 + 分隔符
         let expanded = render_messages_with_output_expanded(&messages, 100, true);
@@ -6655,7 +6800,7 @@ mod tool_result_fold_tests {
         assert_eq!(expanded[1], "    ⎿ first");
         assert_eq!(expanded[2], "       second");
         assert!(expanded[3].trim().is_empty());
-        assert_eq!(expanded[4], "  after tool");
+        assert_eq!(expanded[4], "after tool");
     }
 
     #[test]
@@ -6728,11 +6873,10 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn thinking_expanded_renders_markdown_structure_instead_of_literal_markers() {
-        // 真实 thinking 里约 15% 的行带 `- ` / `1.` / `|` / 围栏。原实现逐行
-        // 纯文本输出，这些标记原样打在屏幕上，整块看起来像乱码。
+    fn thinking_expanded_keeps_literal_markers_as_plain_text() {
+        // 助手/思考改为纯文本：markdown 标记原样保留，不做结构转换。
         let body = "\
-关键点：
+要点：
 1. 第一点
 2. 第二点
 
@@ -6751,19 +6895,13 @@ fn foo() {}
         let rendered = render_messages_with_output_expanded(&[thinking], 70, true);
         let all = rendered.join("\n");
 
-        // 有序列表：`1. ` 变成渲染出的序号，而不是原样保留
         assert!(all.contains("1. 第一点"), "{all}");
-        // 无序列表：`- ` 变成 bullet
-        assert!(all.contains("• "), "{all}");
-        assert!(!all.contains("- **"), "列表标记应被解析：{all}");
-        // 围栏：thinking 里退化成 `│` 引用式，不画带行号的方框
-        assert!(all.contains("│ fn foo() {}"), "{all}");
-        assert!(!all.contains("╭─"), "thinking 的围栏不该画方框：{all}");
-        // 表格：走网格而不是原样 `| a | b |`
-        assert!(!all.contains("|------|"), "表格分隔行应被消费：{all}");
-        assert!(all.contains("┌") || all.contains("│ 列一"), "{all}");
-        // 粗体标记不落地
-        assert!(!all.contains("**"), "粗体标记应被消费：{all}");
+        assert!(all.contains("- **粗体条目**"), "{all}");
+        assert!(all.contains("```rust"), "{all}");
+        assert!(all.contains("fn foo() {}"), "{all}");
+        assert!(all.contains("|------|"), "{all}");
+        assert!(!all.contains("• "), "不应再转成 bullet：{all}");
+        assert!(!all.contains("╭─"), "不应画代码框：{all}");
     }
 
     #[test]
@@ -6810,8 +6948,8 @@ fn foo() {}
     }
 
     #[test]
-    fn live_thinking_tail_is_formatted_too() {
-        // 流式期间模型已经在写列表，逐行原样输出会让这几行先"乱"一遍再变整齐。
+    fn live_thinking_tail_is_plain_text() {
+        // 流式 thinking 纯文本：列表标记原样保留，固定高度取尾。
         let mut lines = vec![];
         render_thinking_block(
             &mut lines,
@@ -6827,7 +6965,7 @@ fn foo() {}
         );
         let text = rendered_text(lines).join("\n");
         assert!(text.contains("1. 第一步"), "{text}");
-        assert!(!text.contains("1. 第一步\n2."), "不应原样堆叠：{text}");
+        assert!(text.contains("2. 第二步"), "{text}");
     }
 
     #[test]
@@ -7069,7 +7207,7 @@ fn foo() {}
                 live_tool_out: &HashMap::new(),
                 activity_density: ActivityDensity::Detailed,
                 activity_groups_expanded: false,
-            skip_attributed_tools: None,
+                skip_attributed_tools: None,
             },
             &mut is_first_user,
         );
@@ -7362,7 +7500,7 @@ fn foo() {}
                 live_tool_out: &HashMap::new(),
                 activity_density: ActivityDensity::Detailed,
                 activity_groups_expanded: false,
-            skip_attributed_tools: None,
+                skip_attributed_tools: None,
             },
             &mut is_first_user,
         );

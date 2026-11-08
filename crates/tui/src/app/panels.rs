@@ -64,6 +64,8 @@ impl AppState {
         if is_new_round {
             self.todo_stats.clear();
             self.todo_execution_logs.clear();
+            self.todo_steps_expanded.clear();
+            self.todo_exec_expanded.clear();
         }
 
         let old_status: HashMap<&str, &TodoStatus> = if is_new_round {
@@ -86,6 +88,8 @@ impl AppState {
                     .entry(item.id.clone())
                     .or_default()
                     .started_at = Some(Instant::now());
+                // 进行中任务默认展开步骤摘要；执行内容仍折叠。
+                self.todo_steps_expanded.insert(item.id.clone());
             } else if !is_in_progress && was_in_progress {
                 if let Some(s) = self.todo_stats.get_mut(&item.id) {
                     if let Some(start) = s.started_at.take() {
@@ -166,6 +170,8 @@ impl AppState {
         self.current_todos = None;
         self.focused_todo_id = None;
         self.todo_panel_expanded = false;
+        self.todo_steps_expanded.clear();
+        self.todo_exec_expanded.clear();
         self.selected_todo_id = None;
         self.todo_detail_open = false;
         self.todo_detail_scroll = 0;
@@ -320,15 +326,17 @@ impl AppState {
 
     pub(super) fn enter_todo_detail(&mut self) -> bool {
         self.ensure_selected_todo();
-        if self.selected_todo_id.is_none() {
+        let Some(id) = self.selected_todo_id.clone() else {
             return false;
-        }
+        };
+        // Enter/Space 必须真正打开步骤与执行层：旧路径只翻 `todo_detail_open`，
+        // 渲染已改看 `todo_steps_expanded` / `todo_exec_expanded`，按键等于空操作。
+        self.todo_steps_expanded.insert(id.clone());
+        self.todo_exec_expanded.insert(id);
         self.todo_detail_open = true;
         self.todo_detail_scroll = 0;
         self.todo_detail_max_scroll = 0;
         self.ui_focus = UiFocus::TodoDetail;
-        // Todo 详情追加在聊天流尾部；进入时主动贴底，确保新增的详情 viewport
-        // 立即出现在屏幕内。内部 scroll=0 仍表示从详情开头开始阅读。
         self.chat_follow_tail = true;
         self.unseen_messages = false;
         true
@@ -458,9 +466,11 @@ impl AppState {
 
     /// Ctrl+T — 展开/折叠任务列表面板，并把内容焦点交给它。
     ///
-    /// 任务全部完成也照常展开：完成态只是**默认**折叠成一行摘要（见
-    /// `render::push_inline_todo_lines` 的 `all_done && collapsed` 早退），而不是
-    /// 不可读。执行中默认展开；已聚焦 Todos 时再次 Ctrl+T 才翻转折叠。
+    /// Ctrl+T：未聚焦时展开整表并聚焦选中任务；已聚焦 Todos/TodoDetail 时
+    /// 只切换**选中任务**的步骤摘要层（`todo_steps_expanded`）。
+    ///
+    /// 全部完成时整表默认收成一行摘要；第一次 Ctrl+T 仍可展开整表复盘。
+    /// 已聚焦后再次 Ctrl+T **不再**翻转折叠整表。
     pub(super) fn toggle_todo_panel(&mut self) {
         let Some(items) = self.current_todos.as_deref() else {
             return;
@@ -468,11 +478,20 @@ impl AppState {
         if items.is_empty() {
             return;
         }
-        if self.ui_focus == UiFocus::Todos {
-            self.todo_panel_expanded = !self.todo_panel_expanded;
-        } else {
-            self.todo_panel_expanded = true;
+        let focused_on_todo = matches!(self.ui_focus, UiFocus::Todos | UiFocus::TodoDetail);
+        if focused_on_todo {
+            if let Some(id) = self.selected_todo_id.clone() {
+                if self.todo_steps_expanded.contains(&id) {
+                    self.todo_steps_expanded.remove(&id);
+                    // 收起步骤时一并收起执行层，避免「步骤没了执行还露着」。
+                    self.todo_exec_expanded.remove(&id);
+                } else {
+                    self.todo_steps_expanded.insert(id);
+                }
+            }
+            return;
         }
+        self.todo_panel_expanded = true;
         self.ensure_selected_todo();
         if self.selected_todo_id.is_some() {
             self.selected_sub_agent = None;
@@ -485,12 +504,41 @@ impl AppState {
         }
     }
 
+    /// Ctrl+O（任务聚焦时）：只切换选中任务的执行内容层。
+    /// 返回 true 表示已处理；false 表示当前未聚焦任务，调用方应走全局
+    /// `output_expanded`。
+    pub(super) fn toggle_todo_exec_for_selected(&mut self) -> bool {
+        if !matches!(self.ui_focus, UiFocus::Todos | UiFocus::TodoDetail) {
+            return false;
+        }
+        let Some(id) = self.selected_todo_id.clone() else {
+            return false;
+        };
+        if !self.todo_exec_expanded.remove(&id) {
+            self.todo_exec_expanded.insert(id.clone());
+            // 展开执行内容时保证步骤层也开着，否则看不到挂载点。
+            self.todo_steps_expanded.insert(id);
+        }
+        true
+    }
+
     pub(super) fn toggle_focused_content_detail(&mut self) {
         match self.ui_focus {
             UiFocus::Todos => {
+                // 展开选中任务的步骤 + 执行内容，进入详情焦点以便滚动查看。
                 let _ = self.enter_todo_detail();
             }
             UiFocus::TodoDetail => {
+                // 再次 Enter/Space：若执行层已开则收起执行层并退回任务列表；
+                // 若只有步骤，则补开执行层（一步看清 bash/read/write 正文）。
+                if let Some(id) = self.selected_todo_id.clone() {
+                    if self.todo_steps_expanded.contains(&id)
+                        && !self.todo_exec_expanded.contains(&id)
+                    {
+                        self.todo_exec_expanded.insert(id);
+                        return;
+                    }
+                }
                 let _ = self.leave_todo_detail();
             }
             UiFocus::SubAgents if self.selected_sub_agent.is_some() => {

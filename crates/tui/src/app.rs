@@ -1571,6 +1571,14 @@ mod navigation_focus_tests {
         state.toggle_focused_content_detail();
         assert_eq!(state.ui_focus, UiFocus::TodoDetail);
         assert!(state.todo_detail_open);
+        assert!(
+            state.todo_steps_expanded.contains("a"),
+            "Enter 必须展开步骤层"
+        );
+        assert!(
+            state.todo_exec_expanded.contains("a"),
+            "Enter 必须展开执行内容，否则看不到 bash/read/write"
+        );
         assert!(state.chat_follow_tail);
 
         state.todo_detail_max_scroll = 20;
@@ -2294,8 +2302,13 @@ pub struct AppState {
     /// in_progress，或最近一次工具活动归因到的 in_progress）。列表顺序上的
     /// 「第一个 InProgress」在模型漏更新时会钉死旧项。
     pub focused_todo_id: Option<String>,
-    /// 任务清单是否展开。执行中默认 true；全部完成时自动 false；Ctrl+T 切换。
+    /// 任务清单是否展开。执行中默认 true；全部完成时自动 false。
+    /// 未聚焦时第一次 Ctrl+T 会展开整表；已聚焦后 Ctrl+T 只切选中任务的步骤。
     pub todo_panel_expanded: bool,
+    /// 哪些任务 id 展开了「步骤摘要」层（Ctrl+T，需先聚焦该任务）。
+    pub todo_steps_expanded: HashSet<String>,
+    /// 哪些任务 id 展开了步骤下的「执行内容」层（Ctrl+O，需先聚焦该任务）。
+    pub todo_exec_expanded: HashSet<String>,
     /// 任务列表当前选中项（按 id 而非 index，避免列表变动时错位）
     pub selected_todo_id: Option<String>,
     /// 选中任务详情是否展开；正常情况下仅在 `UiFocus::TodoDetail` 时为 true。
@@ -2656,6 +2669,8 @@ impl AppState {
             todo_store: None,
             focused_todo_id: None,
             todo_panel_expanded: false,
+            todo_steps_expanded: HashSet::new(),
+            todo_exec_expanded: HashSet::new(),
             selected_todo_id: None,
             todo_detail_open: false,
             todo_detail_scroll: 0,
@@ -2851,6 +2866,8 @@ impl AppState {
         self.current_todos = None;
         self.focused_todo_id = None;
         self.todo_panel_expanded = false;
+        self.todo_steps_expanded.clear();
+        self.todo_exec_expanded.clear();
         self.selected_todo_id = None;
         self.todo_detail_open = false;
         self.todo_detail_scroll = 0;
@@ -6214,6 +6231,8 @@ async fn tui_main(
                                                     state.current_todos = None;
                                                     state.todo_stats.clear();
                                                     state.todo_execution_logs.clear();
+                                                    state.todo_steps_expanded.clear();
+                                                    state.todo_exec_expanded.clear();
                                                     state.todo_panel_expanded = false;
                                                     state.selected_todo_id = None;
                                                     state.todo_detail_open = false;
@@ -9232,11 +9251,13 @@ async fn tui_main(
                             // “已经聚焦”并延续原有第二次按下折叠/展开的语义。
                             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             }
-                            // Ctrl+O 在「全部展开」与「自动模式」间切换（自动模式下正在执行的
-                            // 步骤本就展开）。必须显式占位并 `continue`：否则会落进
-                            // 下面的 `_` 兜底退出内容焦点。
+                            // Ctrl+O：任务聚焦时只切该任务执行层；否则全局
+                            // 「自动 ↔ 全展开」。必须显式占位并 `continue`：
+                            // 否则会落进下面的 `_` 兜底退出内容焦点。
                             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                state.output_expanded = !state.output_expanded;
+                                if !state.toggle_todo_exec_for_selected() {
+                                    state.output_expanded = !state.output_expanded;
+                                }
                                 continue;
                             }
                             _ => {
@@ -10649,6 +10670,8 @@ async fn tui_main(
                                                     state.current_todos = None;
                                                     state.todo_stats.clear();
                                                     state.todo_execution_logs.clear();
+                                                    state.todo_steps_expanded.clear();
+                                                    state.todo_exec_expanded.clear();
                                                     state.todo_panel_expanded = false;
                                                     state.selected_todo_id = None;
                                                     state.todo_detail_open = false;
@@ -11065,10 +11088,10 @@ async fn tui_main(
                                         }
                                     }
                                 }
-                                'o' => {
-                                    // Ctrl+O — 展开/折叠 thinking 与工具结果正文。与内容焦点
-                                    // 态共用同一个 flag，因此在输入框态也必须可用：
-                                    // 折叠头提示的正是这个键，而输入框是默认焦点态。
+                                // Ctrl+O — 任务聚焦时切该任务执行层；否则切
+                                // 全局 thinking / 工具正文。输入框是默认焦点，
+                                // 折叠头提示的正是这个键，所以这里必须可用。
+                                'o' if !state.toggle_todo_exec_for_selected() => {
                                     state.output_expanded = !state.output_expanded;
                                 }
                                 _ => {}
@@ -12808,19 +12831,45 @@ mod todo_stats_tests {
     }
 
     #[test]
-    fn ctrl_t_collapses_the_completed_panel_again() {
+    fn ctrl_t_when_focused_toggles_steps_for_selected_task_only() {
         let mut state = make_state();
-        state.current_todos = Some(vec![todo("a", TodoStatus::Completed)]);
+        state.current_todos = Some(vec![
+            todo("a", TodoStatus::Completed),
+            todo("b", TodoStatus::Completed),
+        ]);
         state.ui_focus = UiFocus::Chat;
 
         state.toggle_todo_panel();
         assert!(state.todo_panel_expanded);
-        state.toggle_todo_panel();
+        assert_eq!(state.ui_focus, UiFocus::Todos);
+        let selected = state.selected_todo_id.clone().expect("应选中一项");
+        let other = if selected == "a" { "b" } else { "a" };
 
-        assert!(
-            !state.todo_panel_expanded,
-            "再次 Ctrl+T 应折回一行完成摘要，保持原有的 toggle 语义"
-        );
+        // 已聚焦：Ctrl+T 只切选中任务的步骤，不收整表。
+        state.toggle_todo_panel();
+        assert!(state.todo_panel_expanded);
+        assert!(state.todo_steps_expanded.contains(&selected));
+        assert!(!state.todo_steps_expanded.contains(other));
+
+        state.toggle_todo_panel();
+        assert!(!state.todo_steps_expanded.contains(&selected));
+        assert!(state.todo_panel_expanded);
+    }
+
+    #[test]
+    fn ctrl_o_when_focused_toggles_exec_for_selected_task_only() {
+        let mut state = make_state();
+        state.current_todos = Some(vec![todo("a", TodoStatus::InProgress)]);
+        state.selected_todo_id = Some("a".to_string());
+        state.ui_focus = UiFocus::Todos;
+        state.todo_steps_expanded.insert("a".to_string());
+
+        assert!(state.toggle_todo_exec_for_selected());
+        assert!(state.todo_exec_expanded.contains("a"));
+        assert!(!state.output_expanded);
+
+        assert!(state.toggle_todo_exec_for_selected());
+        assert!(!state.todo_exec_expanded.contains("a"));
     }
 
     #[test]

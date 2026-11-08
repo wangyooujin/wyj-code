@@ -62,7 +62,7 @@ pub(crate) fn is_successful_explore_pair(call: &ChatMessage, result: &ChatMessag
 /// Compact 可收进回合摘要的成功工具对。
 ///
 /// Edit / Write **永不**进折叠桶——文件改动必须留在输出区逐步可见；
-/// 失败与未配对的进行中调用也不进桶。
+/// 未配对的进行中调用也不进桶。
 pub(crate) fn is_compact_foldable_pair(call: &ChatMessage, result: &ChatMessage) -> bool {
     if !matches!(call.role, MessageRole::ToolCall) {
         return false;
@@ -78,6 +78,27 @@ pub(crate) fn is_compact_foldable_pair(call: &ChatMessage, result: &ChatMessage)
     }
     let name = message_tool_name(call, Some(result)).unwrap_or("");
     !matches!(tool_display_kind(name), ToolDisplayKind::Edit)
+}
+
+/// 已完成且失败的 Bash/KillShell 等命令对。
+///
+/// Compact 折叠态不单独成行：模型常自愈重试，单独刷一条 `· failed` 没有实际
+/// 阅读价值；Ctrl+O 展开后仍走完整工具块。失败的探索类（Grep 等）继续露出。
+pub(crate) fn is_failed_command_pair(call: &ChatMessage, result: &ChatMessage) -> bool {
+    if !matches!(call.role, MessageRole::ToolCall) {
+        return false;
+    }
+    if !matches!(result.role, MessageRole::ToolResult) {
+        return false;
+    }
+    if call.sequence_no.is_none() || call.sequence_no != result.sequence_no {
+        return false;
+    }
+    if !result.is_error {
+        return false;
+    }
+    message_tool_name(call, Some(result))
+        .is_some_and(|name| matches!(tool_display_kind(name), ToolDisplayKind::Command))
 }
 
 /// 一轮（User…下一 User）内成功活动的计数，供 Compact 摘要行。
