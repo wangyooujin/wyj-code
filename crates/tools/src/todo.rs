@@ -35,7 +35,6 @@ pub struct TodoItem {
     pub id: String,
     pub content: String,
     pub status: TodoStatus,
-    pub priority: Option<String>,
     /// 进行时文案（如 "Running tests"），in_progress 时 TUI 优先展示
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_form: Option<String>,
@@ -102,14 +101,7 @@ impl TodoStore {
         }
         self.items
             .iter()
-            .map(|t| {
-                let prio = t
-                    .priority
-                    .as_deref()
-                    .map(|p| format!("[{p}] "))
-                    .unwrap_or_default();
-                format!("{} {}{} ({})", t.status, prio, t.content, t.id)
-            })
+            .map(|t| format!("{} {} ({})", t.status, t.content, t.id))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -141,8 +133,6 @@ struct TodoItemInput {
     id: String,
     content: String,
     status: TodoStatus,
-    #[serde(default)]
-    priority: Option<String>,
     #[serde(default, rename = "activeForm")]
     active_form: Option<String>,
 }
@@ -172,10 +162,6 @@ impl Tool for TodoWriteTool {
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed"]
-                                },
-                                "priority": {
-                                    "type": "string",
-                                    "enum": ["high", "medium", "low"]
                                 },
                                 "activeForm": {
                                     "type": "string",
@@ -209,7 +195,6 @@ impl Tool for TodoWriteTool {
                 id: t.id,
                 content: t.content,
                 status: t.status,
-                priority: t.priority,
                 active_form: t.active_form,
             })
             .collect();
@@ -323,21 +308,20 @@ mod tests {
     }
 
     #[test]
-    fn render_text_includes_priority_and_id() {
+    fn render_text_includes_status_content_and_id() {
         let store = TodoStore {
             items: vec![TodoItem {
                 id: "t1".into(),
                 content: "写文档".into(),
                 status: TodoStatus::Pending,
-                priority: Some("high".into()),
                 active_form: None,
             }],
         };
         let out = store.render_text();
         assert!(out.contains("[ ]"));
-        assert!(out.contains("[high]"));
         assert!(out.contains("写文档"));
         assert!(out.contains("(t1)"));
+        assert!(!out.contains("[high]"));
     }
 
     #[tokio::test]
@@ -446,20 +430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_priority_defaults_to_none() {
-        let store = empty_store();
-        let (tool, _dir) = make_tool(store.clone());
-        tool.run(
-            json!({"todos":[{"id":"a","content":"x","status":"pending"}]}),
-            &make_ctx(),
-        )
-        .await
-        .unwrap();
-        assert!(store.lock().unwrap().items[0].priority.is_none());
-    }
-
-    #[tokio::test]
-    async fn run_preserves_priority_when_provided() {
+    async fn run_ignores_legacy_priority_field() {
         let store = empty_store();
         let (tool, _dir) = make_tool(store.clone());
         tool.run(
@@ -468,10 +439,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            store.lock().unwrap().items[0].priority.as_deref(),
-            Some("low")
-        );
+        assert_eq!(store.lock().unwrap().items[0].content, "x");
     }
 
     fn item(id: &str, status: TodoStatus) -> TodoItem {
@@ -479,7 +447,6 @@ mod tests {
             id: id.into(),
             content: format!("task-{id}"),
             status,
-            priority: None,
             active_form: None,
         }
     }

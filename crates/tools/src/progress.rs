@@ -86,7 +86,6 @@ fn push_item(items: &mut Vec<TodoItem>, text: &str, status: TodoStatus) {
         id,
         content: text.to_string(),
         status,
-        priority: None,
         active_form: None,
     });
 }

@@ -1194,7 +1194,6 @@ mod navigation_focus_tests {
             id: id.to_string(),
             content: format!("todo-{id}"),
             status,
-            priority: None,
             active_form: None,
         }
     }
@@ -1494,14 +1493,12 @@ mod navigation_focus_tests {
                 id: "a".to_string(),
                 content: "first".to_string(),
                 status: wyj_tools::todo::TodoStatus::Pending,
-                priority: None,
                 active_form: None,
             },
             wyj_tools::todo::TodoItem {
                 id: "b".to_string(),
                 content: "second".to_string(),
                 status: wyj_tools::todo::TodoStatus::Pending,
-                priority: None,
                 active_form: None,
             },
         ]);
@@ -12119,7 +12116,6 @@ mod todo_stats_tests {
             id: id.to_string(),
             content: format!("task-{id}"),
             status,
-            priority: None,
             active_form: None,
         }
     }

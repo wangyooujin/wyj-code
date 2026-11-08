@@ -1546,9 +1546,13 @@ fn render_chat_message(
             }
             *is_first_user = false;
 
+            // 用户输入与助手正文拉开：同色系于 ❯ 前缀（suggestion），助手走 markdown body。
+            let user_style = Style::default()
+                .fg(Theme::suggestion_color())
+                .add_modifier(Modifier::BOLD);
+            let user_cont = Style::default().fg(Theme::suggestion_color());
             let mut content_lines = msg.content.lines();
             let first_line = content_lines.next().unwrap_or("");
-            let first_style = Theme::highlight();
             for (idx, wrapped) in wrap_line(first_line, max_content_width.saturating_sub(2).max(1))
                 .into_iter()
                 .enumerate()
@@ -1556,14 +1560,14 @@ fn render_chat_message(
                 let prefix = if idx == 0 { "❯ " } else { "  " };
                 lines.push(Line::from(vec![
                     Span::styled(prefix, Theme::user_prefix()),
-                    Span::styled(wrapped, first_style),
+                    Span::styled(wrapped, if idx == 0 { user_style } else { user_cont }),
                 ]));
             }
             for l in content_lines {
                 for wrapped in wrap_line(l, max_content_width.saturating_sub(2).max(1)) {
                     lines.push(Line::from(Span::styled(
                         format!("  {wrapped}"),
-                        Theme::body(),
+                        user_cont,
                     )));
                 }
             }
@@ -2461,16 +2465,16 @@ fn push_inline_todo_lines(
     let mut next_max_scroll: u16 = 0;
     for (i, item) in items.iter().enumerate() {
         let is_selected = focused && selected_todo_id == Some(item.id.as_str());
-        let selected_style = |st: Style| -> Style {
+        // 选中只留 ▶ + 加粗，不再铺 selected_bg（底色会把条目正文盖糊）。
+        let emphasize = |st: Style| -> Style {
             if is_selected {
-                st.bg(Theme::selected_bg_color())
-                    .add_modifier(Modifier::BOLD)
+                st.add_modifier(Modifier::BOLD)
             } else {
                 st
             }
         };
         let (icon, item_style) = match item.status {
-            TodoStatus::Pending => ("○".to_string(), Theme::muted()),
+            TodoStatus::Pending => ("○".to_string(), Theme::body()),
             TodoStatus::InProgress => {
                 let frame = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
                 (
@@ -2483,35 +2487,24 @@ fn push_inline_todo_lines(
             TodoStatus::Completed => (
                 "✓".to_string(),
                 Style::default()
-                    .fg(Theme::muted_color())
-                    .add_modifier(Modifier::DIM),
+                    .fg(Theme::text_dim_color())
+                    .add_modifier(Modifier::CROSSED_OUT),
             ),
         };
 
-        let prio_str = item
-            .priority
-            .as_deref()
-            .map(|p| format!("[{p}] "))
-            .unwrap_or_default();
         let display_text = if item.status == TodoStatus::InProgress {
             item.active_form.as_deref().unwrap_or(&item.content)
         } else {
             &item.content
         };
-        let content = truncate_line(
-            &format!("{prio_str}{display_text}"),
-            max_item_width.saturating_sub(24),
-        );
+        let content = truncate_line(display_text, max_item_width.saturating_sub(24));
         let marker = if is_selected { "▶ " } else { "  " };
 
         let mut spans = vec![
-            Span::styled(marker, selected_style(Theme::dim())),
-            Span::styled(
-                format!("[{}/{}] ", i + 1, total),
-                selected_style(Theme::dim()),
-            ),
-            Span::styled(format!("{icon} "), selected_style(item_style)),
-            Span::styled(content, selected_style(item_style)),
+            Span::styled(marker, emphasize(Theme::dim())),
+            Span::styled(format!("[{}/{}] ", i + 1, total), emphasize(Theme::dim())),
+            Span::styled(format!("{icon} "), emphasize(item_style)),
+            Span::styled(content, emphasize(item_style)),
         ];
         if let Some(s) = todo_stats.get(&item.id) {
             spans.push(Span::styled(
@@ -2521,7 +2514,7 @@ fn push_inline_todo_lines(
                     fmt_tokens(s.input_tokens),
                     fmt_tokens(s.output_tokens)
                 ),
-                selected_style(Theme::dim()),
+                emphasize(Theme::dim()),
             ));
         }
         lines.push(Line::from(spans));
@@ -2797,10 +2790,10 @@ fn render_compact_turn(
     render_chat_message(lines, &messages[start], start, is_first_user, ctx);
     trim_trailing_blank_lines(lines);
 
-    // 回合活动摘要（含 TurnSummary 耗时，若有）
+    // 回合活动摘要（含 TurnSummary 耗时，若有）。展开细节走 Ctrl+O，
+    // 不再挂「Enter/Ctrl+O 展开」提示——Chat 焦点下 Enter 本就不展开活动。
     push_render_gap(lines);
-    let mut summary = format_turn_activity_summary(&stats);
-    summary.push_str(&wyj_i18n::tr("density.turn_summary_hint"));
+    let summary = format_turn_activity_summary(&stats);
     lines.push(Line::from(vec![
         Span::styled("  ▸ ", Theme::dim()),
         Span::styled(summary, Theme::dim()),
@@ -2874,11 +2867,8 @@ fn render_balanced_range(
                 let count = (group_end - i) / 2;
                 if count >= 2 {
                     push_render_gap(lines);
-                    let mut label =
+                    let label =
                         wyj_i18n::tr_fmt("density.explored", &[("count", &count.to_string())]);
-                    if !ctx.output_expanded {
-                        label.push_str(&wyj_i18n::tr("density.explored_hint"));
-                    }
                     lines.push(Line::from(vec![
                         Span::styled("  ▸ ", Theme::dim()),
                         Span::styled(label, Theme::dim()),
@@ -4917,8 +4907,11 @@ mod tool_result_fold_tests {
             "文件修改必须留在输出区：{joined}"
         );
         assert!(
-            joined.contains("Ctrl+O") || joined.contains("ctrl+o"),
-            "摘要应提示 Ctrl+O 展开：{joined}"
+            !joined.contains("Enter 展开")
+                && !joined.contains("Enter to expand")
+                && !joined.contains("Ctrl+O 展开")
+                && !joined.contains("Ctrl+O to expand"),
+            "摘要不再挂展开提示：{joined}"
         );
     }
 
@@ -5303,14 +5296,12 @@ mod tool_result_fold_tests {
                 id: "a".to_string(),
                 content: "task a".to_string(),
                 status: wyj_tools::todo::TodoStatus::Completed,
-                priority: None,
                 active_form: None,
             },
             wyj_tools::todo::TodoItem {
                 id: "b".to_string(),
                 content: "task b".to_string(),
                 status: wyj_tools::todo::TodoStatus::Completed,
-                priority: None,
                 active_form: None,
             },
         ]);
@@ -5358,14 +5349,12 @@ mod tool_result_fold_tests {
                 id: "a".to_string(),
                 content: "task a".to_string(),
                 status: wyj_tools::todo::TodoStatus::Completed,
-                priority: None,
                 active_form: None,
             },
             wyj_tools::todo::TodoItem {
                 id: "b".to_string(),
                 content: "task b".to_string(),
                 status: wyj_tools::todo::TodoStatus::Completed,
-                priority: None,
                 active_form: None,
             },
         ]);
@@ -5415,14 +5404,12 @@ mod tool_result_fold_tests {
                 id: "a".to_string(),
                 content: "task a".to_string(),
                 status: wyj_tools::todo::TodoStatus::Completed,
-                priority: None,
                 active_form: None,
             },
             wyj_tools::todo::TodoItem {
                 id: "b".to_string(),
                 content: "task b".to_string(),
                 status: wyj_tools::todo::TodoStatus::InProgress,
-                priority: None,
                 active_form: None,
             },
         ]);
@@ -5465,7 +5452,6 @@ mod tool_result_fold_tests {
             id: "a".to_string(),
             content: "implement auth".to_string(),
             status: wyj_tools::todo::TodoStatus::InProgress,
-            priority: None,
             active_form: Some("Implementing auth".to_string()),
         }]);
 
@@ -5517,7 +5503,6 @@ mod tool_result_fold_tests {
             id: "a".to_string(),
             content: "short task".to_string(),
             status: wyj_tools::todo::TodoStatus::InProgress,
-            priority: None,
             active_form: None,
         }]);
         state.selected_todo_id = Some("a".to_string());
@@ -5961,7 +5946,6 @@ mod tool_result_fold_tests {
             id: "a".to_string(),
             content: "检查交互焦点".to_string(),
             status: TodoStatus::InProgress,
-            priority: Some("high".to_string()),
             active_form: Some("正在检查交互焦点".to_string()),
         }]);
         assert_eq!(thinking_status_label(&state), "正在检查交互焦点");
@@ -5982,7 +5966,6 @@ mod tool_result_fold_tests {
             id: "b".to_string(),
             content: "检查 fallback".to_string(),
             status: TodoStatus::InProgress,
-            priority: None,
             active_form: None,
         }]);
         assert_eq!(thinking_status_label(&state), "检查 fallback");
@@ -5992,7 +5975,6 @@ mod tool_result_fold_tests {
             id: "c".to_string(),
             content: "已完成".to_string(),
             status: TodoStatus::Completed,
-            priority: None,
             active_form: Some("不应被选中".to_string()),
         }]);
         assert_eq!(
