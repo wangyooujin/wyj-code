@@ -41,7 +41,7 @@ use wyj_core::{
     EvolutionCandidate, EvolutionMemory, EvolutionStore, HistoryEntry, HistoryStore, InjectionKind,
     MemoryStatus, Session, SessionFile, SessionFileMeta, SessionMeta, SessionStore, ToolEvent,
 };
-use wyj_tools::todo::{is_todo_collapsible, TodoItem, TodoStatus};
+use wyj_tools::todo::{TodoItem, TodoStatus};
 use wyj_tools::trace::TraceEvent;
 use wyj_tools::{
     ctx::{install_global_tool_output_sink, UiAskRequest},
@@ -56,45 +56,6 @@ const SHELL_WAKE_TAIL_BYTES: usize = 64 * 1024;
 
 /// 用于 /model 热切换 / 设置面板保存后重建 Agent 的函数类型
 pub type RebuildFn = Arc<dyn Fn(&Config, &str) -> anyhow::Result<Agent> + Send + Sync>;
-
-/// 应用 `/density`：更新内存态并写回 `config.toml` 的 `[ui].activity_density`。
-/// 返回 `true` = 已切换（含写盘失败但内存已改）。
-fn apply_activity_density(state: &mut AppState, raw: &str) -> bool {
-    let Some(next) = wyj_config::ActivityDensity::parse(raw) else {
-        state
-            .messages
-            .push(ChatMessage::assistant_err(wyj_i18n::tr_fmt(
-                "density.invalid",
-                &[("level", raw.trim())],
-            )));
-        return false;
-    };
-
-    state.activity_density = next;
-    // 切档后默认收起分组展开，避免 Compact→Balanced 后仍摊着旧摘要。
-    state.activity_groups_expanded = false;
-
-    let mut new_cfg = state.config.clone();
-    new_cfg.ui.activity_density = next;
-    match new_cfg.save() {
-        Ok(()) => {
-            state.config = new_cfg;
-            state.messages.push(ChatMessage::assistant(wyj_i18n::tr_fmt(
-                "density.switched",
-                &[("level", next.as_str())],
-            )));
-        }
-        Err(e) => {
-            state
-                .messages
-                .push(ChatMessage::assistant_err(wyj_i18n::tr_fmt(
-                    "density.save_failed",
-                    &[("level", next.as_str()), ("err", &e.to_string())],
-                )));
-        }
-    }
-    true
-}
 
 /// 非 TUI 表面（headless REPL、`-p`、cron）探测终端列数，供 `CommandContext`
 /// 的排版类命令使用。TUI 路径不用它——那边每帧从真实 frame 回写
@@ -2336,7 +2297,7 @@ pub struct AppState {
     /// in_progress，或最近一次工具活动归因到的 in_progress）。列表顺序上的
     /// 「第一个 InProgress」在模型漏更新时会钉死旧项。
     pub focused_todo_id: Option<String>,
-    /// 任务面板是否处于展开态（仅在 is_todo_collapsible 为真时生效）
+    /// 任务清单是否展开。执行中默认 true；全部完成时自动 false；Ctrl+T 切换。
     pub todo_panel_expanded: bool,
     /// 任务列表当前选中项（按 id 而非 index，避免列表变动时错位）
     pub selected_todo_id: Option<String>,
@@ -2360,8 +2321,6 @@ pub struct AppState {
     pub model_picker: Option<ModelPickerDialog>,
     /// 思考强度面板（/effort 无参命令触发时 Some）
     pub effort_picker: Option<EffortPickerDialog>,
-    /// 活动密度面板（/density 无参命令触发时 Some）
-    pub density_picker: Option<DensityPickerDialog>,
     /// AGENTS.md 记忆面板（/memory 命令触发时 Some）
     pub memory_dialog: Option<MemoryDialog>,
     /// 证据化自进化治理中心（/evolve 命令触发时 Some）
@@ -2572,7 +2531,6 @@ pub struct AppState {
 }
 mod agents_panel;
 mod clipboard;
-mod density_panel;
 mod dialogs;
 mod effort_panel;
 mod events;
@@ -2594,7 +2552,6 @@ mod util;
 // 这是「物理拆分、逻辑位置不变」：模块边界只影响文件布局，不改变 API 表面。
 pub(crate) use agents_panel::*;
 pub(crate) use clipboard::*;
-pub use density_panel::*;
 pub use dialogs::*;
 pub use effort_panel::*;
 pub use mcp_panel::*;
@@ -2713,7 +2670,6 @@ impl AppState {
             profile_dialog: None,
             model_picker: None,
             effort_picker: None,
-            density_picker: None,
             memory_dialog: None,
             evolution_dialog: None,
             mcp_dialog: None,
@@ -8576,38 +8532,6 @@ async fn tui_main(
                         continue;
                     }
 
-                    // ⓪.64 活动密度面板拦截（/density 无参命令触发）
-                    if state.density_picker.is_some() {
-                        match key.code {
-                            KeyCode::Esc => {
-                                state.density_picker = None;
-                            }
-                            KeyCode::Up => {
-                                if let Some(dialog) = &mut state.density_picker {
-                                    dialog.move_up();
-                                }
-                            }
-                            KeyCode::Down => {
-                                if let Some(dialog) = &mut state.density_picker {
-                                    dialog.move_down();
-                                }
-                            }
-                            KeyCode::Enter => {
-                                let picked = state
-                                    .density_picker
-                                    .as_ref()
-                                    .and_then(|d| d.item_value(d.selected));
-                                if let Some(level) = picked {
-                                    if apply_activity_density(&mut state, level.as_str()) {
-                                        state.density_picker = None;
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
                     // ① plan 批准对话框最高优先级：↑/↓ 选中 批准/继续规划/手动输入，
                     // Enter 确认（手动输入位先展开文本框，再次 Enter 提交）。
                     if let Some(dlg) = state.plan_dialog.as_mut() {
@@ -9289,15 +9213,6 @@ async fn tui_main(
                                 }
                                 continue;
                             }
-                            KeyCode::Enter
-                                if key.modifiers.is_empty()
-                                    && matches!(state.ui_focus, UiFocus::Chat) =>
-                            {
-                                // 内容焦点下 Enter：展开/收起活动分组（探索合并或
-                                // Compact 回合摘要）。与 Ctrl+O（正文）正交。
-                                state.activity_groups_expanded = !state.activity_groups_expanded;
-                                continue;
-                            }
                             KeyCode::Enter | KeyCode::Char(' ')
                                 if key.modifiers.is_empty()
                                     && !matches!(
@@ -9305,6 +9220,7 @@ async fn tui_main(
                                         UiFocus::Chat | UiFocus::Shells
                                     ) =>
                             {
+                                // Chat 焦点下不再用 Enter 切活动分组——统一走 Ctrl+O。
                                 state.toggle_focused_content_detail();
                                 continue;
                             }
@@ -10331,15 +10247,6 @@ async fn tui_main(
                                             &session,
                                         ) {
                                             state.effort_picker = None;
-                                        }
-                                    }
-                                    Ok(CommandResult::OpenDensityPicker) => {
-                                        state.density_picker =
-                                            Some(DensityPickerDialog::new(state.activity_density));
-                                    }
-                                    Ok(CommandResult::SetActivityDensity(raw)) => {
-                                        if apply_activity_density(&mut state, &raw) {
-                                            state.density_picker = None;
                                         }
                                     }
                                     Ok(CommandResult::OpenSessionPicker) => {

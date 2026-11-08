@@ -4097,7 +4097,7 @@ async fn repl(
     session_id: String,
     cwd: std::path::PathBuf,
     initial_messages: Vec<wyj_api::types::Message>,
-    mut cfg: Config,
+    cfg: Config,
     mode: AgentMode,
     shared_agent_defs: wyj_tools::SharedAgentDefinitions,
     local_plugin: Option<wyj_store::lockfile::PluginContributions>,
@@ -4496,9 +4496,6 @@ async fn repl(
                 Ok(CommandResult::OpenEffortPicker) => {
                     println!("{}", wyj_i18n::tr("effort.picker.headless_unsupported"));
                 }
-                Ok(CommandResult::OpenDensityPicker) => {
-                    println!("{}", wyj_i18n::tr("density.picker.headless_unsupported"));
-                }
                 Ok(CommandResult::SwitchModel(model)) => {
                     // headless 下**必须能执行**：切模型只是改内存 + 重建 Agent，
                     // 没有任何 UI 依赖。headless REPL 里用户敲 `/model <名>`
@@ -4566,29 +4563,6 @@ async fn repl(
                         "{}",
                         wyj_i18n::tr_fmt("effort.switched", &[("level", &level)])
                     );
-                }
-                Ok(CommandResult::SetActivityDensity(raw)) => {
-                    let Some(next) = wyj_config::ActivityDensity::parse(&raw) else {
-                        println!(
-                            "{}",
-                            wyj_i18n::tr_fmt("density.invalid", &[("level", raw.trim())])
-                        );
-                        continue;
-                    };
-                    cfg.ui.activity_density = next;
-                    match cfg.save() {
-                        Ok(()) => println!(
-                            "{}",
-                            wyj_i18n::tr_fmt("density.switched", &[("level", next.as_str())])
-                        ),
-                        Err(e) => println!(
-                            "{}",
-                            wyj_i18n::tr_fmt(
-                                "density.save_failed",
-                                &[("level", next.as_str()), ("err", &e.to_string())]
-                            )
-                        ),
-                    }
                 }
                 Ok(CommandResult::ModelDoctor(profile_name)) => {
                     let live_cfg = wyj_config::Config::load().unwrap_or_else(|_| cfg.clone());

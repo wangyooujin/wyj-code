@@ -858,22 +858,21 @@ impl MouseMode {
 
 /// 聊天区活动密度：控制工具调用 / 探索步骤在主视图里占多少行。
 ///
-/// 与 `Ctrl+O`（thinking / 工具**正文**自动 ↔ 全展开）正交——本枚举只改
-/// 「有没有合并行、合并到哪一层」，不决定正文是否摊开。
+/// 遗留配置枚举。TUI 已固定 Compact 呈现；字段仍可解析以免旧 config 报错。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ActivityDensity {
-    /// 对话优先：回合内成功活动收成一行摘要，展开后回落 Balanced。
-    Compact,
-    /// 默认：写盘 / Bash / 失败等逐步可见；成功的探索类工具合并为 `Explored N`。
+    /// 对话优先：回合内成功探索/命令收成一行摘要；Edit/Write 始终露出。
     #[default]
+    Compact,
+    /// 遗留：写盘 / Bash / 失败等逐步可见；成功探索合并为 `Explored N`。
     Balanced,
-    /// 探索类也不合并，逐步一行标题（接近未分组时的时间线）。
+    /// 遗留：探索类也不合并，逐步一行标题。
     Detailed,
 }
 
 impl ActivityDensity {
-    /// 解析 `/density` 参数或配置字符串。未知值返回 `None`。
+    /// 解析配置字符串。未知值返回 `None`。
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "compact" | "c" => Some(Self::Compact),
@@ -883,7 +882,7 @@ impl ActivityDensity {
         }
     }
 
-    /// 配置 / 状态栏用的稳定英文名。
+    /// 配置用的稳定英文名。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Compact => "compact",
@@ -892,7 +891,7 @@ impl ActivityDensity {
         }
     }
 
-    /// `/density` 无参时按 Compact → Balanced → Detailed → Compact 循环。
+    /// 遗留循环辅助（Compact → Balanced → Detailed → Compact）。
     pub fn cycle(self) -> Self {
         match self {
             Self::Compact => Self::Balanced,
@@ -940,7 +939,7 @@ impl Default for UiCfg {
             mouse: MouseMode::Auto,
             mouse_capture: None,
             scrollbar: true,
-            activity_density: ActivityDensity::Balanced,
+            activity_density: ActivityDensity::Compact,
         }
     }
 }
@@ -2946,7 +2945,7 @@ context_window = 200000
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.ui.mouse, MouseMode::Auto);
         assert!(cfg.ui.scrollbar);
-        assert_eq!(cfg.ui.activity_density, ActivityDensity::Balanced);
+        assert_eq!(cfg.ui.activity_density, ActivityDensity::Compact);
         // 常见终端（xterm-256color / screen / tmux）都判定为开启。
         assert!(cfg.ui.mouse.resolve(Some("xterm-256color")));
         assert!(cfg.ui.mouse.resolve(Some("screen-256color")));

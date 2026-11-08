@@ -27,7 +27,7 @@
 - 系统通知用 `markdown::wrap_plain_text_spans` 折行。不要交给 `Paragraph` 的 `WordWrapper`（中文没有空格，会被拦腰截断）。
 - 子 Agent 详情是把 trace **翻译**成聊天消息再走同一条渲染管线，按事件条数缓存。不要在面板里铺原始 trace。交接摘要一行，报错进正文。
 - 实时工具输出两道闸：`tool_use_id` 已登记，且 `is_thinking`。中断后泵仍可能推来尾帧。
-- **活动密度**（`[ui].activity_density` / `/density`）与 `Ctrl+O` 正交：前者管「合并几层活动行」，后者管 thinking/工具**正文**自动↔全展开。默认 `balanced`：相邻 ≥2 条成功探索工具（Read/Grep/Glob/CodeSearch/WebFetch/WebSearch/ToolSearch/Memory/ContextRecall）合并为 `Explored N`；`compact` 把回合内成功活动收成一行摘要（失败、进行中、授权、Plan、AskQuestion、用户 `!` bash 永不进合并桶）；`detailed` 不合并。分组展开用内容焦点 `Enter`（`activity_groups_expanded`），`Ctrl+O` 为 true 时探索组也强制展开。只改呈现层，不改 `ChatMessage` 入库。
+- 聊天活动固定 **Compact**：成功探索/命令收成一行回合摘要；**Edit/Write 永不折叠**，始终画在输出区。`Ctrl+O`（`output_expanded`）展开回合细节、thinking 与工具正文。失败、进行中、授权、Plan、AskQuestion、用户 `!` bash 永不进折叠桶。`/density` 已删除；`[ui].activity_density` 仅兼容旧配置，渲染忽略。只改呈现层，不改 `ChatMessage` 入库。
 
 ## 输入与鼠标
 
@@ -43,13 +43,13 @@
 - `/profile` 的字段表是 `PROFILE_FIELD_SPECS`。顺序即渲染顺序。新字段要同时接读写 match，并且 `en.yml` / `zh.yml` 都有 label key（缺 key 会原样显示 key）。枚举候选第一项是空串，表示跟随默认。思考字段按线协议分流，不要两套都铺出来。模型字段 Enter 能手填，不能只有拉取菜单。
 - 「仅本会话使用」的分组存在 `session_profile_override`，不写 `config.toml`。任何写盘路径用 `state.config`，不用叠了覆盖的有效配置。状态栏要显示分组名。切换成功后收起面板。
 - `/evolve` 保持 Active / Candidates / Episodes / Health 四视图。危险动作二次确认。
-- 全部 todo 完成时摘要只留一行。`TurnDone` 不清 `current_todos`；正常结束才把残留的 in_progress 补成完成，截断的回合不要补（见 `core` 的 `turn_truncated`）。
+- Todo 挂在聊天流尾部（不是底部面板）。执行中默认展开；每任务名下画 compact 执行摘要（进行中约 4 行跟尾，`·/spinner/✓`）。有 tasklist 时已归因的 ToolCall/ToolResult 从主聊天归并到任务下。全部完成时摘要只留一行，Ctrl+T 可再展开。`TurnDone` 不清 `current_todos`；正常结束才把残留的 in_progress 补成完成，截断的回合不要补（见 `core` 的 `turn_truncated`）。
 - 新建分组的 `max_tools_per_turn` 预填 4。留空会让国内端点按目录判成每轮 1 个工具。
 
 ## 渲染时不要退回去的行为
 
 - `draw_chat` 只把视口里的行交给 `Paragraph`。`scroll` 是 `u16`，整段历史塞进去会卡，也会滚不到底。高度按物理行算。
-- `Ctrl+O` 是「自动 ↔ 全展开」，不是「全折叠 ↔ 全展开」。正在执行的步骤保持展开。Edit/Write 折叠态仍显示最多约 20 行 diff；不要把这个例外扩到 Bash 这类大输出。不要用 `Ctrl+O` 去改密度档——那是 `/density` 的事。
+- `Ctrl+O` 是「自动 ↔ 全展开」，不是「全折叠 ↔ 全展开」。正在执行的步骤保持展开。Edit/Write 折叠态仍显示最多约 20 行 diff；不要把这个例外扩到 Bash 这类大输出。
 - 退出前排空在途的按键 release，panic hook 无条件 `PopKeyboardEnhancementFlags`。否则 Ghostty 的 `CSI u` 会漏进 shell，提示符后多出 `9;5;3u`。
 - 鼠标报告只开 1000/1002/1006，不要开 1003，也不要改用 crossterm 的 `EnableMouseCapture`。
 - 不要再试 Inline viewport 来做贴底。那条路已经因为光标查询竞态失败过。

@@ -59,6 +59,27 @@ pub(crate) fn is_successful_explore_pair(call: &ChatMessage, result: &ChatMessag
     message_tool_name(call, Some(result)).is_some_and(is_explore_tool)
 }
 
+/// Compact 可收进回合摘要的成功工具对。
+///
+/// Edit / Write **永不**进折叠桶——文件改动必须留在输出区逐步可见；
+/// 失败与未配对的进行中调用也不进桶。
+pub(crate) fn is_compact_foldable_pair(call: &ChatMessage, result: &ChatMessage) -> bool {
+    if !matches!(call.role, MessageRole::ToolCall) {
+        return false;
+    }
+    if !matches!(result.role, MessageRole::ToolResult) {
+        return false;
+    }
+    if call.sequence_no.is_none() || call.sequence_no != result.sequence_no {
+        return false;
+    }
+    if result.is_error {
+        return false;
+    }
+    let name = message_tool_name(call, Some(result)).unwrap_or("");
+    !matches!(tool_display_kind(name), ToolDisplayKind::Edit)
+}
+
 /// 一轮（User…下一 User）内成功活动的计数，供 Compact 摘要行。
 #[derive(Debug, Default, Clone)]
 pub(crate) struct TurnActivityStats {
@@ -106,8 +127,8 @@ pub(crate) fn collect_turn_activity_stats(messages: &[ChatMessage]) -> TurnActiv
                                 stats.has_foldable_activity = true;
                             }
                             ToolDisplayKind::Edit => {
+                                // 计入摘要数字，但不进折叠桶——输出区逐步露出。
                                 stats.edits += 1;
-                                stats.has_foldable_activity = true;
                             }
                             ToolDisplayKind::Command => {
                                 stats.commands += 1;

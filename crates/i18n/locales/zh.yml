@@ -129,6 +129,7 @@ spinner:
   todo_done: "任务已完成"
   todo_expand: "  （Ctrl+T 展开）"
   todo_collapse: "  （Ctrl+T 折叠）"
+  todo_waiting_steps: "等待工具活动…"
   todo_budget_resume: "[本轮工具轮数预算用尽，任务列表还剩 {count} 项未完成——正在自动续跑]"
   todo_auto_resume: "[自动续跑 {round}：接着完成剩余的 {count} 项任务]"
   todo_resume_exhausted: "[自动续跑已达上限，仍有 {count} 项未完成。可手动输入「继续」，或调高 [agent].forced_thinking_max_turns / [agent].max_turns 后重试]"
@@ -319,7 +320,6 @@ help:
     - `/profile [分组名]` — 管理调用分组；无参数打开管理面板，带分组名直接切换（写盘，成为全局默认）。面板里选中分组后按 Enter →「仅本会话使用」可只对当前会话生效，不写 config.toml，随会话落盘、`--resume` 后继续生效
     - `/model [模型名]` — 切换当前分组下的模型；无参数打开模型选择器（从端点拉取可用模型列表），带模型名直接切换。**仅本次会话生效**，不写 config.toml、不随会话落盘（`--resume` 后回到分组配置的模型）；只影响当前模式实际使用的那个模型字段
     - `/effort [档位]` — 调整思考强度；无参数打开档位面板（只列当前端点真正支持的档位），带档位直接切换，`off` 关闭思考。随会话落盘、`--resume` 后继续生效，不写 config.toml
-    - `/density [compact|balanced|detailed]` — 切换聊天区活动密度：无参打开选择面板；带档位直接切换。`balanced`（默认）合并成功的探索类工具；`compact` 把回合成功活动收成一行摘要；`detailed` 逐步一行。写回 config.toml。与 `Ctrl+O`（正文展开）正交
     - `/mcp` — 管理 MCP server（浏览/搜索 Registry、安装/升级/卸载、全局或项目作用域）
     - `/skills` — 管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）
     - `/plugins` — 管理插件（添加插件市场、浏览/安装/升级/卸载/启用/禁用）
@@ -349,8 +349,7 @@ help:
     - `Esc` — 中断当前任务
     - `Shift+Tab` — 循环切换模式 Normal → Plan → Bypass
     - `Ctrl+T` — 聚焦任务列表；已聚焦时折叠/展开任务列表
-    - `Ctrl+O` — 强制展开/收起全部 thinking 与工具结果正文（默认自动：执行中展开，跑完即收）；不改 `/density` 档位
-    - `Enter`（内容焦点）— 展开/收起活动分组（探索合并行或 Compact 回合摘要）
+    - `Ctrl+O` — 展开/收起回合活动摘要、thinking 与工具结果正文（默认 compact：成功探索/命令收成一行；文件修改始终露出；执行中的步骤保持展开）
     - `Ctrl+L` — 清屏（保留对话历史）
     - `Ctrl+A` / `Ctrl+E` — 跳到行首 / 行尾
     - `Ctrl+K` — 删除光标到行尾
@@ -526,8 +525,8 @@ hooks:
   command_line: "({timeout}s) `{command}`"
 
 todo:
-  focus_hint: "↑↓ 选择并跨区   Enter/Space 查看详情   Esc 返回输入框"
-  detail_hint: "↑↓ 逐行滚动   PageUp/PageDown 翻页   Enter/Space 或 Esc 返回任务列表"
+  focus_hint: "↑↓ 选择   Enter/Space 展开任务下步骤   Esc 返回输入框"
+  detail_hint: "↑↓ 滚动步骤   PageUp/PageDown 翻页   Enter/Space 或 Esc 收起步骤"
 
 agents:
   desc: "打开 Agent 类型目录（内置 + 自定义定义文件）"
@@ -939,10 +938,10 @@ density:
   invalid: "未知密度 '{level}'（可用：compact / balanced / detailed）"
   save_failed: "活动密度已切换为 {level}，但写入 config.toml 失败：{err}"
   explored: "探索了 {count} 处"
-  explored_hint: "  ·  Enter 展开"
+  explored_hint: "  ·  Ctrl+O 展开"
   turn_summary: "工作了 {elapsed} · 探索 {explored} · 改了 {edits} · 跑了 {commands}"
-  turn_summary_hint: "  ·  Enter 展开"
-  expand_hint_content: "内容焦点下 Enter 展开/收起活动分组；Ctrl+O 仍控制正文"
+  turn_summary_hint: "  ·  Ctrl+O 展开"
+  expand_hint_content: "Ctrl+O 展开/收起回合活动与工具正文"
   picker:
     title: "活动密度"
     compact: "compact — 对话优先（回合活动收成一行摘要）"

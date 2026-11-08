@@ -8,17 +8,22 @@
 //!   父模块，由子模块 `use super::*` 继承。
 
 mod dialogs;
+mod todo_inline;
 
 /// 对话框绘制函数的本地别名：`draw()` 的分发点仍然写成裸函数名，读起来与拆分
 /// 前逐字一致，而实现落在 `render/dialogs.rs`。
 use dialogs::*;
+use todo_inline::{
+    attributed_todo_message_ids, push_todo_execution_summary, should_skip_attributed_tool_message,
+};
 
 use crate::activity_density::{
-    collect_turn_activity_stats, format_turn_activity_summary, is_successful_explore_pair,
+    collect_turn_activity_stats, format_turn_activity_summary, is_compact_foldable_pair,
+    is_successful_explore_pair,
 };
 use crate::app::{
     fmt_tokens, format_elapsed, format_hms, ActionMenu, AgentsDialog, AppState, AskQuestionDialog,
-    AskQuestionStage, Attachment, ChatMessage, DensityPickerDialog, EffortPickerDialog,
+    AskQuestionStage, Attachment, ChatMessage, EffortPickerDialog,
     EnterPlanDialog, EvolutionDialog, EvolutionRow, ExecModeConfirmDialog, ExtensionsDialog,
     FlatRow, InProgressAnswer, InputOwner, McpConnStatus, McpDialog, McpDialogTab, McpOverlay,
     MemoryDialog, MemoryRow, MessageRole, ModelPickerDialog, PermissionDialog, PlanApprovalDialog,
@@ -44,7 +49,7 @@ use ratatui::{
     },
     Frame,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use wyj_config::{ActivityDensity, AgentMode};
 use wyj_core::tool::{AskQuestionSpec, QuestionAnswer};
@@ -868,10 +873,6 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     if let Some(dialog) = &state.effort_picker {
         draw_effort_picker(f, dialog, area);
     }
-    if let Some(dialog) = &state.density_picker {
-        draw_density_picker(f, dialog, area);
-    }
-
     // 所有浮层都完成后再扫描最终 Buffer，避免被面板覆盖的聊天链接仍落在坐标表中。
     // backend 会在 Buffer diff 之后注入 OSC 8，不影响这里的宽度与换行计算。
     crate::hyperlink::linkify_buffer(
@@ -2278,6 +2279,11 @@ pub(crate) fn build_pending_chat_lines(
         .iter()
         .filter_map(|(id, (_, seq))| state.live_tool_out.get(id).map(|t| (*seq, t.clone())))
         .collect();
+    let attributed_ids = if state.current_todos.is_some() {
+        Some(attributed_todo_message_ids(&state.todo_execution_logs))
+    } else {
+        None
+    };
     lines.extend(render_message_range(
         MessageRangeRenderArgs {
             messages: &state.messages,
@@ -2289,6 +2295,7 @@ pub(crate) fn build_pending_chat_lines(
             live_tool_out: &live_tool_out,
             activity_density: state.activity_density,
             activity_groups_expanded: state.activity_groups_expanded,
+            skip_attributed_tools: attributed_ids.as_ref(),
         },
         &mut is_first_user,
     ));
@@ -2321,8 +2328,8 @@ pub(crate) fn build_pending_chat_lines(
             &mut lines,
             &items,
             &state.messages,
-            &state.sub_agents,
             &state.todo_execution_logs,
+            &live_tool_out,
             state.spinner_frame,
             state.todo_panel_expanded,
             matches!(state.ui_focus, UiFocus::Todos | UiFocus::TodoDetail),
@@ -2331,7 +2338,6 @@ pub(crate) fn build_pending_chat_lines(
             state.todo_detail_scroll,
             &state.todo_stats,
             max_content_width,
-            state.output_expanded,
         );
         state.todo_detail_scroll = next_scroll;
         state.todo_detail_max_scroll = next_max_scroll;
@@ -2351,8 +2357,8 @@ fn push_inline_todo_lines(
     lines: &mut Vec<Line<'static>>,
     items: &[wyj_tools::todo::TodoItem],
     messages: &[ChatMessage],
-    sub_agents: &std::collections::BTreeMap<u64, SubAgentUiState>,
     todo_logs: &HashMap<String, Vec<TodoExecutionEntry>>,
+    live_tool_out: &HashMap<usize, String>,
     spinner_frame: usize,
     expanded: bool,
     focused: bool,
@@ -2361,7 +2367,6 @@ fn push_inline_todo_lines(
     detail_scroll: u16,
     todo_stats: &HashMap<String, TodoRuntimeStats>,
     max_content_width: usize,
-    output_expanded: bool,
 ) -> (u16, u16) {
     if items.is_empty() {
         return (detail_scroll, 0);
@@ -2373,8 +2378,8 @@ fn push_inline_todo_lines(
         .filter(|t| t.status == TodoStatus::Completed)
         .count();
     let collapsible = is_todo_collapsible(items);
+    let all_done = done == total;
     let collapsed = collapsible && !expanded;
-    let all_done = total > 0 && done == total;
 
     let total_elapsed: f64 = todo_stats.values().map(|s| s.elapsed_secs()).sum();
     let total_in: u32 = todo_stats.values().map(|s| s.input_tokens).sum();
@@ -2409,14 +2414,8 @@ fn push_inline_todo_lines(
     };
 
     lines.push(Line::from(""));
-    // 全部完成：**默认**只保留这一行摘要（不画分隔线、不列条目）——2 行折叠
-    // 面板挂在聊天流里纯粹占地方，而 `TurnDone` 刻意不清 current_todos，它会
-    // 一直挂到用户发下一条消息才消失。收成一行既保留"这轮做了什么、耗时多少
-    // token"的可追溯信息，又不干扰阅读。
-    //
-    // 但完成 ≠ 不可读。用户在这个窗口里最想知道的恰恰是"刚才做了哪几步、
-    // 每步多少 token"——`todo_stats` 与 `todo_execution_logs` 是唯一的审计
-    // 凭据且不落盘，所以用户主动 Ctrl+T 时必须还能把它叫回来。
+    // 全部完成：**默认**只保留这一行摘要。Ctrl+T 仍可展开完整清单与每任务
+    // 下的执行步骤（`todo_stats` / `todo_execution_logs` 仅内存）。
     if all_done && collapsed {
         lines.push(Line::from(vec![
             Span::styled("  ", Theme::dim()),
@@ -2426,7 +2425,6 @@ fn push_inline_todo_lines(
                     .fg(Theme::claude_color())
                     .add_modifier(Modifier::BOLD),
             ),
-            // 折叠态照常给展开提示，否则用户无从知道这一行还能被叫回来。
             Span::styled(wyj_i18n::tr("spinner.todo_expand"), Theme::dim()),
         ]));
         return (detail_scroll, 0);
@@ -2453,22 +2451,16 @@ fn push_inline_todo_lines(
             Span::raw("")
         },
     ]));
-    lines.push(Line::from(Span::styled(
-        format!("  {}", "─".repeat(max_content_width.saturating_sub(2))),
-        Theme::border(),
-    )));
 
     if collapsed {
         return (detail_scroll, 0);
     }
 
     let max_item_width = max_content_width.saturating_sub(10);
-    let mut selected_item = None;
+    let mut next_scroll = detail_scroll;
+    let mut next_max_scroll: u16 = 0;
     for (i, item) in items.iter().enumerate() {
         let is_selected = focused && selected_todo_id == Some(item.id.as_str());
-        if is_selected {
-            selected_item = Some(item);
-        }
         let selected_style = |st: Style| -> Style {
             if is_selected {
                 st.bg(Theme::selected_bg_color())
@@ -2533,6 +2525,25 @@ fn push_inline_todo_lines(
             ));
         }
         lines.push(Line::from(spans));
+
+        let log = todo_logs.get(&item.id).map(Vec::as_slice).unwrap_or(&[]);
+        let (scroll, max_scroll) = push_todo_execution_summary(
+            lines,
+            item,
+            messages,
+            log,
+            live_tool_out,
+            spinner_frame,
+            is_selected,
+            detail_open,
+            detail_scroll,
+            max_content_width,
+        );
+        // 只有当前选中任务的视口回写滚动状态（Enter 全量展开时）。
+        if is_selected && (detail_open || matches!(item.status, TodoStatus::InProgress)) {
+            next_scroll = scroll;
+            next_max_scroll = max_scroll;
+        }
     }
 
     if focused && !detail_open {
@@ -2541,143 +2552,16 @@ fn push_inline_todo_lines(
             Theme::dim(),
         )));
     }
-
-    let mut next_scroll = detail_scroll;
-    let mut next_max_scroll: u16 = 0;
     if focused && detail_open {
-        if let Some(item) = selected_item
-            .or_else(|| selected_todo_id.and_then(|id| items.iter().find(|item| item.id == id)))
-        {
-            (next_scroll, next_max_scroll) = push_todo_detail_lines(
-                lines,
-                item,
-                messages,
-                sub_agents,
-                todo_logs.get(&item.id).map(Vec::as_slice).unwrap_or(&[]),
-                todo_stats.get(&item.id),
-                detail_scroll,
-                max_content_width,
-                output_expanded,
-            );
-        }
+        lines.push(Line::from(Span::styled(
+            format!("  {}", wyj_i18n::tr("todo.detail_hint")),
+            Theme::dim(),
+        )));
     }
 
     (next_scroll, next_max_scroll)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn push_todo_detail_lines(
-    lines: &mut Vec<Line<'static>>,
-    item: &wyj_tools::todo::TodoItem,
-    messages: &[ChatMessage],
-    sub_agents: &std::collections::BTreeMap<u64, SubAgentUiState>,
-    log: &[TodoExecutionEntry],
-    stats: Option<&TodoRuntimeStats>,
-    detail_scroll: u16,
-    max_content_width: usize,
-    output_expanded: bool,
-) -> (u16, u16) {
-    lines.push(Line::from(Span::styled(
-        format!("  {}", "─".repeat(max_content_width.saturating_sub(2))),
-        Theme::border(),
-    )));
-
-    let status = match item.status {
-        TodoStatus::Pending => "pending",
-        TodoStatus::InProgress => "in_progress",
-        TodoStatus::Completed => "completed",
-    };
-    let priority = item.priority.as_deref().unwrap_or("-");
-    let detail_width = max_content_width.saturating_sub(4).max(1);
-    let mut detail_lines: Vec<Line<'static>> = Vec::new();
-
-    for l in wrap_line(
-        &format!("id: {} · status: {status} · priority: {priority}", item.id),
-        detail_width,
-    ) {
-        detail_lines.push(Line::from(Span::styled(format!("  {l}"), Theme::dim())));
-    }
-    if let Some(active) = item.active_form.as_deref() {
-        for l in wrap_line(&format!("active: {active}"), detail_width) {
-            detail_lines.push(Line::from(Span::styled(
-                format!("  {l}"),
-                Theme::tool_result(),
-            )));
-        }
-    }
-    for l in wrap_line(&format!("task: {}", item.content), detail_width) {
-        detail_lines.push(Line::from(Span::styled(
-            format!("  {l}"),
-            Theme::tool_result(),
-        )));
-    }
-    if let Some(s) = stats {
-        detail_lines.push(Line::from(Span::styled(
-            format!(
-                "  ⏱ {} · ↑{} ↓{}",
-                format_hms(s.elapsed_secs()),
-                fmt_tokens(s.input_tokens),
-                fmt_tokens(s.output_tokens)
-            ),
-            Theme::dim(),
-        )));
-    }
-    detail_lines.push(Line::from(Span::styled(
-        "  execution",
-        Style::default()
-            .fg(Theme::claude_color())
-            .add_modifier(Modifier::BOLD),
-    )));
-
-    if log.is_empty() {
-        detail_lines.push(Line::from(Span::styled(
-            "  no captured execution events yet",
-            Theme::dim(),
-        )));
-    } else {
-        let ctx = ChatRenderCtx {
-            max_content_width: detail_width,
-            sub_agents,
-            spinner_frame: 0,
-            // 跟随全局 Ctrl+O flag：详情区通过 `TodoExecutionEntry::Message` 重放的
-            // **恰恰是工具消息**（不是 thinking），若这里硬编码 false，面板会只剩
-            // 一排 `⏺ Tool(...)` 标题、正文全空，等于摧毁这个面板的存在意义。
-            output_expanded,
-            // 详情区渲染的是**历史**执行记录，那些调用早已 ToolEnd 完毕，
-            // 实时输出块不会、也不该出现在这里。
-            live_tool_out: &HashMap::new(),
-        };
-        for entry in log {
-            match entry {
-                TodoExecutionEntry::Message(id) => {
-                    if let Some(msg) = messages.iter().find(|m| m.id == *id) {
-                        let mut msg_lines = Vec::new();
-                        let mut is_first_user = true;
-                        render_chat_message(&mut msg_lines, msg, 0, &mut is_first_user, &ctx);
-                        push_prefixed_lines(&mut detail_lines, msg_lines, "  ");
-                    }
-                }
-                TodoExecutionEntry::Note(text) => {
-                    for l in wrap_line(text, detail_width) {
-                        detail_lines.push(Line::from(Span::styled(format!("  {l}"), Theme::dim())));
-                    }
-                }
-            }
-        }
-    }
-
-    let viewport = detail_lines.len().min(12);
-    let max_scroll = detail_lines.len().saturating_sub(viewport);
-    let scroll = (detail_scroll as usize).min(max_scroll);
-    for line in detail_lines.into_iter().skip(scroll).take(viewport) {
-        lines.push(line);
-    }
-    lines.push(Line::from(Span::styled(
-        format!("  {}", wyj_i18n::tr("todo.detail_hint")),
-        Theme::dim(),
-    )));
-    (scroll as u16, max_scroll.min(u16::MAX as usize) as u16)
-}
 
 fn push_prefixed_lines(
     lines: &mut Vec<Line<'static>>,
@@ -2747,6 +2631,8 @@ struct MessageRangeRenderArgs<'a> {
     live_tool_out: &'a std::collections::HashMap<usize, String>,
     activity_density: ActivityDensity,
     activity_groups_expanded: bool,
+    /// 有 tasklist 时，已归因到任务的 ToolCall/ToolResult 从主聊天跳过。
+    skip_attributed_tools: Option<&'a HashSet<u64>>,
 }
 
 /// 渲染 `messages[range]` 为 `Vec<Line>`。`is_first_user` 携带"区间开始前是否已
@@ -2768,6 +2654,7 @@ fn render_message_range(
         output_expanded,
         activity_density,
         activity_groups_expanded,
+        skip_attributed_tools,
     } = args;
     let ctx = ChatRenderCtx {
         max_content_width,
@@ -2776,11 +2663,11 @@ fn render_message_range(
         output_expanded,
         live_tool_out,
     };
-    let explore_expanded = activity_groups_expanded
-        || output_expanded
-        || activity_density == ActivityDensity::Detailed;
-    let compact_collapsed =
-        activity_density == ActivityDensity::Compact && !activity_groups_expanded;
+    // 活动密度固定 Compact：折叠态收成回合摘要；Ctrl+O（output_expanded）
+    // 展开逐步细节。`activity_density` 配置字段保留以兼容旧 config，渲染忽略。
+    let _ = activity_density;
+    let explore_expanded = activity_groups_expanded || output_expanded;
+    let compact_collapsed = !explore_expanded;
 
     let mut lines = vec![];
     if compact_collapsed {
@@ -2791,6 +2678,7 @@ fn render_message_range(
             is_first_user,
             &ctx,
             explore_expanded,
+            skip_attributed_tools,
         );
     } else {
         render_balanced_range(
@@ -2801,12 +2689,14 @@ fn render_message_range(
             is_first_user,
             &ctx,
             explore_expanded,
+            skip_attributed_tools,
         );
     }
     lines
 }
 
 /// Compact：按 User 切回合；成功活动收成一行摘要，失败/进行中/回答等仍逐步露出。
+#[allow(clippy::too_many_arguments)]
 fn render_compact_range(
     lines: &mut Vec<Line<'static>>,
     messages: &[ChatMessage],
@@ -2814,10 +2704,16 @@ fn render_compact_range(
     is_first_user: &mut bool,
     ctx: &ChatRenderCtx<'_>,
     explore_expanded: bool,
+    skip_attributed_tools: Option<&HashSet<u64>>,
 ) {
     let mut turn_starts: Vec<usize> = Vec::new();
-    for idx in range.start..range.end {
-        if matches!(messages[idx].role, MessageRole::User) {
+    for (idx, msg) in messages
+        .iter()
+        .enumerate()
+        .take(range.end)
+        .skip(range.start)
+    {
+        if matches!(msg.role, MessageRole::User) {
             turn_starts.push(idx);
         }
     }
@@ -2831,6 +2727,7 @@ fn render_compact_range(
             is_first_user,
             ctx,
             explore_expanded,
+            skip_attributed_tools,
         );
         return;
     }
@@ -2845,6 +2742,7 @@ fn render_compact_range(
             is_first_user,
             ctx,
             explore_expanded,
+            skip_attributed_tools,
         );
     }
 
@@ -2862,10 +2760,12 @@ fn render_compact_range(
             is_first_user,
             ctx,
             explore_expanded,
+            skip_attributed_tools,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_compact_turn(
     lines: &mut Vec<Line<'static>>,
     messages: &[ChatMessage],
@@ -2874,6 +2774,7 @@ fn render_compact_turn(
     is_first_user: &mut bool,
     ctx: &ChatRenderCtx<'_>,
     explore_expanded: bool,
+    skip_attributed_tools: Option<&HashSet<u64>>,
 ) {
     let turn = &messages[start..end];
     let stats = collect_turn_activity_stats(turn);
@@ -2886,6 +2787,7 @@ fn render_compact_turn(
             is_first_user,
             ctx,
             explore_expanded,
+            skip_attributed_tools,
         );
         return;
     }
@@ -2912,14 +2814,23 @@ fn render_compact_turn(
             i += 1;
             continue;
         }
+        if should_skip_attributed_tool_message(msg, skip_attributed_tools) {
+            i += 1;
+            continue;
+        }
         if matches!(msg.role, MessageRole::ToolCall) {
             if let Some(next) = messages.get(i + 1).filter(|r| {
                 i + 1 < end
                     && matches!(r.role, MessageRole::ToolResult)
                     && r.sequence_no == msg.sequence_no
             }) {
-                if !next.is_error {
-                    // 成功工具：已进摘要，跳过整对。
+                if should_skip_attributed_tool_message(next, skip_attributed_tools) {
+                    i += 2;
+                    continue;
+                }
+                if is_compact_foldable_pair(msg, next) {
+                    // 成功探索/命令/其它：已进摘要，跳过整对。
+                    // Edit/Write 不在此列，继续落到下面逐步露出。
                     i += 2;
                     continue;
                 }
@@ -2937,7 +2848,8 @@ fn render_compact_turn(
     }
 }
 
-/// Balanced / Detailed / Compact-展开：逐步渲染，可选合并相邻成功探索工具。
+/// Compact 展开后 / 详细逐步渲染，可选合并相邻成功探索工具。
+#[allow(clippy::too_many_arguments)]
 fn render_balanced_range(
     lines: &mut Vec<Line<'static>>,
     messages: &[ChatMessage],
@@ -2946,11 +2858,19 @@ fn render_balanced_range(
     is_first_user: &mut bool,
     ctx: &ChatRenderCtx<'_>,
     explore_expanded: bool,
+    skip_attributed_tools: Option<&HashSet<u64>>,
 ) {
     let mut i = start;
     while i < end {
-        if matches!(messages[i].role, MessageRole::ToolCall) && !explore_expanded {
-            if let Some(group_end) = peek_explore_group_end(messages, i, end) {
+        let msg = &messages[i];
+        if should_skip_attributed_tool_message(msg, skip_attributed_tools) {
+            i += 1;
+            continue;
+        }
+        if matches!(msg.role, MessageRole::ToolCall) && !explore_expanded {
+            if let Some(group_end) =
+                peek_explore_group_end(messages, i, end, skip_attributed_tools)
+            {
                 let count = (group_end - i) / 2;
                 if count >= 2 {
                     push_render_gap(lines);
@@ -2970,13 +2890,16 @@ fn render_balanced_range(
         }
 
         push_render_gap(lines);
-        let msg = &messages[i];
         if matches!(msg.role, MessageRole::ToolCall) {
             if let Some(next) = messages.get(i + 1) {
                 if i + 1 < end
                     && matches!(next.role, MessageRole::ToolResult)
                     && next.sequence_no == msg.sequence_no
                 {
+                    if should_skip_attributed_tool_message(next, skip_attributed_tools) {
+                        i += 2;
+                        continue;
+                    }
                     render_tool_result_block(lines, Some(msg), next, ctx);
                     trim_trailing_blank_lines(lines);
                     i += 2;
@@ -2991,10 +2914,20 @@ fn render_balanced_range(
 }
 
 /// 从 `i` 起连续成功探索对的结束下标（不含）；不足 2 对返回 `None`。
-fn peek_explore_group_end(messages: &[ChatMessage], i: usize, end: usize) -> Option<usize> {
+/// 已归因到 tasklist 的工具对不计入合并组（它们会画在任务下）。
+fn peek_explore_group_end(
+    messages: &[ChatMessage],
+    i: usize,
+    end: usize,
+    skip_attributed_tools: Option<&HashSet<u64>>,
+) -> Option<usize> {
     let mut j = i;
     let mut pairs = 0usize;
-    while j + 1 < end && is_successful_explore_pair(&messages[j], &messages[j + 1]) {
+    while j + 1 < end
+        && !should_skip_attributed_tool_message(&messages[j], skip_attributed_tools)
+        && !should_skip_attributed_tool_message(&messages[j + 1], skip_attributed_tools)
+        && is_successful_explore_pair(&messages[j], &messages[j + 1])
+    {
         pairs += 1;
         j += 2;
     }
@@ -3318,6 +3251,7 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
             live_tool_out: &HashMap::new(),
             activity_density: state.activity_density,
             activity_groups_expanded: state.activity_groups_expanded,
+            skip_attributed_tools: None,
         },
         &mut is_first_user,
     ));
@@ -4869,6 +4803,7 @@ mod tool_result_fold_tests {
                 live_tool_out,
                 activity_density,
                 activity_groups_expanded,
+                skip_attributed_tools: None,
             },
             &mut is_first_user,
         ))
@@ -4886,7 +4821,8 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn balanced_merges_consecutive_successful_explore_tools() {
+    fn compact_folds_consecutive_successful_explores_into_turn_summary() {
+        // 活动密度已固定 Compact：多条成功探索进回合摘要，不再画 Explored N 行。
         let mut messages = vec![message(MessageRole::User, "look around")];
         for (i, (name, arg)) in [("Read", "a.rs"), ("Grep", "foo"), ("Glob", "*.rs")]
             .into_iter()
@@ -4899,22 +4835,22 @@ mod tool_result_fold_tests {
             100,
             false,
             &HashMap::new(),
-            ActivityDensity::Balanced,
+            ActivityDensity::Balanced, // 配置字段被忽略
             false,
         );
         let joined = rendered.join("\n");
         assert!(
-            joined.contains("3") && (joined.contains("探索") || joined.contains("Explored")),
-            "Balanced 应合并为 Explored 3：{joined}"
+            (joined.contains("工作了") || joined.contains("Worked")) && joined.contains('3'),
+            "应收成含 explored 3 的回合摘要：{joined}"
         );
         assert!(
             !joined.contains("Read(a.rs)"),
-            "合并后不应再逐条露出 Read：{joined}"
+            "折叠后不应逐条露出 Read：{joined}"
         );
     }
 
     #[test]
-    fn balanced_keeps_failed_explore_out_of_the_merge() {
+    fn compact_keeps_failed_explore_visible_outside_summary() {
         let mut messages = vec![message(MessageRole::User, "search")];
         messages.extend(explore_pair(1, "Read", "a.rs"));
         messages.extend(explore_pair(2, "Grep", "foo"));
@@ -4928,39 +4864,17 @@ mod tool_result_fold_tests {
             100,
             false,
             &HashMap::new(),
-            ActivityDensity::Balanced,
+            ActivityDensity::Compact,
             false,
         );
         let joined = rendered.join("\n");
         assert!(
-            joined.contains("2") && (joined.contains("探索") || joined.contains("Explored")),
-            "前两条成功应合并：{joined}"
+            (joined.contains("工作了") || joined.contains("Worked")) && joined.contains('2'),
+            "前两条成功应进摘要：{joined}"
         );
         assert!(
             joined.contains("Grep(bar)") || joined.contains("failed"),
             "失败的 Grep 必须单独成行：{joined}"
-        );
-    }
-
-    #[test]
-    fn detailed_does_not_merge_explore_tools() {
-        let mut messages = vec![message(MessageRole::User, "look")];
-        messages.extend(explore_pair(1, "Read", "a.rs"));
-        messages.extend(explore_pair(2, "Grep", "foo"));
-        let rendered = render_messages_with_density(
-            &messages,
-            100,
-            false,
-            &HashMap::new(),
-            ActivityDensity::Detailed,
-            false,
-        );
-        let joined = rendered.join("\n");
-        assert!(joined.contains("Read(a.rs)"), "{joined}");
-        assert!(joined.contains("Grep(foo)"), "{joined}");
-        assert!(
-            !joined.contains("Explored") && !joined.contains("探索了"),
-            "Detailed 不应出现合并行：{joined}"
         );
     }
 
@@ -4999,8 +4913,48 @@ mod tool_result_fold_tests {
             "成功探索不应逐步露出：{joined}"
         );
         assert!(
-            !joined.contains("Edit(auth.rs)"),
-            "成功 Edit 应进摘要：{joined}"
+            joined.contains("Edit(auth.rs)"),
+            "文件修改必须留在输出区：{joined}"
+        );
+        assert!(
+            joined.contains("Ctrl+O") || joined.contains("ctrl+o"),
+            "摘要应提示 Ctrl+O 展开：{joined}"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_expands_compact_turn_summary() {
+        let mut messages = vec![message(MessageRole::User, "fix login")];
+        messages.extend(explore_pair(1, "Read", "auth.rs"));
+        messages.extend(explore_pair(2, "Grep", "token"));
+        messages.push(message(MessageRole::Assistant, "fixed"));
+
+        let collapsed = render_messages_with_density(
+            &messages,
+            100,
+            false,
+            &HashMap::new(),
+            ActivityDensity::Compact,
+            false,
+        );
+        let expanded = render_messages_with_density(
+            &messages,
+            100,
+            true,
+            &HashMap::new(),
+            ActivityDensity::Compact,
+            false,
+        );
+        let collapsed_joined = collapsed.join("\n");
+        let expanded_joined = expanded.join("\n");
+        assert!(
+            !collapsed_joined.contains("Read(auth.rs)"),
+            "折叠态探索应收进摘要：{collapsed_joined}"
+        );
+        assert!(
+            expanded_joined.contains("Read(auth.rs)")
+                && expanded_joined.contains("Grep(token)"),
+            "Ctrl+O 应展开 Compact 回合细节：{expanded_joined}"
         );
     }
 
@@ -5042,38 +4996,6 @@ mod tool_result_fold_tests {
         );
     }
 
-    #[test]
-    fn ctrl_o_expands_explore_groups_without_changing_density() {
-        let mut messages = vec![message(MessageRole::User, "look")];
-        messages.extend(explore_pair(1, "Read", "a.rs"));
-        messages.extend(explore_pair(2, "Grep", "foo"));
-        let collapsed = render_messages_with_density(
-            &messages,
-            100,
-            false,
-            &HashMap::new(),
-            ActivityDensity::Balanced,
-            false,
-        );
-        let expanded = render_messages_with_density(
-            &messages,
-            100,
-            true, // Ctrl+O
-            &HashMap::new(),
-            ActivityDensity::Balanced,
-            false,
-        );
-        let collapsed_joined = collapsed.join("\n");
-        let expanded_joined = expanded.join("\n");
-        assert!(
-            collapsed_joined.contains("探索") || collapsed_joined.contains("Explored"),
-            "{collapsed_joined}"
-        );
-        assert!(
-            expanded_joined.contains("Read(a.rs)") && expanded_joined.contains("Grep(foo)"),
-            "Ctrl+O 应强制展开探索组：{expanded_joined}"
-        );
-    }
 
     fn sub_agent(status: SubAgentStatus) -> SubAgentUiState {
         SubAgentUiState {
@@ -5484,9 +5406,10 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn in_progress_todo_panel_still_renders_separator_and_items() {
-        // 上一条的对照：未全部完成时行为完全不变（仍有分隔线与条目）。
+    fn in_progress_todo_panel_lists_items_without_separator_chrome() {
+        // 执行中默认展开清单；轻量内嵌，不再画粗分隔线。
         let mut state = make_state();
+        state.todo_panel_expanded = true;
         state.current_todos = Some(vec![
             wyj_tools::todo::TodoItem {
                 id: "a".to_string(),
@@ -5520,18 +5443,76 @@ mod tool_result_fold_tests {
             .expect("面板未渲染");
         let tail = &rendered[head..];
         assert!(
-            tail.iter().any(|l| l.contains('─')),
-            "未完成时保留分隔线：{tail:?}"
+            !tail.iter().any(|l| l.trim_start().starts_with('─')),
+            "内嵌清单不再画粗分隔线：{tail:?}"
         );
         assert!(
             tail.iter().any(|l| l.contains("task b")),
             "未完成时列出条目：{tail:?}"
+        );
+        assert!(
+            tail.iter()
+                .any(|l| l.contains(&wyj_i18n::tr("spinner.todo_waiting_steps"))),
+            "进行中且无执行日志时应提示等待：{tail:?}"
+        );
+    }
+
+    #[test]
+    fn attributed_tools_render_under_todo_not_in_main_chat() {
+        let mut state = make_state();
+        state.todo_panel_expanded = true;
+        state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
+            id: "a".to_string(),
+            content: "implement auth".to_string(),
+            status: wyj_tools::todo::TodoStatus::InProgress,
+            priority: None,
+            active_form: Some("Implementing auth".to_string()),
+        }]);
+
+        let mut call = message(MessageRole::ToolCall, "Read(src/auth.rs)");
+        call.id = 101;
+        call.sequence_no = Some(1);
+        call.tool_name = Some("Read".to_string());
+        let mut result = message(MessageRole::ToolResult, "ok");
+        result.id = 102;
+        result.sequence_no = Some(1);
+        result.tool_name = Some("Read".to_string());
+        state.messages.push(call);
+        state.messages.push(result);
+        state
+            .todo_execution_logs
+            .insert("a".to_string(), vec![TodoExecutionEntry::Message(101)]);
+
+        let rendered: Vec<String> = build_pending_chat_lines(&mut state, 100)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        let title_at = rendered
+            .iter()
+            .position(|l| l.contains(&wyj_i18n::tr("spinner.todo_title")))
+            .expect("todo title");
+        let before = &rendered[..title_at];
+        let after = &rendered[title_at..];
+        assert!(
+            !before.iter().any(|l| l.contains("Read(src/auth.rs)")),
+            "已归因工具不应出现在主聊天：{before:?}"
+        );
+        assert!(
+            after.iter().any(|l| l.contains("Read(src/auth.rs)")),
+            "已归因工具应出现在任务下摘要：{after:?}"
         );
     }
 
     #[test]
     fn rendering_short_todo_detail_writes_back_zero_max_scroll() {
         let mut state = make_state();
+        state.todo_panel_expanded = true;
         state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
             id: "a".to_string(),
             content: "short task".to_string(),
@@ -5557,10 +5538,22 @@ mod tool_result_fold_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(state.todo_detail_max_scroll, 0);
-        assert!(rendered
-            .iter()
-            .any(|line| line.contains("task: short task")));
-        assert!(rendered.iter().any(|line| line.contains("PageUp/PageDown")));
+        assert!(
+            rendered.iter().any(|line| line.contains("short task")),
+            "应看到任务名：{rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains(&wyj_i18n::tr("spinner.todo_waiting_steps"))),
+            "无步骤时应提示等待：{rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains(&wyj_i18n::tr("todo.detail_hint"))),
+            "展开步骤时应有滚动提示：{rendered:?}"
+        );
     }
 
     fn running_sub_agent_with_tool_log() -> SubAgentUiState {
@@ -6412,6 +6405,7 @@ mod tool_result_fold_tests {
             "spinner.todo_done",
             "spinner.todo_expand",
             "spinner.todo_collapse",
+            "spinner.todo_waiting_steps",
         ] {
             let v = wyj_i18n::tr(key);
             assert!(
@@ -7093,6 +7087,7 @@ fn foo() {}
                 live_tool_out: &HashMap::new(),
                 activity_density: ActivityDensity::Detailed,
                 activity_groups_expanded: false,
+            skip_attributed_tools: None,
             },
             &mut is_first_user,
         );
@@ -7385,6 +7380,7 @@ fn foo() {}
                 live_tool_out: &HashMap::new(),
                 activity_density: ActivityDensity::Detailed,
                 activity_groups_expanded: false,
+            skip_attributed_tools: None,
             },
             &mut is_first_user,
         );

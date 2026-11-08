@@ -85,7 +85,6 @@ fn slot_color(slot: &str) -> Color {
 fn production_source(file: &str) -> String {
     let source = match file {
         "activity_density.rs" => include_str!("activity_density.rs"),
-        "app/density_panel.rs" => include_str!("app/density_panel.rs"),
         "render.rs" => include_str!("render.rs"),
         "markdown.rs" => include_str!("markdown.rs"),
         "welcome.rs" => include_str!("welcome.rs"),
@@ -96,6 +95,7 @@ fn production_source(file: &str) -> String {
         // 近 3000 行绘制代码就脱离这条配色守卫，而这正是它当初被拆出来的那
         // 部分实现。
         "render/dialogs.rs" => include_str!("render/dialogs.rs"),
+        "render/todo_inline.rs" => include_str!("render/todo_inline.rs"),
         "app/agents_panel.rs" => include_str!("app/agents_panel.rs"),
         "app/clipboard.rs" => include_str!("app/clipboard.rs"),
         "app/dialogs.rs" => include_str!("app/dialogs.rs"),
@@ -136,10 +136,6 @@ fn no_hardcoded_colors_outside_theme() {
             "activity_density.rs",
             production_source("activity_density.rs"),
         ),
-        (
-            "app/density_panel.rs",
-            production_source("app/density_panel.rs"),
-        ),
         ("render.rs", production_source("render.rs")),
         ("markdown.rs", production_source("markdown.rs")),
         ("welcome.rs", production_source("welcome.rs")),
@@ -147,6 +143,10 @@ fn no_hardcoded_colors_outside_theme() {
         ("input.rs", production_source("input.rs")),
         ("app.rs", production_source("app.rs")),
         ("render/dialogs.rs", production_source("render/dialogs.rs")),
+        (
+            "render/todo_inline.rs",
+            production_source("render/todo_inline.rs"),
+        ),
         (
             "app/agents_panel.rs",
             production_source("app/agents_panel.rs"),

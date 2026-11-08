@@ -157,6 +157,7 @@ mod tests {
         "spinner.todo_done",
         "spinner.todo_expand",
         "spinner.todo_collapse",
+        "spinner.todo_waiting_steps",
     ];
 
     #[test]

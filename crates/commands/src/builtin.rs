@@ -2127,38 +2127,6 @@ impl Command for EffortCmd {
     }
 }
 
-// ── /density ──────────────────────────────────────────────────────────────────
-
-/// `/density` — 切换聊天区活动密度（compact / balanced / detailed）。
-///
-/// 写回 `config.toml` 的 `[ui].activity_density`。无参打开下拉面板；
-/// 带参时按名设置。与 `Ctrl+O`（正文展开）正交。
-pub struct DensityCmd;
-
-#[async_trait]
-impl Command for DensityCmd {
-    fn runs_while_busy(&self) -> bool {
-        true
-    }
-    fn name(&self) -> &str {
-        "density"
-    }
-    fn description(&self) -> String {
-        tr("density.desc")
-    }
-    fn usage(&self) -> String {
-        "/density [compact|balanced|detailed]".to_string()
-    }
-    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
-        if args.trim().is_empty() {
-            return Ok(CommandResult::OpenDensityPicker);
-        }
-        Ok(CommandResult::SetActivityDensity(
-            args.trim().to_ascii_lowercase(),
-        ))
-    }
-}
-
 // ── /cwd ─────────────────────────────────────────────────────────────────────
 
 pub struct CwdCmd;
@@ -2684,7 +2652,6 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(ProfileCmd));
     reg.register(Arc::new(ModelCmd));
     reg.register(Arc::new(EffortCmd));
-    reg.register(Arc::new(DensityCmd));
     // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
     reg.register(Arc::new(CwdCmd));
     reg.register(Arc::new(ResumeCmd));
@@ -2747,7 +2714,6 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(ProfileCmd));
     reg.register(Arc::new(ModelCmd));
     reg.register(Arc::new(EffortCmd));
-    reg.register(Arc::new(DensityCmd));
     // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
     reg.register(Arc::new(CwdCmd));
     reg.register(Arc::new(ResumeCmd));

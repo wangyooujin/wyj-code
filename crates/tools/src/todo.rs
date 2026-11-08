@@ -46,10 +46,12 @@ pub struct TodoStore {
     pub items: Vec<TodoItem>,
 }
 
-/// 任务面板是否应默认折叠：条数超过 3，或全部任务已完成。
+/// 有非空清单即可 Ctrl+T 折叠/展开。
+///
+/// 「默认是否折叠」不在这里决定：执行中默认展开，仅全部完成时由
+/// `apply_todo_snapshot` 把 `todo_panel_expanded` 收成 false。
 pub fn is_todo_collapsible(items: &[TodoItem]) -> bool {
-    items.len() > 3
-        || (!items.is_empty() && items.iter().all(|t| t.status == TodoStatus::Completed))
+    !items.is_empty()
 }
 
 /// 收口任务状态，让 UI「当前任务」与列表字段一致。
@@ -483,12 +485,12 @@ mod tests {
     }
 
     #[test]
-    fn is_todo_collapsible_false_for_few_incomplete_items() {
+    fn is_todo_collapsible_true_for_few_incomplete_items() {
         let items = vec![
             item("a", TodoStatus::Pending),
             item("b", TodoStatus::InProgress),
         ];
-        assert!(!is_todo_collapsible(&items));
+        assert!(is_todo_collapsible(&items));
     }
 
     #[test]

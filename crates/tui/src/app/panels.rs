@@ -54,8 +54,12 @@ impl AppState {
         let new_all_done =
             !items.is_empty() && items.iter().all(|t| t.status == TodoStatus::Completed);
         let is_new_round = is_new_todo_round(self.current_todos.as_deref(), &items);
-        if is_new_round || (new_all_done && !old_all_done) {
+        // 仅「刚全部完成」自动收成一行；新一轮默认展开。同轮 TodoUpdate
+        // 不改 `todo_panel_expanded`，避免冲掉用户 Ctrl+T 的手动折叠。
+        if new_all_done && !old_all_done {
             self.todo_panel_expanded = false;
+        } else if is_new_round {
+            self.todo_panel_expanded = true;
         }
         if is_new_round {
             self.todo_stats.clear();
@@ -456,13 +460,15 @@ impl AppState {
     ///
     /// 任务全部完成也照常展开：完成态只是**默认**折叠成一行摘要（见
     /// `render::push_inline_todo_lines` 的 `all_done && collapsed` 早退），而不是
-    /// 不可读。每项耗时/token 与执行回放是唯一的审计凭据且不落盘，而复盘窗口
-    /// 恰恰就是"这一轮干完了、下一轮还没发"的这一刻。
+    /// 不可读。执行中默认展开；已聚焦 Todos 时再次 Ctrl+T 才翻转折叠。
     pub(super) fn toggle_todo_panel(&mut self) {
         let Some(items) = self.current_todos.as_deref() else {
             return;
         };
-        if is_todo_collapsible(items) && self.ui_focus == UiFocus::Todos {
+        if items.is_empty() {
+            return;
+        }
+        if self.ui_focus == UiFocus::Todos {
             self.todo_panel_expanded = !self.todo_panel_expanded;
         } else {
             self.todo_panel_expanded = true;
