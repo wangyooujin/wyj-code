@@ -7,9 +7,14 @@
 //!   （折行、高度测量、markdown 调度）。这些助手被上面两者共同依赖，所以留在
 //!   父模块，由子模块 `use super::*` 继承。
 
+mod agents_inline;
 mod dialogs;
 mod todo_inline;
 
+use agents_inline::{
+    agents_summary_split_index, push_agent_live_viewport, push_agents_done_block, turn_agent_ids,
+    turn_agents_all_done,
+};
 /// 对话框绘制函数的本地别名：`draw()` 的分发点仍然写成裸函数名，读起来与拆分
 /// 前逐字一致，而实现落在 `render/dialogs.rs`。
 use dialogs::*;
@@ -747,20 +752,15 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         ])
         .split(area);
 
-    // 防御性清零：只有内容区真正画出子 Agent 执行内容（`draw_sub_agent_content`）
-    // 时才会重新写入准确值，避免本帧未展示（面板未聚焦/无选中）时残留上一帧的旧值。
+    // 防御性清零：子 Agent 视口的 max_scroll 由 `build_running_agent_viewports`
+    // 在 draw_chat 里重写；本帧若无 Running 视口则保持 0，避免滚轮吃掉旧值。
     state.sub_agent_detail_max_scroll = 0;
     state.shell_detail_max_scroll = 0;
     // 内容区矩形回写：应用内拖选要知道哪些格子属于正文（见
     // `AppState::capture_frame_rows`）。输入框/状态栏/底部面板一律不算。
     state.chat_area = chunks[0];
-    // 选中子 Agent 后内容区切换为它的执行内容；↑↓ 在运行中的子 Agent 之间切换，
-    // Esc / ↑ 越界回到输入框时恢复聊天流。
-    if state.ui_focus == UiFocus::SubAgents && state.selected_sub_agent.is_some() {
-        draw_sub_agent_content(f, state, chunks[0]);
-    } else {
-        draw_chat(f, state, chunks[0]);
-    }
+    // 子 Agent 执行内容内嵌在聊天流（贴各自 Agent ToolCall 下方），不再整屏盖住主聊天。
+    draw_chat(f, state, chunks[0]);
     if thinking_dock_height > 0 {
         draw_thinking_dock(f, state, chunks[1]);
     }
@@ -810,9 +810,6 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
             if let Some(dlg) = &state.enter_plan_dialog {
                 draw_enter_plan_dialog(f, dlg, panel_chunk);
             }
-        }
-        BottomPanel::SubAgents => {
-            draw_sub_agents_panel(f, state, panel_chunk);
         }
         BottomPanel::ShellProcesses => {
             draw_shell_panel(f, state, panel_chunk);
@@ -1020,15 +1017,12 @@ enum BottomPanel {
     ExecModeConfirm,
     PlanApproval,
     EnterPlan,
-    SubAgents,
     ShellProcesses,
 }
 
 /// 会话占用裁决框的固定高度：2 行边框 + 2 行说明 + 3 行选项 + 1 行操作提示。
 const SESSION_CONFLICT_PANEL_H: u16 = 8;
 
-/// agents 面板列表区最多同时展示的行数（超出用滚动窗口，不再随数量线性增长）
-const SUB_AGENT_LIST_MAX: usize = 6;
 /// 后台任务面板列表区最多同时展示的行数
 const SHELL_LIST_MAX: usize = 6;
 /// 后台任务面板详情区（实时输出）最多占用的行数（超出内部滚动）
@@ -1131,33 +1125,12 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
             BottomPanel::ShellProcesses,
         );
     }
-    if state.ui_focus == UiFocus::SubAgents && state.has_running_sub_agents() {
-        // 焦点在子 Agent 面板时保持可见；列表只含运行中的条目
-        // （`visible_sub_agents`），全部完成后由 `reconcile_sub_agent_selection`
-        // 把焦点交还输入框，这里自然收起。
-        let list_rows = state.visible_sub_agents().len().min(SUB_AGENT_LIST_MAX) as u16;
-        let max_h = (area_height * 7 / 10).max(list_rows + 2);
-        return (
-            (list_rows + 2).clamp(list_rows + 2, max_h).min(area_height),
-            BottomPanel::SubAgents,
-        );
-    }
+    // 子 Agent 已内嵌进聊天流（贴 Agent ToolCall 下方），底部不再占 SubAgents 面板。
     if state.has_running_shells() {
         return (
             shell_panel_height(state, area_height),
             BottomPanel::ShellProcesses,
         );
-    }
-
-    // 子 Agent 聚合面板：运行期间自动显示，全部结束后自动收起。选中条目的执行
-    // 内容由内容区 `draw_sub_agent_content` 接管，面板本身只负责列表与选中高亮。
-    let visible = state.visible_sub_agents();
-    let show_sub_agents = state.has_running_sub_agents();
-    if show_sub_agents && !visible.is_empty() {
-        let list_rows = visible.len().min(SUB_AGENT_LIST_MAX) as u16;
-        let max_h = (area_height * 7 / 10).max(list_rows + 2);
-        let h = (list_rows + 2).clamp(list_rows + 2, max_h);
-        return (h.min(area_height), BottomPanel::SubAgents);
     }
     (0, BottomPanel::None)
 }
@@ -1181,6 +1154,9 @@ struct ChatRenderCtx<'a> {
     /// `AppState.live_tool_out` 求交集后按 `sequence_no` 重建，因此天然只含
     /// 仍在飞的调用；回合被中断后遗留的孤儿快照进不来。
     live_tool_out: &'a std::collections::HashMap<usize, String>,
+    /// 运行中子 Agent 的固定高度视口（已按 scroll/follow_tail 裁好）。
+    /// 贴在对应 Agent ToolCall 正下方；key = sub_agent id。
+    agent_viewports: &'a HashMap<u64, Vec<Line<'static>>>,
 }
 
 /// 工具执行中实时输出块显示的尾部行数。
@@ -1688,32 +1664,13 @@ fn render_chat_message(
                 render_live_tool_output(lines, tail, ctx);
             }
 
-            // 子 Agent 调用：运行期间紧跟一条实时刷新的动态 ⎿ 状态行
-            if let Some(s) = msg.sub_agent_id.and_then(|id| ctx.sub_agents.get(&id)) {
-                match s.status {
-                    SubAgentStatus::Running => {
-                        let frame = SPINNER_FRAMES[ctx.spinner_frame % SPINNER_FRAMES.len()];
-                        let stats = wyj_i18n::tr_fmt(
-                            "subagent.inline_running",
-                            &[
-                                ("elapsed", format_hms(s.elapsed_secs()).as_str()),
-                                ("tokens", &fmt_tokens(s.output_tokens)),
-                                ("count", &s.tool_calls.to_string()),
-                            ],
-                        );
-                        let mut spans = vec![
-                            Span::styled("    ⎿  ", Theme::dim()),
-                            Span::styled(format!("{frame} {stats}"), Theme::info()),
-                        ];
-                        if let Some(cur) = &s.current_tool {
-                            spans.push(Span::styled(
-                                format!(" · {}", truncate_line(cur, 40)),
-                                Theme::dim(),
-                            ));
-                        }
-                        lines.push(Line::from(spans));
-                    }
-                    SubAgentStatus::Interrupted if !s.has_result => {
+            // 子 Agent：运行中贴固定高度视口；中断且尚无 ToolResult 时留一行状态。
+            // 选中态由 `push_agent_live_viewport` 的 ▶ 标记，这里只负责挂载。
+            if let Some(id) = msg.sub_agent_id {
+                if let Some(viewport) = ctx.agent_viewports.get(&id) {
+                    lines.extend(viewport.iter().cloned());
+                } else if let Some(s) = ctx.sub_agents.get(&id) {
+                    if matches!(s.status, SubAgentStatus::Interrupted) && !s.has_result {
                         lines.push(Line::from(vec![
                             Span::styled("    ⎿  ", Theme::dim()),
                             Span::styled(
@@ -1722,7 +1679,6 @@ fn render_chat_message(
                             ),
                         ]));
                     }
-                    _ => {}
                 }
             }
         }
@@ -2349,6 +2305,27 @@ pub(crate) fn build_pending_chat_lines(
         state.messages.len()
     };
 
+    let agent_viewports = build_running_agent_viewports(state, max_content_width);
+    let agents_done = turn_agents_all_done(&state.messages, &state.sub_agents);
+    let agents_at = if agents_done {
+        agents_summary_split_index(&state.messages)
+    } else {
+        None
+    };
+    let turn_ids = turn_agent_ids(&state.messages);
+
+    let push_agents_summary = |lines: &mut Vec<Line<'static>>, state: &AppState| {
+        push_agents_done_block(
+            lines,
+            &turn_ids,
+            &state.sub_agents,
+            state.agents_panel_expanded,
+            state.ui_focus == UiFocus::SubAgents,
+            state.selected_sub_agent,
+            max_content_width,
+        );
+    };
+
     lines.extend(render_message_range(
         MessageRangeRenderArgs {
             messages: &state.messages,
@@ -2361,9 +2338,14 @@ pub(crate) fn build_pending_chat_lines(
             activity_density: state.activity_density,
             activity_groups_expanded: state.activity_groups_expanded,
             skip_attributed_tools: attributed_ids.as_ref(),
+            agent_viewports: &agent_viewports,
         },
         &mut is_first_user,
     ));
+
+    if agents_at.is_some_and(|i| i <= split) {
+        push_agents_summary(&mut lines, state);
+    }
 
     if let Some(items) = state.current_todos.clone() {
         let (next_scroll, next_max_scroll) = push_inline_todo_lines(
@@ -2400,9 +2382,14 @@ pub(crate) fn build_pending_chat_lines(
             activity_density: state.activity_density,
             activity_groups_expanded: state.activity_groups_expanded,
             skip_attributed_tools: attributed_ids.as_ref(),
+            agent_viewports: &agent_viewports,
         },
         &mut is_first_user,
     ));
+
+    if agents_at.is_some_and(|i| i > split) {
+        push_agents_summary(&mut lines, state);
+    }
 
     // 流式 thinking 钉在输入框上方码头（`draw_thinking_dock`），不进聊天流。
     // 流式最终正文画在任务列表之后。
@@ -2420,6 +2407,82 @@ pub(crate) fn build_pending_chat_lines(
     }
 
     lines
+}
+
+/// 为每个 Running 子 Agent 预裁固定高度视口，供 Agent ToolCall 下方挂载。
+fn build_running_agent_viewports(
+    state: &mut AppState,
+    max_content_width: usize,
+) -> HashMap<u64, Vec<Line<'static>>> {
+    let running_ids: Vec<u64> = state
+        .visible_sub_agents()
+        .iter()
+        .map(|(id, _)| **id)
+        .collect();
+    if running_ids.is_empty() {
+        state.sub_agent_detail_max_scroll = 0;
+        return HashMap::new();
+    }
+
+    let focused = state.ui_focus == UiFocus::SubAgents;
+    let selected = state.selected_sub_agent;
+    let empty_viewports = HashMap::new();
+    let mut map = HashMap::new();
+
+    for id in running_ids {
+        state.refresh_sub_agent_detail_cache(id);
+        let detail_messages = state
+            .sub_agent_detail_cache
+            .as_ref()
+            .filter(|c| c.agent_id == id)
+            .map(|c| c.messages.clone())
+            .unwrap_or_default();
+        let mut is_first_user = true;
+        let body = render_message_range(
+            MessageRangeRenderArgs {
+                messages: &detail_messages,
+                range: 0..detail_messages.len(),
+                max_content_width: max_content_width.saturating_sub(6).max(8),
+                sub_agents: &state.sub_agents,
+                spinner_frame: state.spinner_frame,
+                output_expanded: state.output_expanded,
+                live_tool_out: &HashMap::new(),
+                activity_density: state.activity_density,
+                activity_groups_expanded: state.activity_groups_expanded,
+                skip_attributed_tools: None,
+                agent_viewports: &empty_viewports,
+            },
+            &mut is_first_user,
+        );
+        let is_selected = focused && selected == Some(id);
+        let (scroll, follow_tail) = if is_selected {
+            (
+                state.sub_agent_detail_scroll,
+                state.sub_agent_detail_follow_tail,
+            )
+        } else {
+            (0, true)
+        };
+        let mut viewport = Vec::new();
+        let (scroll_y, max_scroll) = push_agent_live_viewport(
+            &mut viewport,
+            &body,
+            is_selected,
+            scroll,
+            follow_tail,
+            max_content_width,
+        );
+        if is_selected {
+            state.sub_agent_detail_scroll = scroll_y;
+            state.sub_agent_detail_max_scroll = max_scroll;
+            state.sub_agent_detail_follow_tail = follow_tail || scroll_y >= max_scroll;
+        }
+        map.insert(id, viewport);
+    }
+    if !focused || selected.is_none() {
+        state.sub_agent_detail_max_scroll = 0;
+    }
+    map
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2690,6 +2753,7 @@ struct MessageRangeRenderArgs<'a> {
     activity_groups_expanded: bool,
     /// 有 tasklist 时，已归因到任务的 ToolCall/ToolResult 从主聊天跳过。
     skip_attributed_tools: Option<&'a HashSet<u64>>,
+    agent_viewports: &'a HashMap<u64, Vec<Line<'static>>>,
 }
 
 /// 渲染 `messages[range]` 为 `Vec<Line>`。`is_first_user` 携带"区间开始前是否已
@@ -2712,6 +2776,7 @@ fn render_message_range(
         activity_density,
         activity_groups_expanded,
         skip_attributed_tools,
+        agent_viewports,
     } = args;
     let ctx = ChatRenderCtx {
         max_content_width,
@@ -2719,6 +2784,7 @@ fn render_message_range(
         spinner_frame,
         output_expanded,
         live_tool_out,
+        agent_viewports,
     };
     // 活动密度固定 Compact：折叠态收成回合摘要；Ctrl+O（output_expanded）
     // 展开逐步细节。`activity_density` 配置字段保留以兼容旧 config，渲染忽略。
@@ -3239,16 +3305,9 @@ pub(crate) fn resolve_detail_scroll(
     value
 }
 
-/// 选中子 Agent 时接管整个内容区，把它的执行过程（trace）铺开显示。
-///
-/// 执行内容不再挤在底部面板的详情带里：那条带子受 `bottom_panel_size` 的高度预算
-/// 限制，列表本身还要占行，实际几乎永远显示不全。滚动语义见
-/// [`resolve_detail_scroll`]：默认贴底跟随新事件，PageUp/PgDn 翻阅后停在历史位置。
-///
-/// **正文复用聊天区的渲染管线**（`render_message_range`）：执行轨迹先被翻译成
-/// 与主聊天流同构的 `ChatMessage` 序列（见 `app::sub_agent_view`），于是子 Agent
-/// 的执行过程与聊天流长得一模一样——`⏺ 工具名(参数)` 标题行、`⎿` 结果行、
-/// markdown 正文、Ctrl+O 折叠/展开。详情视图自己那套 `in:` / `out:` 平铺已经删掉。
+/// 旧「整屏盖住主聊天」的详情视图——生产路径已改为内嵌视口；测试仍用它钉住
+/// trace→聊天管线翻译。
+#[cfg(test)]
 fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
     let Some(id) = state.selected_sub_agent else {
         draw_chat(f, state, area);
@@ -3315,6 +3374,7 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
             activity_density: state.activity_density,
             activity_groups_expanded: state.activity_groups_expanded,
             skip_attributed_tools: None,
+            agent_viewports: &HashMap::new(),
         },
         &mut is_first_user,
     ));
@@ -3367,7 +3427,6 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
             state.sub_agent_detail_max_scroll as usize,
             body_height as usize,
         )
-        .map(|metrics| metrics.for_target(crate::app::ScrollbarTarget::SubAgentDetail))
     } else {
         None
     };
@@ -3406,7 +3465,7 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
 /// **停下的原因不在这行里**：它多半是一整段 provider 报错，塞进来会把结论挤没，
 /// 而它本来就在正文里（终态结果 `Done.result` 的最后一段就是那句报错，见
 /// `sub_agent.rs` 的 `outputs.push(run_failed)`）。
-fn push_sub_agent_handoff_line(
+pub(super) fn push_sub_agent_handoff_line(
     lines: &mut Vec<Line<'static>>,
     handoff: &wyj_tools::handoff::SubAgentHandoff,
     detail_width: usize,
@@ -3463,100 +3522,7 @@ fn push_sub_agent_handoff_line(
     ]));
 }
 
-/// 底部固定面板：子 Agent 总览，支持上下选中 + 展开详情（工具流水 + 最终结果/状态）。
-/// 标题 `agents [N]`；Running=spinner / Done=✓ / Failed=✗ / Interrupted=⊘；
-/// 列表区固定行数上限（SUB_AGENT_LIST_MAX）+ 滚动窗口；运行期间自动显示，
-/// 全部完成后自动收起，历史详情仍可通过 `/subagents` 主动打开。
-fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
-    // 只列**运行中**的子 Agent（`visible_sub_agents` 是唯一口径）。完成/失败/
-    // 中断的条目不再展示：结果已经回灌对话，完整轨迹仍可用
-    // `wyj-code subagent-trace` 从落盘文件查阅。
-    // 按 id 升序（BTreeMap 天然启动顺序），用 owned Vec 避免可变借用冲突。
-    let ids: Vec<u64> = state
-        .visible_sub_agents()
-        .iter()
-        .map(|(id, _)| **id)
-        .collect();
-
-    let title = wyj_i18n::tr_fmt(
-        "subagent.panel_title",
-        &[("count", ids.len().to_string().as_str())],
-    );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Theme::border())
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Theme::claude_color())
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let selected_idx = state
-        .selected_sub_agent
-        .and_then(|id| ids.iter().position(|&i| i == id));
-
-    let list_area = inner;
-
-    let max_content_width = list_area.width.saturating_sub(2) as usize;
-    let max_show = (list_area.height as usize).clamp(1, SUB_AGENT_LIST_MAX);
-    let start = match selected_idx {
-        Some(idx) if idx >= max_show => idx - max_show + 1,
-        _ => 0,
-    };
-
-    let mut lines: Vec<Line<'static>> = vec![];
-    for (row_i, id) in ids.iter().skip(start).take(max_show).enumerate() {
-        let Some(s) = state.sub_agents.get(id) else {
-            continue;
-        };
-        let is_selected = selected_idx == Some(start + row_i);
-        let sel_bg = |mut st: Style| -> Style {
-            if is_selected {
-                st = st.bg(Theme::selected_bg_color());
-            }
-            st
-        };
-
-        // 面板只列运行中的条目（见函数头的 `visible_sub_agents`），因此图标恒为
-        // spinner——完成/失败/中断的状态由聊天流与 `bg_agent_reminder_with` 承载。
-        let icon = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()].to_string();
-        let item_style = Style::default()
-            .fg(Theme::info_color())
-            .add_modifier(Modifier::BOLD);
-
-        let bg_tag = if s.background { " ◇bg" } else { "" };
-        let head = format!("a{} {}({})", id, s.agent_type, s.description);
-        let stats = format!(
-            " ⏱ {} ↑{} ↓{}{bg_tag}",
-            format_hms(s.elapsed_secs()),
-            fmt_tokens(s.input_tokens),
-            fmt_tokens(s.output_tokens),
-        );
-        let mut spans = vec![
-            Span::styled(format!(" a{id} "), sel_bg(Theme::dim())),
-            Span::styled(format!("{icon} "), sel_bg(item_style)),
-            Span::styled(
-                truncate_line(&head, max_content_width.saturating_sub(30)),
-                sel_bg(item_style),
-            ),
-            Span::styled(stats, sel_bg(Theme::dim())),
-        ];
-        if let Some(cur) = &s.current_tool {
-            spans.push(Span::styled(
-                format!(" {}", truncate_line(cur, 30)),
-                sel_bg(Theme::dim()),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-    f.render_widget(Paragraph::new(Text::from(lines)), list_area);
-}
-
 /// 后台 Shell 任务面板：列表（id / 命令 / 状态 / 耗时）+ 详情（实时输出）。
-/// 结构与 `draw_sub_agents_panel` 完全对称，便于两处对照维护。
 fn draw_shell_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
     // 只列**运行中**的 shell（`running_shells` 是唯一口径）。已完成条目对用户
     // 已无操作价值：输出早已通过 reminder 回灌模型、聊天流里也留了退出记录。
@@ -4867,6 +4833,7 @@ mod tool_result_fold_tests {
                 activity_density,
                 activity_groups_expanded,
                 skip_attributed_tools: None,
+                agent_viewports: &HashMap::new(),
             },
             &mut is_first_user,
         ))
@@ -5118,7 +5085,8 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn running_sub_agents_keep_automatic_panel_visible() {
+    fn running_sub_agents_do_not_take_bottom_panel() {
+        // agentlist 已内嵌聊天流，底部不再为 Running 子 Agent 占位。
         let mut state = make_state();
         state
             .sub_agents
@@ -5126,8 +5094,8 @@ mod tool_result_fold_tests {
 
         let (height, panel) = bottom_panel_size(&state, 40);
 
-        assert!(height > 0);
-        assert!(matches!(panel, BottomPanel::SubAgents));
+        assert_eq!(height, 0);
+        assert!(matches!(panel, BottomPanel::None));
     }
 
     // ── 后台任务面板可见性 ─────────────────────────────────────────────
@@ -5207,8 +5175,8 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn sub_agent_focus_outranks_running_shells() {
-        // 上一条的镜像：焦点在子 Agent 面板时也不该被后台任务抢走。
+    fn sub_agent_focus_does_not_hide_running_shell_panel() {
+        // 子 Agent 内嵌后，底部只剩 shell 面板；焦点在 SubAgents 时仍应露出 shells。
         let mut state = make_state();
         state
             .sub_agents
@@ -5218,7 +5186,7 @@ mod tool_result_fold_tests {
 
         let (_, panel) = bottom_panel_size(&state, 40);
 
-        assert!(matches!(panel, BottomPanel::SubAgents));
+        assert!(matches!(panel, BottomPanel::ShellProcesses));
     }
 
     #[test]
@@ -5925,9 +5893,9 @@ mod tool_result_fold_tests {
         );
     }
 
-    /// 面板高度只覆盖列表：详情由内容区承担，`bottom_panel_size` 不再为它预留行数。
+    /// 聚焦子 Agent 时底部也不再占位：执行内容只挂在 Agent ToolCall 下方。
     #[test]
-    fn focused_sub_agent_panel_reserves_rows_for_list_only() {
+    fn focused_sub_agent_does_not_reserve_bottom_panel_rows() {
         let mut state = make_state();
         state
             .sub_agents
@@ -5938,8 +5906,63 @@ mod tool_result_fold_tests {
 
         let (height, panel) = bottom_panel_size(&state, 40);
 
-        assert!(matches!(panel, BottomPanel::SubAgents));
-        assert_eq!(height, 3, "1 条运行中列表 + 上下边框；详情不再占行");
+        assert!(matches!(panel, BottomPanel::None));
+        assert_eq!(height, 0);
+    }
+
+    #[test]
+    fn running_agent_viewport_renders_under_its_tool_call() {
+        let mut state = make_state();
+        state.messages.push(message(MessageRole::User, "delegate"));
+        let mut call = message(MessageRole::ToolCall, "Explore(找定义)");
+        call.tool_name = Some("Agent".to_string());
+        call.sub_agent_id = Some(1);
+        state.messages.push(call);
+        state
+            .sub_agents
+            .insert(1, running_sub_agent_with_tool_log());
+
+        let text = rendered_text(build_pending_chat_lines(&mut state, 100));
+        let joined = text.join("\n");
+
+        assert!(
+            joined.contains("Explore(找定义)"),
+            "Agent ToolCall 应在主聊天：\n{joined}"
+        );
+        assert!(
+            joined.contains("Grep(pattern=needle)") || joined.contains("Grep"),
+            "运行中视口应挂在 ToolCall 下：\n{joined}"
+        );
+        assert!(
+            !joined.contains(&wyj_i18n::tr("spinner.agents_done")),
+            "仍有 Running 时不应出现完成摘要：\n{joined}"
+        );
+    }
+
+    #[test]
+    fn completed_agents_collapse_to_summary_line() {
+        let mut state = make_state();
+        state.messages.push(message(MessageRole::User, "delegate"));
+        let mut call = message(MessageRole::ToolCall, "Explore(找定义)");
+        call.tool_name = Some("Agent".to_string());
+        call.sub_agent_id = Some(1);
+        state.messages.push(call);
+        let mut result = message(MessageRole::ToolResult, "结论");
+        result.tool_name = Some("Agent".to_string());
+        result.sub_agent_id = Some(1);
+        result.display_summary = "结论".to_string();
+        state.messages.push(result);
+        state.sub_agents.insert(1, sub_agent(SubAgentStatus::Done));
+        state.agents_panel_expanded = false;
+
+        let text = rendered_text(build_pending_chat_lines(&mut state, 100));
+        let joined = text.join("\n");
+
+        assert!(
+            joined.contains(&wyj_i18n::tr("spinner.agents_done")),
+            "全部完成后应留摘要行：\n{joined}"
+        );
+        assert!(joined.contains("[1/1]"), "摘要应带完成计数：\n{joined}");
     }
 
     #[test]
@@ -7208,6 +7231,7 @@ fn foo() {}
                 activity_density: ActivityDensity::Detailed,
                 activity_groups_expanded: false,
                 skip_attributed_tools: None,
+                agent_viewports: &HashMap::new(),
             },
             &mut is_first_user,
         );
@@ -7501,6 +7525,7 @@ fn foo() {}
                 activity_density: ActivityDensity::Detailed,
                 activity_groups_expanded: false,
                 skip_attributed_tools: None,
+                agent_viewports: &HashMap::new(),
             },
             &mut is_first_user,
         );

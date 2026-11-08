@@ -96,6 +96,7 @@ fn production_source(file: &str) -> String {
         // 部分实现。
         "render/dialogs.rs" => include_str!("render/dialogs.rs"),
         "render/todo_inline.rs" => include_str!("render/todo_inline.rs"),
+        "render/agents_inline.rs" => include_str!("render/agents_inline.rs"),
         "app/agents_panel.rs" => include_str!("app/agents_panel.rs"),
         "app/clipboard.rs" => include_str!("app/clipboard.rs"),
         "app/dialogs.rs" => include_str!("app/dialogs.rs"),
@@ -146,6 +147,10 @@ fn no_hardcoded_colors_outside_theme() {
         (
             "render/todo_inline.rs",
             production_source("render/todo_inline.rs"),
+        ),
+        (
+            "render/agents_inline.rs",
+            production_source("render/agents_inline.rs"),
         ),
         (
             "app/agents_panel.rs",

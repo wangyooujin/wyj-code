@@ -130,6 +130,9 @@ spinner:
   todo_done: "Tasks complete"
   todo_expand: "  (ctrl+t to expand)"
   todo_collapse: "  (ctrl+t to collapse)"
+  agents_done: "Agents complete"
+  agents_expand: "  (ctrl+a to expand)"
+  agents_collapse: "  (ctrl+a to collapse)"
   todo_waiting_steps: "waiting for tool activity…"
   todo_budget_resume: "[Tool-loop turn budget exhausted with {count} task(s) unfinished — resuming automatically]"
   todo_auto_resume: "[Auto-resume {round}: continuing with the remaining {count} task(s)]"
@@ -352,9 +355,10 @@ help:
     - `Esc` — Interrupt current task
     - `Shift+Tab` — Cycle mode Normal → Plan → Bypass
     - `Ctrl+T` — Focus the task list; when a task is focused, expand/collapse that task's step summaries
+    - `Ctrl+A` — When sub-agents exist, expand/focus the agent list (or the completed summary); otherwise jump to start of line
     - `Ctrl+O` — When a task is focused, expand/collapse execution details under its steps (bash/read/write, etc.); otherwise expand/collapse turn activity summaries, thinking, and tool result bodies
     - `Ctrl+L` — Clear screen (keeps conversation history)
-    - `Ctrl+A` / `Ctrl+E` — Jump to start / end of line
+    - `Ctrl+E` — Jump to end of line
     - `Ctrl+K` — Delete from cursor to end of line
     - `Ctrl+U` — Delete from cursor to start of line
     - `Ctrl+W` — Delete previous word

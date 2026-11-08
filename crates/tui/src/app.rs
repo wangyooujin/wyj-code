@@ -2475,6 +2475,8 @@ pub struct AppState {
     /// 每帧重置成 `max_scroll`；用户一旦主动上滚即置假，此后 scroll 是绝对偏移，
     /// 后续追加的 trace 事件只在下方堆积、不再把视口拽走。
     pub sub_agent_detail_follow_tail: bool,
+    /// 本轮 agents 全部完成后，摘要行是否展开成整表（Ctrl+A，对齐 tasklist / Ctrl+T）。
+    pub agents_panel_expanded: bool,
     /// 后台子 Agent 完成时主 Agent 空闲，暂存的 system-reminder，下轮起手注入
     pub pending_bg_reminders: Vec<String>,
     /// 上一回合被**推理轮数预算**关闸收尾，且任务清单里仍有未完成项。
@@ -2729,6 +2731,7 @@ impl AppState {
             sub_agent_detail_scroll: 0,
             sub_agent_detail_max_scroll: 0,
             sub_agent_detail_follow_tail: true,
+            agents_panel_expanded: false,
             pending_bg_reminders: vec![],
             todo_resume_pending: false,
             todo_resume_count: 0,
@@ -2900,6 +2903,7 @@ impl AppState {
         self.selected_sub_agent = None;
         self.sub_agent_detail_open = false;
         self.reset_sub_agent_detail_view();
+        self.agents_panel_expanded = false;
         self.pending_bg_reminders.clear();
         // 会话级重置：后台任务属于「上一段会话的现场」，随会话一起作废；
         // 与 begin_new_turn 的「跨轮次保留」是刻意区分的两级粒度。
@@ -4481,7 +4485,7 @@ fn scan_files(
 /// 在 agents 面板里按 delta(-1=Up/+1=Down) 移动选中项。
 /// 未选中时统一默认跳到最新（id 最大）一项；移动到边界后 clamp，不 wrap。
 /// 把某会话落盘的子 Agent trace（`wyj_tools::trace`）重建为 `SubAgentUiState`
-/// 摘要，回灌进 `sub_agents`——复用现有 `draw_sub_agents_panel`，跨会话查看
+/// 摘要，回灌进 `sub_agents`——内嵌 agentlist / `/subagents` 可看，跨会话查看
 /// 不需要专门的展示代码路径。全文 input/output 只留在磁盘（避免长会话下
 /// 常驻内存暴涨），这里只截断出与实时 `arg_summary` 观感一致的摘要行。
 /// trace 目录不存在（新会话，或该会话从未跑过子 Agent）时返回空 map。
@@ -4662,26 +4666,27 @@ fn sub_agent_status_from_handoff(status: wyj_tools::handoff::HandoffStatus) -> S
 /// （本会话历史子 Agent 已在启动/`/resume` 时由 `reload_persisted_sub_agents`
 /// 回灌进 `state.sub_agents`，故这里天然覆盖跨会话查看）；带 id 时校验存在性。
 fn apply_open_subagents_panel(state: &mut AppState, target_id: Option<u64>) {
-    // 面板只列运行中的子 Agent（`visible_sub_agents` 是唯一口径），因此这里
-    // 也只在运行项里定位：选中一个不在列表上的 id 会让焦点悬空在一行看不见的
-    // 位置，用户按 ↑↓ 才知道发生了什么。
-    let running: Vec<u64> = state
-        .visible_sub_agents()
-        .iter()
-        .map(|(id, _)| **id)
-        .collect();
-    if running.is_empty() {
+    // 运行中：聚焦内嵌视口。全部完成：展开摘要表。会话里完全没有则提示 empty。
+    if state.sub_agents.is_empty() {
         state
             .messages
             .push(ChatMessage::system(wyj_i18n::tr("subagents.empty")));
         return;
     }
+    let running: Vec<u64> = state
+        .visible_sub_agents()
+        .iter()
+        .map(|(id, _)| **id)
+        .collect();
     match target_id {
-        Some(id) if running.contains(&id) => {
+        Some(id) if state.sub_agents.contains_key(&id) => {
             state.selected_sub_agent = Some(id);
             state.sub_agent_detail_open = true;
             state.reset_sub_agent_detail_view();
             state.ui_focus = UiFocus::SubAgents;
+            if running.is_empty() {
+                state.agents_panel_expanded = true;
+            }
         }
         Some(id) => {
             state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
@@ -4689,13 +4694,19 @@ fn apply_open_subagents_panel(state: &mut AppState, target_id: Option<u64>) {
                 &[("id", id.to_string().as_str())],
             )));
         }
-        None => {
+        None if !running.is_empty() => {
             if let Some(&last_id) = running.last() {
                 state.selected_sub_agent = Some(last_id);
                 state.sub_agent_detail_open = true;
                 state.reset_sub_agent_detail_view();
                 state.ui_focus = UiFocus::SubAgents;
             }
+        }
+        None => {
+            state.agents_panel_expanded = true;
+            state.selected_sub_agent = state.sub_agents.keys().next_back().copied();
+            state.sub_agent_detail_open = true;
+            state.ui_focus = UiFocus::SubAgents;
         }
     }
 }
@@ -9247,9 +9258,13 @@ async fn tui_main(
                                 state.close_panel_focus();
                                 continue;
                             }
-                            // Ctrl+T 自己负责聚焦/折叠 Todo；保持当前焦点让它能判断
-                            // “已经聚焦”并延续原有第二次按下折叠/展开的语义。
+                            // Ctrl+T / Ctrl+A 自己负责聚焦/折叠 Todo / Agents；
+                            // 保持当前焦点让后续分支能判断「已经聚焦」。
                             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            }
+                            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let _ = state.toggle_agents_panel();
+                                continue;
                             }
                             // Ctrl+O：任务聚焦时只切该任务执行层；否则全局
                             // 「自动 ↔ 全展开」。必须显式占位并 `continue`：
@@ -11024,6 +11039,12 @@ async fn tui_main(
                         delete_word_backward_composer(&mut state, &mut input);
                         update_slash_completions(&mut state, &input, &cmd_registry);
                         update_file_completions(&mut state, &input, &cwd);
+                    } else if key.code == KeyCode::Char('a')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && state.toggle_agents_panel()
+                    {
+                        // Ctrl+A：有 agents 时优先展开/聚焦 agentlist（对齐
+                        // tasklist 的 Ctrl+T）；否则留给下面的行首跳转。
                     } else if crate::input::apply_edit_key(&mut input, &key) {
                         // 左右移动 / Ctrl+A / Ctrl+E / Ctrl+K / Ctrl+U 走唯一实现，
                         // 与各弹窗的自由文本输入同源（见 `input::apply_edit_key`）。
@@ -11031,6 +11052,7 @@ async fn tui_main(
                         // Backspace / Delete（附件占位标记）、Ctrl+W（同上）、
                         // Home / End（输入框为空时是"跳到对话首尾"）、
                         // Enter / ↑↓ / 粘贴（提交、历史、附件）。
+                        // Ctrl+A 在有 agents 时已被上游截走。
                         input.reconcile_attachment_markers(state.pending_attachments.len());
                         update_slash_completions(&mut state, &input, &cmd_registry);
                         update_file_completions(&mut state, &input, &cwd);

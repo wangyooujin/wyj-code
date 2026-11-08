@@ -129,6 +129,9 @@ spinner:
   todo_done: "任务已完成"
   todo_expand: "  （Ctrl+T 展开）"
   todo_collapse: "  （Ctrl+T 折叠）"
+  agents_done: "Agents 已完成"
+  agents_expand: "  （Ctrl+A 展开）"
+  agents_collapse: "  （Ctrl+A 折叠）"
   todo_waiting_steps: "等待工具活动…"
   todo_budget_resume: "[本轮工具轮数预算用尽，任务列表还剩 {count} 项未完成——正在自动续跑]"
   todo_auto_resume: "[自动续跑 {round}：接着完成剩余的 {count} 项任务]"
@@ -349,9 +352,10 @@ help:
     - `Esc` — 中断当前任务
     - `Shift+Tab` — 循环切换模式 Normal → Plan → Bypass
     - `Ctrl+T` — 聚焦任务列表；已聚焦某任务时展开/收起该任务下的步骤摘要
+    - `Ctrl+A` — 有子 Agent 时展开/聚焦 agentlist（全部完成后展开摘要表）；否则跳到行首
     - `Ctrl+O` — 已聚焦某任务时展开/收起该任务步骤下的执行内容（bash/read/write 等）；未聚焦任务时展开/收起回合活动摘要、thinking 与工具结果正文
     - `Ctrl+L` — 清屏（保留对话历史）
-    - `Ctrl+A` / `Ctrl+E` — 跳到行首 / 行尾
+    - `Ctrl+E` — 跳到行尾
     - `Ctrl+K` — 删除光标到行尾
     - `Ctrl+U` — 删除光标到行首
     - `Ctrl+W` — 删除前一个词

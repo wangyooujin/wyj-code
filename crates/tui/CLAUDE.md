@@ -44,6 +44,7 @@
 - 「仅本会话使用」的分组存在 `session_profile_override`，不写 `config.toml`。任何写盘路径用 `state.config`，不用叠了覆盖的有效配置。状态栏要显示分组名。切换成功后收起面板。
 - `/evolve` 保持 Active / Candidates / Episodes / Health 四视图。危险动作二次确认。
 - Todo 插在本轮工作消息之后、最终助手正文 / `streaming_buf` 之前（不是流尾、不是底部面板）。三层：任务标题 → 步骤摘要 → 执行内容。Enter/Space 聚焦任务后展开步骤+执行；Ctrl+T / Ctrl+O 在已聚焦时分别切步骤 / 执行层。进行中任务默认展开步骤；执行层默认折叠。有 tasklist 时已归因的 ToolCall/ToolResult 从主聊天归并到任务下。全部完成时摘要只留一行，Ctrl+T 可再展开整表。`TurnDone` 不清 `current_todos`；正常结束才把残留的 in_progress 补成完成，截断的回合不要补（见 `core` 的 `turn_truncated`）。
+- 子 Agent 内嵌在聊天流：贴在各自 Agent ToolCall 正下方，固定 8 行视口（`agents_inline::AGENT_LIVE_VIEWPORT`）follow_tail；不再占底部 `BottomPanel::SubAgents`，也不整屏盖住主聊天。完成后视口消失，主聊天只留 Agent ToolResult / handoff（轨迹不灌进主历史）。本轮全部完成时留一行 `agents [N/N]` 摘要，Ctrl+A 展开整表（有 agents 时 Ctrl+A 优先于行首跳转）。前后台同一套 UI；后台完成通知保留。
 - 新建分组的 `max_tools_per_turn` 预填 4。留空会让国内端点按目录判成每轮 1 个工具。
 
 ## 渲染时不要退回去的行为

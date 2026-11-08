@@ -278,14 +278,12 @@ pub(super) const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
 /// 滚动条控制的是哪一块滚动状态。
 ///
-/// 内容区在不同焦点下画的是不同的东西（聊天流 / 子 Agent 详情），两者各有独立
-/// 的偏移与跟随标志，拖动时必须落到对应那一份上。
+/// 内容区滚动条拖动落到哪一份偏移上。子 Agent 视口已内嵌进聊天流，
+/// 其内部跟尾由按键/滚轮调 `sub_agent_detail_scroll`，不再单独占一条滚动条。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScrollbarTarget {
     /// 聊天流（`chat_scroll`）。
     Chat,
-    /// 子 Agent 详情（`sub_agent_detail_scroll`）。
-    SubAgentDetail,
 }
 
 /// 滚动条拖动所需的几何信息，由渲染层每帧回写。
@@ -307,11 +305,6 @@ pub(crate) struct ScrollbarMetrics {
 }
 
 impl ScrollbarMetrics {
-    /// 复制一份并指向另一个滚动目标（渲染侧先建通用几何，再标注归属）。
-    pub fn for_target(self, target: ScrollbarTarget) -> Self {
-        Self { target, ..self }
-    }
-
     /// 落在 `y` 行时滑块顶部应该在的位置（按比例映射，夹进轨道）。
     pub fn thumb_top_for(&self, y: u16) -> usize {
         let track = self.area.height as usize;

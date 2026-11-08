@@ -464,6 +464,30 @@ impl AppState {
         true
     }
 
+    /// Ctrl+A — 展开/折叠本轮已完成的 agents 摘要（对齐 tasklist / Ctrl+T）。
+    ///
+    /// 仍有 Running 时：把内容焦点落到最近一个运行中的子 Agent（视口跟尾可滚）。
+    /// 全部完成时：翻转 `agents_panel_expanded`；展开时聚焦列表末项。
+    /// 没有 agents 时是 no-op（调用方应把 Ctrl+A 留给行首跳转）。
+    pub(super) fn toggle_agents_panel(&mut self) -> bool {
+        if self.sub_agents.is_empty() {
+            return false;
+        }
+        if self.has_running_sub_agents() {
+            return self.focus_sub_agent_edge(false);
+        }
+        self.agents_panel_expanded = !self.agents_panel_expanded;
+        if self.agents_panel_expanded {
+            self.selected_todo_id = None;
+            self.selected_sub_agent = self.sub_agents.keys().next_back().copied();
+            self.sub_agent_detail_open = true;
+            self.ui_focus = UiFocus::SubAgents;
+            self.chat_follow_tail = true;
+            self.unseen_messages = false;
+        }
+        true
+    }
+
     /// Ctrl+T — 展开/折叠任务列表面板，并把内容焦点交给它。
     ///
     /// Ctrl+T：未聚焦时展开整表并聚焦选中任务；已聚焦 Todos/TodoDetail 时
@@ -587,10 +611,30 @@ impl AppState {
         }
     }
 
-    /// 只在**运行中**的子 Agent 间取首/末（与 `visible_sub_agents` 同一口径）。
+    /// 可聚焦的子 Agent id：运行中优先；全部完成且摘要展开时用整表。
+    fn focusable_sub_agent_ids(&self) -> Vec<u64> {
+        let running: Vec<u64> = self
+            .visible_sub_agents()
+            .into_iter()
+            .map(|(id, _)| *id)
+            .collect();
+        if !running.is_empty() {
+            return running;
+        }
+        if self.agents_panel_expanded {
+            return self.sub_agents.keys().copied().collect();
+        }
+        Vec::new()
+    }
+
+    /// 在可聚焦的子 Agent 间取首/末。
     pub(super) fn focus_sub_agent_edge(&mut self, first: bool) -> bool {
-        let mut ids = self.visible_sub_agents().into_iter().map(|(id, _)| *id);
-        let id = if first { ids.next() } else { ids.next_back() };
+        let ids = self.focusable_sub_agent_ids();
+        let id = if first {
+            ids.first().copied()
+        } else {
+            ids.last().copied()
+        };
         let Some(id) = id else {
             return false;
         };
@@ -663,15 +707,9 @@ impl AppState {
         self.shells.iter().any(|s| s.status == ShellStatus::Running)
     }
 
-    /// 在 SubAgent 列表内部移动；到达边界时返回 false，交给上层跨区域导航。
-    /// 只在**运行中**的条目间移动（与 `visible_sub_agents` 同一口径）。
+    /// 在可聚焦的子 Agent 间移动；到达边界时返回 false，交给上层跨区域导航。
     pub(super) fn move_selected_sub_agent(&mut self, delta: i32) -> bool {
-        let ids: Vec<u64> = self
-            .sub_agents
-            .iter()
-            .filter(|(_, s)| s.status == SubAgentStatus::Running)
-            .map(|(id, _)| *id)
-            .collect();
+        let ids = self.focusable_sub_agent_ids();
         if ids.is_empty() {
             self.selected_sub_agent = None;
             return false;
@@ -739,7 +777,7 @@ impl AppState {
     }
 
     /// 子 Agent 版的 [`AppState::reconcile_shell_selection`]：选中项完成/
-    /// 中断后重新落到运行中的最后一项，没有运行项时收起面板并交还输入焦点。
+    /// 中断后重新落到运行中的最后一项；全部结束时收成摘要行（对齐 tasklist）。
     pub fn reconcile_sub_agent_selection(&mut self) {
         let running: Vec<u64> = self
             .sub_agents
@@ -754,9 +792,12 @@ impl AppState {
             self.selected_sub_agent = running.last().copied();
             self.reset_sub_agent_detail_view();
         }
-        if self.selected_sub_agent.is_none() {
-            self.sub_agent_detail_open = false;
+        if running.is_empty() {
+            // 全部完成：默认折叠成一行摘要，焦点交还输入框。
+            self.agents_panel_expanded = false;
             if self.ui_focus == UiFocus::SubAgents {
+                self.selected_sub_agent = None;
+                self.sub_agent_detail_open = false;
                 self.ui_focus = UiFocus::Composer;
             }
         }

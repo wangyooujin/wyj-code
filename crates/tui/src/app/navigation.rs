@@ -253,12 +253,6 @@ impl AppState {
                     self.unseen_messages = false;
                 }
             }
-            ScrollbarTarget::SubAgentDetail => {
-                let max = self.sub_agent_detail_max_scroll as usize;
-                let clamped = offset.min(max);
-                self.sub_agent_detail_scroll = clamped.min(u16::MAX as usize) as u16;
-                self.sub_agent_detail_follow_tail = clamped >= max;
-            }
         }
     }
 
