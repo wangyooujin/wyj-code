@@ -25,7 +25,7 @@ members = [
 double_must_use = "allow"
 
 [workspace.package]
-version = "0.3.34"
+version = "0.3.35"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["owen"]
