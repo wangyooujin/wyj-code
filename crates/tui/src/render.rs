@@ -40,7 +40,7 @@ use crate::app::{
     TodoRuntimeStats, UiFocus, PROFILE_FIELD_SPECS, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_SPECS,
 };
 use crate::input::{is_atomic_marker, InputBox, ATTACHMENT_MARKER, PASTE_MARKER};
-use crate::markdown::{display_width, render_markdown};
+use crate::markdown::{display_width, render_markdown, render_streaming_markdown};
 use crate::theme::Theme;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
@@ -1321,9 +1321,8 @@ struct ThinkingRenderOpts<'a> {
     spinner_frame: usize,
     /// 展开态正文的按宽度缓存（复用 `ChatMessage::render_cache`）。
     ///
-    /// thinking 展开后走完整 markdown 解析，长思考几十行、历史里又有十几段，
-    /// 每帧重解析一次就是与 assistant 消息同一类的浪费；而它一旦定稿正文
-    /// 不再变化，正是缓存的最佳对象。`None` = 不缓存（测试与一次性渲染）。
+    /// thinking 展开后按宽度缓存纯文本折行结果；定稿后正文不再变化，正是
+    /// 缓存的最佳对象。`None` = 不缓存（测试与一次性渲染）。
     cache: Option<&'a crate::app::RenderCache>,
 }
 
@@ -1465,7 +1464,7 @@ fn draw_thinking_dock(f: &mut Frame, state: &AppState, area: Rect) {
 /// 旧实现固定显示前 3 行，结论永远看不到；后来改成定稿后一字不留，又让
 /// 「思考完了接下来要做什么」完全取决于模型会不会接着写正文。一行尾部摘要
 /// 两边都不重踩：历史仍然不铺开，收起后至少能看到当时想到哪了。
-/// 流式分支先 `rsplit` 取源码窗再 markdown，最后按物理行截视口，不扫全文。
+/// 流式分支先 `rsplit` 取源码窗再纯文本折行，最后按物理行截视口，不扫全文。
 fn render_thinking_block(
     lines: &mut Vec<Line<'static>>,
     content: &str,
@@ -1613,18 +1612,14 @@ fn render_chat_message(
                     }
                 }
             } else {
-                // 已定稿助手正文：纯文本折行（不做 markdown），按宽度缓存。
+                // 已定稿助手正文走 markdown：标题/列表/表格/围栏按结构渲染，
+                // 结果按宽度缓存，避免每帧对历史重跑解析（长对话主要开销）。
                 let mut cache = msg.render_cache.borrow_mut();
                 let mut rendered = match cache.as_ref() {
                     Some((w, cached)) if *w == max_content_width => cached.clone(),
                     _ => {
                         let mut fresh: Vec<Line<'static>> = vec![];
-                        push_plain_text_lines(
-                            &mut fresh,
-                            &msg.content,
-                            max_content_width,
-                            Theme::body(),
-                        );
+                        render_markdown(&mut fresh, &msg.content, max_content_width);
                         *cache = Some((max_content_width, fresh));
                         cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
                     }
@@ -2394,12 +2389,10 @@ pub(crate) fn build_pending_chat_lines(
     // 流式 thinking 钉在输入框上方码头（`draw_thinking_dock`），不进聊天流。
     // 流式最终正文画在任务列表之后。
     if !state.streaming_buf.is_empty() {
-        push_plain_text_lines(
-            &mut lines,
-            &state.streaming_buf,
-            max_content_width,
-            Theme::body(),
-        );
+        // 流式路径走 streaming 变体：未定稿按中间态渲染（未闭合围栏不画框、
+        // 未成形表格不合并），闭合那一刻才不会整块重排。定稿走 `render_markdown`
+        // 并按宽度缓存，两者互不影响。
+        render_streaming_markdown(&mut lines, &state.streaming_buf, max_content_width);
     }
 
     if let Some(dlg) = &state.ask_question_dialog {
@@ -6793,7 +6786,8 @@ mod tool_result_fold_tests {
         let messages = vec![message(MessageRole::Assistant, "first response"), second];
         let rendered = render_messages(&messages, 100);
 
-        assert_eq!(rendered, vec!["first response", "", "second response"]);
+        // markdown 顶层段落带 2 列缩进（与 golden / PlanProposal 一致）
+        assert_eq!(rendered, vec!["  first response", "", "  second response"]);
     }
 
     #[test]
@@ -6814,7 +6808,7 @@ mod tool_result_fold_tests {
         assert_eq!(rendered.len(), 3, "{rendered:?}");
         assert!(rendered[0].contains("Read("));
         assert!(rendered[1].trim().is_empty());
-        assert_eq!(rendered[2], "after tool");
+        assert_eq!(rendered[2], "  after tool");
 
         // 展开态：完整块 + 分隔符
         let expanded = render_messages_with_output_expanded(&messages, 100, true);
@@ -6823,7 +6817,24 @@ mod tool_result_fold_tests {
         assert_eq!(expanded[1], "    ⎿ first");
         assert_eq!(expanded[2], "       second");
         assert!(expanded[3].trim().is_empty());
-        assert_eq!(expanded[4], "after tool");
+        assert_eq!(expanded[4], "  after tool");
+    }
+
+    #[test]
+    fn assistant_body_renders_markdown_structure() {
+        // 定稿助手正文必须做结构转换：粗体剥标记、无序变 bullet、围栏画框。
+        // 与 Thinking 纯文本路径相对——那条故意保留字面量。
+        let msg = message(
+            MessageRole::Assistant,
+            "见 **重点**：\n\n- 条目甲\n- 条目乙\n\n```rust\nfn ok() {}\n```",
+        );
+        let rendered = render_messages(&[msg], 80);
+        let all = rendered.join("\n");
+        assert!(all.contains("重点"), "{all}");
+        assert!(!all.contains("**重点**"), "粗体标记应被剥掉：{all}");
+        assert!(all.contains("• 条目甲"), "{all}");
+        assert!(all.contains("╭─"), "代码围栏应画框：{all}");
+        assert!(all.contains("fn ok() {}"), "{all}");
     }
 
     #[test]
@@ -6897,7 +6908,8 @@ mod tool_result_fold_tests {
 
     #[test]
     fn thinking_expanded_keeps_literal_markers_as_plain_text() {
-        // 助手/思考改为纯文本：markdown 标记原样保留，不做结构转换。
+        // Thinking 保持纯文本：markdown 标记原样保留，不做结构转换。
+        // （Assistant 正文另走 render_markdown。）
         let body = "\
 要点：
 1. 第一点
@@ -6943,8 +6955,7 @@ fn foo() {}
 
     #[test]
     fn thinking_body_is_indented_exactly_four_columns() {
-        // 外层缩进只补一层：markdown 内部对顶层段落不再补 2 格（否则叠加成
-        // 6 格，比列表 bullet 还靠右，层级关系反了）。
+        // Thinking 纯文本：外层统一补 4 列缩进，不叠加 markdown 段落缩进。
         let mut thinking = message(MessageRole::Thinking, "普通段落");
         thinking.thinking_elapsed_secs = Some(1.0);
         let rendered = render_messages_with_output_expanded(&[thinking], 60, true);
@@ -6954,8 +6965,7 @@ fn foo() {}
 
     #[test]
     fn thinking_body_render_is_cached_by_width() {
-        // 展开态走完整 markdown 解析，历史里几十段 thinking 每帧重解析就是
-        // 与 assistant 消息同一类的浪费。缓存按宽度失效。
+        // 展开态按宽度缓存折行结果，避免历史里多段 thinking 每帧重算。
         let mut thinking = message(MessageRole::Thinking, "第一段\n\n第二段");
         thinking.thinking_elapsed_secs = Some(1.0);
         let first = render_messages_with_output_expanded(std::slice::from_ref(&thinking), 60, true);

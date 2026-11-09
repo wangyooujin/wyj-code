@@ -22,7 +22,7 @@
 - `NO_COLOR` 只清颜色，保留粗体等修饰。非 truecolor 时 RGB 量化到 256 色，灰走灰阶。
 - 聊天高度按**物理行**（含折行）算。内容不足一屏时贴底画。不要用 `para.line_count()` 扫整段历史。
 - 折叠态不得读取 `content` 做预览。工具结果默认只画标题行，`Ctrl+O` 才出全文。`!` bash 输出是例外：全文，不折叠。
-- Assistant 与 Thinking **纯文本折行**，不做 markdown 结构转换。流式 thinking 钉在输入框上方固定码头（不进聊天流）；定稿 Thinking 仍在历史，折叠头 + 尾摘要，外层缩进 4 列。流式视口固定 4 物理行（1 状态 + `THINKING_LIVE_TAIL_LINES`；不足垫空、超出取尾）。展开态按宽度缓存；流式不缓存。
+- Assistant 正文走 markdown（定稿 `render_markdown`、流式 `render_streaming_markdown`），按宽度缓存。Thinking **纯文本折行**，不做结构转换。流式 thinking 钉在输入框上方固定码头（不进聊天流）；定稿 Thinking 仍在历史，折叠头 + 尾摘要，外层缩进 4 列。流式视口固定 4 物理行（1 状态 + `THINKING_LIVE_TAIL_LINES`；不足垫空、超出取尾）。展开态按宽度缓存；流式不缓存。
 - Bash 的完整命令单独成行，标题行里的摘要是截断过的。工具耗时走 `fmt_duration_precise`。
 - 系统通知用 `markdown::wrap_plain_text_spans` 折行。不要交给 `Paragraph` 的 `WordWrapper`（中文没有空格，会被拦腰截断）。
 - 子 Agent 详情是把 trace **翻译**成聊天消息再走同一条渲染管线，按事件条数缓存。不要在面板里铺原始 trace。交接摘要一行，报错进正文。
