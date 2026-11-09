@@ -717,7 +717,8 @@ pub(super) fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, ar
     let n_sessions = picker.sessions.len();
     // 显示项：1条"新建会话" + 1条分割线 + n条历史 + 1条分割线 + 1条提示 = n+4
     let height = ((n_sessions as u16 + 4).max(5)).min(area.height.saturating_sub(4));
-    let width = (area.width * 4 / 5).clamp(50, 92);
+    // 上限略放宽，给中文标题（每字 2 列）和右侧开始时间留出并存空间。
+    let width = (area.width * 4 / 5).clamp(50, 100);
 
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -744,22 +745,26 @@ pub(super) fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, ar
     let w = inner.width as usize;
     let home = std::env::var("HOME").unwrap_or_default();
     let new_session_label = wyj_i18n::tr("dialog.new_session_label");
+    // 前缀两列：选中 `▶ `，未选中 `  `，正文贴齐边框内侧。
+    const PREFIX_W: usize = 2;
+    /// 标题列显示宽度上限（含尾部 `...`），按终端列数而非字符数。
+    /// 48 列大约能放下 22 个汉字；窄终端仍会按右侧时间/目录自动收紧。
+    const TITLE_COL: usize = 48;
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // "新建会话" 条目（selected == 0 时高亮）
+    let new_prefix = if picker.selected == 0 { "▶ " } else { "  " };
+    let new_line = truncate_line(&format!("{new_prefix}{new_session_label}"), w);
     if picker.selected == 0 {
         lines.push(Line::from(Span::styled(
-            format!("  ▶ {:<w$}", new_session_label, w = w.saturating_sub(4)),
+            new_line,
             Style::default()
                 .fg(Theme::success_color())
                 .add_modifier(Modifier::BOLD),
         )));
     } else {
-        lines.push(Line::from(Span::styled(
-            format!("    {:<w$}", new_session_label, w = w.saturating_sub(4)),
-            Theme::success(),
-        )));
+        lines.push(Line::from(Span::styled(new_line, Theme::success())));
     }
 
     if !picker.sessions.is_empty() {
@@ -767,6 +772,7 @@ pub(super) fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, ar
 
         for (i, meta) in picker.sessions.iter().enumerate() {
             let selected = picker.selected == i + 1;
+            let prefix = if selected { "▶ " } else { "  " };
 
             // cwd 缩短显示（取最后一级目录名）
             let cwd_short = if !home.is_empty() && meta.cwd.starts_with(&home) {
@@ -781,7 +787,7 @@ pub(super) fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, ar
                 .unwrap_or(&cwd_short)
                 .to_string();
 
-            let time_str = format_relative_time(&meta.timestamp);
+            let time_str = format_session_start_time(&meta.session_id, &meta.timestamp);
             let right = format!(
                 "  {}  {}  {}",
                 time_str,
@@ -791,12 +797,12 @@ pub(super) fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, ar
                     &[("turns", &meta.turns.to_string())]
                 )
             );
-            let right_w = right.chars().count();
-            let title_w = w.saturating_sub(right_w + 4);
-            let title = truncate_chars(&meta.title, title_w);
-
-            let line_str = format!("    {:<tw$}{}", title, right, tw = title_w);
-            let line_str: String = line_str.chars().take(w).collect();
+            let right_w = display_width(&right);
+            let title_col = TITLE_COL.min(w.saturating_sub(PREFIX_W + right_w));
+            let title = truncate_session_title(&meta.title, title_col);
+            // 按显示宽度补空格，避免中文标题把右侧时间挤乱。
+            let pad = title_col.saturating_sub(display_width(&title));
+            let line_str = truncate_line(&format!("{prefix}{title}{}{right}", " ".repeat(pad)), w);
 
             if selected {
                 lines.push(Line::from(Span::styled(
@@ -3054,42 +3060,58 @@ pub(super) fn draw_confirm_overlay(
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-/// 将 ISO 8601 时间戳格式化为相对时间字符串
-pub(super) fn format_relative_time(timestamp: &str) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+/// 会话列表标题：按终端显示宽度截断，总宽不超过 `max_cols`（含尾部 `...`）。
+fn truncate_session_title(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    let full_w: usize = s.chars().map(char_display_width).sum();
+    if full_w <= max_cols {
+        return s.to_string();
+    }
+    const ELLIPSIS: &str = "...";
+    const ELLIPSIS_W: usize = 3;
+    if max_cols <= ELLIPSIS_W {
+        return ELLIPSIS.chars().take(max_cols).collect();
+    }
+    let budget = max_cols - ELLIPSIS_W;
+    let mut width = 0usize;
+    let mut result = String::new();
+    for c in s.chars() {
+        let cw = char_display_width(c);
+        if width + cw > budget {
+            break;
+        }
+        width += cw;
+        result.push(c);
+    }
+    result.push_str(ELLIPSIS);
+    result
+}
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+/// 会话开始时间：优先从 `sess-{unix}-…` 解析创建时刻，失败则回退 meta.timestamp。
+/// 展示为本地时区 `YYYY-MM-DD HH:MM`。
+fn format_session_start_time(session_id: &str, fallback_timestamp: &str) -> String {
+    let secs = session_id
+        .strip_prefix("sess-")
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| parse_iso_to_secs(fallback_timestamp).map(|s| s as i64));
 
-    let ts = parse_iso_to_secs(timestamp).unwrap_or(now);
-    let diff = now.saturating_sub(ts);
-
-    if diff < 60 {
-        wyj_i18n::tr("dialog.time_just_now")
-    } else if diff < 3600 {
-        wyj_i18n::tr_fmt(
-            "dialog.time_minutes_ago",
-            &[("n", &(diff / 60).to_string())],
-        )
-    } else if diff < 86400 {
-        wyj_i18n::tr_fmt(
-            "dialog.time_hours_ago",
-            &[("n", &(diff / 3600).to_string())],
-        )
-    } else if diff < 7 * 86400 {
-        wyj_i18n::tr_fmt(
-            "dialog.time_days_ago",
-            &[("n", &(diff / 86400).to_string())],
-        )
-    } else {
-        timestamp.get(..10).unwrap_or(timestamp).to_string()
+    match secs.and_then(|s| chrono::DateTime::from_timestamp(s, 0)) {
+        Some(dt) => dt
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string(),
+        None => fallback_timestamp
+            .get(..16)
+            .unwrap_or(fallback_timestamp)
+            .replace('T', " "),
     }
 }
 
 /// 粗略地将 ISO 8601 字符串（"2024-06-29T15:30:45Z"）解析为 Unix 秒
-pub(super) fn parse_iso_to_secs(s: &str) -> Option<u64> {
+fn parse_iso_to_secs(s: &str) -> Option<u64> {
     let s = s.trim_end_matches('Z');
     let (date, time) = s.split_once('T')?;
     let mut dp = date.split('-');
@@ -3295,5 +3317,136 @@ mod dialog_window_scroll_tests {
         );
         assert!(text.contains("prof-00"));
         assert!(text.contains(&wyj_i18n::tr("profile.dialog.add_new_row")));
+    }
+}
+
+#[cfg(test)]
+mod session_picker_format_tests {
+    use super::{draw_session_picker, format_session_start_time, truncate_session_title};
+    use crate::app::SessionPickerState;
+    use crate::markdown::display_width;
+    use crate::test_support::render_to_text;
+    use ratatui::layout::Rect;
+    use wyj_core::SessionMeta;
+
+    #[test]
+    fn truncate_session_title_keeps_short_text() {
+        assert_eq!(truncate_session_title("hello", 30), "hello");
+    }
+
+    #[test]
+    fn truncate_session_title_cuts_ascii_to_display_width() {
+        let title: String = (0..40).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let out = truncate_session_title(&title, 30);
+        assert_eq!(display_width(&out), 30);
+        assert!(out.ends_with("..."));
+        assert_eq!(&out[..27], &title[..27]);
+    }
+
+    #[test]
+    fn truncate_session_title_cuts_cjk_by_columns_not_chars() {
+        let title = "标题要足够长才会被截断成三十列后面还有很多字";
+        let out = truncate_session_title(title, 30);
+        // 宽字符可能剩 1 列塞不下，总宽 ≤30 即可。
+        assert!(
+            display_width(&out) <= 30,
+            "got width {}",
+            display_width(&out)
+        );
+        assert!(out.ends_with("..."));
+        // 30 列预算里 `...` 占 3，正文最多 27 列 → 中文约 13 字。
+        assert!(out.chars().count() < title.chars().count());
+        assert!(!out.contains("后面还有"));
+    }
+
+    #[test]
+    fn session_start_time_prefers_sess_id_unix_prefix() {
+        // 任意稳定 unix 秒；断言用了 sess- 前缀而不是 fallback 的 2099。
+        let id = "sess-1762682400-abcdef123456";
+        let formatted = format_session_start_time(id, "2099-01-01T00:00:00Z");
+        assert!(
+            !formatted.starts_with("2099-"),
+            "should prefer session_id timestamp, got {formatted}"
+        );
+        assert_eq!(formatted.len(), "YYYY-MM-DD HH:MM".len());
+        assert!(formatted.chars().nth(10) == Some(' '), "got {formatted}");
+        assert!(formatted.chars().nth(13) == Some(':'), "got {formatted}");
+    }
+
+    #[test]
+    fn session_start_time_falls_back_to_meta_timestamp() {
+        let formatted = format_session_start_time("legacy-id", "2026-03-15T08:30:00Z");
+        // 本地时区可能跨日，只校验格式与年份来自 fallback。
+        assert!(formatted.contains("2026-"), "got {formatted}");
+        assert_eq!(formatted.len(), "YYYY-MM-DD HH:MM".len());
+    }
+
+    #[test]
+    fn session_picker_truncates_title_shows_start_time_and_hugs_left() {
+        let long_title = "a_very_long_session_title_that_needs_truncation_for_the_menu".to_string();
+        let picker = SessionPickerState {
+            sessions: vec![SessionMeta {
+                session_id: "sess-1762682400-abcdef123456".into(),
+                title: long_title.clone(),
+                last_preview: String::new(),
+                cwd: "/tmp/demo-project".into(),
+                timestamp: "2099-01-01T00:00:00Z".into(),
+                turns: 3,
+                input_tokens: 0,
+                output_tokens: 0,
+                title_generated: true,
+                branch_parent_session_id: None,
+                branch_parent_checkpoint_id: None,
+            }],
+            selected: 1,
+        };
+
+        let text = render_to_text(
+            |f| draw_session_picker(f, &picker, Rect::new(0, 0, 120, 24)),
+            120,
+            24,
+        );
+
+        assert!(
+            text.contains("a_very_long_session_title"),
+            "title prefix should be visible:\n{text}"
+        );
+        assert!(
+            text.contains("..."),
+            "long title should be ellipsized:\n{text}"
+        );
+        assert!(
+            !text.contains("for_the_menu"),
+            "truncated tail must not appear:\n{text}"
+        );
+
+        let start =
+            format_session_start_time("sess-1762682400-abcdef123456", "2099-01-01T00:00:00Z");
+        assert!(
+            text.contains(&start),
+            "should show session start datetime {start}:\n{text}"
+        );
+        assert!(
+            !text.contains("2099-"),
+            "must not show last-activity fallback:\n{text}"
+        );
+        assert!(
+            text.contains("demo-project"),
+            "cwd should still fit beside the title:\n{text}"
+        );
+
+        // 选中行：边框 `│` 内侧立刻是 `▶`（对话框本身居中，行首空格不算）。
+        let selected = text
+            .lines()
+            .find(|l| l.contains('▶') && l.contains("a_very_long_session_title"))
+            .unwrap_or_else(|| panic!("selected session row missing:\n{text}"));
+        let after_border = selected
+            .split_once('│')
+            .map(|(_, rest)| rest)
+            .unwrap_or(selected);
+        assert!(
+            after_border.starts_with('▶'),
+            "content should hug inner border, got {selected:?}"
+        );
     }
 }
