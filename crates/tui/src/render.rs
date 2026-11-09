@@ -6143,22 +6143,32 @@ mod tool_result_fold_tests {
             wyj_i18n::tr("tool_activity.read")
         );
 
-        // 工具也跑完了：没有 current_tool_name / current_op 时落到 "Thinking"。
+        // 工具也跑完了：没有 current_tool_name / current_op 时落到 spinner.thinking。
         state.current_tool_name = None;
         state.current_op = None;
-        assert_eq!(thinking_status_label(&state), "Thinking");
+        assert_eq!(
+            thinking_status_label(&state),
+            wyj_i18n::tr("spinner.thinking")
+        );
     }
 
     #[test]
     fn thinking_status_label_falls_back_to_thinking() {
         let mut state = make_state();
-        // 无 todo / current_op / permission / plan / queue 时返回静态 "Thinking"
-        assert_eq!(thinking_status_label(&state), "Thinking");
+        // 无 todo / current_op / permission / plan / queue 时走 i18n spinner.thinking
+        // （en=Thinking / zh=思考中）；写死英文字面量会在中文 locale 下误红。
+        assert_eq!(
+            thinking_status_label(&state),
+            wyj_i18n::tr("spinner.thinking")
+        );
 
         // turn_start_time / spinner_frame 都不影响 label（label 与时间/动画无关）
         state.turn_start_time = Some(Instant::now() - std::time::Duration::from_secs(60));
         state.spinner_frame = 9;
-        assert_eq!(thinking_status_label(&state), "Thinking");
+        assert_eq!(
+            thinking_status_label(&state),
+            wyj_i18n::tr("spinner.thinking")
+        );
     }
 
     #[test]
@@ -6280,7 +6290,10 @@ mod tool_result_fold_tests {
         state.permission_dialog = None;
         state.plan_dialog = None;
         state.pending_queue.clear();
-        assert_eq!(thinking_status_label(&state), "Thinking");
+        assert_eq!(
+            thinking_status_label(&state),
+            wyj_i18n::tr("spinner.thinking")
+        );
     }
 
     #[test]
