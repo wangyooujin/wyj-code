@@ -33,7 +33,27 @@ pub const PLAN_ALLOWED_TOOLS: &[&str] = &[
     "TodoWrite",
     "Memory",
     "Agent",
+    // ToolSearch 本身只检索并暴露 schema，不执行副作用；Plan 下仍靠本白名单
+    // 拦真正的写工具。缺了它，lazy schema 折叠后模型无法按需取回只读能力。
+    "ToolSearch",
+    // ContextRecall 是 context editing 外置后的唯一召回入口；常驻可见却不在
+    // 白名单里，长规划回合一旦清理就会把模型卡在死引用上。
+    "ContextRecall",
+    // 纯只读截图（不激活窗口、不挪指针）；未注册时 catalog 无此名，列在
+    // 这里无副作用。computer / app_computer **故意不进**：Plan 白名单是
+    // 工具名级，进了会连 click/type 一并放行。
+    "window_capture",
 ];
+
+/// Plan 静态白名单之外，仍可放行的动态只读工具。
+///
+/// MCP 工具名随 server 变化，无法写进 [`PLAN_ALLOWED_TOOLS`]。只信任桥接层
+/// 根据协议 `readOnlyHint == true` 算出的 `declared_read_only`；未声明或
+/// 声明为写的 MCP 仍走白名单拒绝。内置工具不得靠这条旁路——默认
+/// `needs_permission=false` 的写漏网工具不能在 Plan 下静默放行。
+pub fn plan_allows_dynamic_read_only(tool_name: &str, declared_read_only: bool) -> bool {
+    declared_read_only && tool_name.starts_with("mcp__")
+}
 
 /// 由运行模式推导初始权限模式。
 ///
@@ -121,6 +141,9 @@ pub struct PermissionRequest {
     pub tool_name: String,
     pub input: Value,
     pub cwd: PathBuf,
+    /// 调用方已知的「工具显式声明只读」。Plan 下仅对 `mcp__*` 生效，见
+    /// [`plan_allows_dynamic_read_only`]。
+    pub declared_read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,7 +220,12 @@ impl PermissionPolicy {
 
         match &request.mode {
             PermissionMode::Plan(allowed) => {
-                if !allowed.contains(&request.tool_name) {
+                if !allowed.contains(&request.tool_name)
+                    && !plan_allows_dynamic_read_only(
+                        &request.tool_name,
+                        request.declared_read_only,
+                    )
+                {
                     return PermissionVerdict::Deny(DenyReason::new(
                         "tool_not_allowed_in_plan",
                         format!("工具 `{}` 不在 Plan 模式白名单内", request.tool_name),
@@ -706,6 +734,7 @@ mod tests {
             tool_name: tool.to_string(),
             input,
             cwd: cwd.to_path_buf(),
+            declared_read_only: false,
         }
     }
 
@@ -1055,12 +1084,60 @@ mod tests {
     fn plan_allowlist_contains_both_todo_write_and_memory() {
         assert!(PLAN_ALLOWED_TOOLS.contains(&"TodoWrite"));
         assert!(PLAN_ALLOWED_TOOLS.contains(&"Memory"));
+        assert!(
+            PLAN_ALLOWED_TOOLS.contains(&"ToolSearch"),
+            "Plan 模式需要 ToolSearch 才能展开被 lazy schema 折叠的只读能力"
+        );
+        assert!(
+            PLAN_ALLOWED_TOOLS.contains(&"ContextRecall"),
+            "Plan 模式需要 ContextRecall，否则 context editing 外置后无法召回"
+        );
+        assert!(
+            PLAN_ALLOWED_TOOLS.contains(&"window_capture"),
+            "Plan 模式可只读截图；computer/app_computer 不得进白名单"
+        );
+        assert!(!PLAN_ALLOWED_TOOLS.contains(&"computer"));
+        assert!(!PLAN_ALLOWED_TOOLS.contains(&"app_computer"));
+        assert!(!PLAN_ALLOWED_TOOLS.contains(&"KillShell"));
         // 名单里不能有重复项（否则交集运算的行为依赖顺序）。
         let mut sorted = PLAN_ALLOWED_TOOLS.to_vec();
         sorted.sort_unstable();
         let unique = sorted.len();
         sorted.dedup();
         assert_eq!(sorted.len(), unique, "Plan 白名单里有重复工具名");
+    }
+
+    #[test]
+    fn plan_dynamic_read_only_only_accepts_annotated_mcp() {
+        assert!(plan_allows_dynamic_read_only(
+            "mcp__codegraph__search",
+            true
+        ));
+        assert!(!plan_allows_dynamic_read_only(
+            "mcp__codegraph__search",
+            false
+        ));
+        assert!(!plan_allows_dynamic_read_only("ContextRecall", true));
+        assert!(!plan_allows_dynamic_read_only("computer", true));
+
+        let policy = PermissionPolicy::default();
+        let cwd = PathBuf::from("/tmp");
+        let mode = permission_mode_for(&wyj_config::AgentMode::Plan);
+        let mut allowed = request(mode.clone(), &cwd, "mcp__codegraph__search", json!({}));
+        allowed.declared_read_only = true;
+        assert!(matches!(
+            policy.evaluate(&allowed),
+            PermissionVerdict::Allow
+        ));
+
+        let denied = request(mode, &cwd, "mcp__github__create_pr", json!({}));
+        assert!(matches!(
+            policy.evaluate(&denied),
+            PermissionVerdict::Deny(DenyReason {
+                code: "tool_not_allowed_in_plan",
+                ..
+            })
+        ));
     }
 
     /// `--allowed-tools` 在 Plan 模式下是**取交集**（显式名单更窄）。

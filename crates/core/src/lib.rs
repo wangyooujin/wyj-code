@@ -100,9 +100,9 @@ pub use memory_v3::{
 };
 pub use permission::{
     check_read_target, check_search_root, is_protected_dir_component, is_protected_dir_tree,
-    is_protected_read_target, safe_resolve_write_target, DenyReason, ExecutionSurface,
-    PermissionMode, PermissionPolicy, PermissionPrompt, PermissionRequest, PermissionVerdict,
-    PROTECTED_DIR_NAMES,
+    is_protected_read_target, plan_allows_dynamic_read_only, safe_resolve_write_target, DenyReason,
+    ExecutionSurface, PermissionMode, PermissionPolicy, PermissionPrompt, PermissionRequest,
+    PermissionVerdict, PLAN_ALLOWED_TOOLS, PROTECTED_DIR_NAMES,
 };
 pub use project::{project_key, project_root};
 pub use secret::{redact_cow, redact_sensitive_text, REDACTED_SECRET};

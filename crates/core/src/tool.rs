@@ -209,6 +209,22 @@ pub trait ToolContext: Send + Sync {
     fn denial_reason(&self, _name: &str, _input: &Value) -> Option<String> {
         None
     }
+    /// 带「工具显式声明只读」的强制策略判定。Plan 下用于放行带
+    /// `readOnlyHint` 的 MCP 工具；默认忽略该标志、等同 [`Self::is_allowed`]。
+    fn is_allowed_for_tool(&self, name: &str, input: &Value, declared_read_only: bool) -> bool {
+        let _ = declared_read_only;
+        self.is_allowed(name, input)
+    }
+    /// 同 [`Self::denial_reason`]，可附带声明只读标志。
+    fn denial_reason_for_tool(
+        &self,
+        name: &str,
+        input: &Value,
+        declared_read_only: bool,
+    ) -> Option<String> {
+        let _ = declared_read_only;
+        self.denial_reason(name, input)
+    }
     /// 子 Agent 用量的共享累加器（见 [`crate::session::SubUsageTotals`]）。
     ///
     /// 子 Agent 在**自己的 `Session`** 上跑，用量天然与主会话的 `total_*`

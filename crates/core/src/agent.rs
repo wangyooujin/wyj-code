@@ -4217,10 +4217,13 @@ impl Agent {
                 // approve 只能替代交互确认，不能绕过模式白名单、路径范围、
                 // protected path 等强制策略。
                 HookOutcome::Approve => {
-                    if !ctx.is_allowed(&name, &input) {
+                    // `needs_permission=false` 对 MCP 表示 readOnlyHint=true；
+                    // Plan 静态白名单吃不下动态 mcp__ 名，靠这条声明旁路。
+                    let declared_read_only = !t.needs_permission(&input);
+                    if !ctx.is_allowed_for_tool(&name, &input, declared_read_only) {
                         // hook 只能替代「询问」，不能替代「禁止」——理由同下。
                         let reason = ctx
-                            .denial_reason(&name, &input)
+                            .denial_reason_for_tool(&name, &input, declared_read_only)
                             .unwrap_or_else(|| "被强制权限策略拒绝".to_string());
                         let msg = format!(
                             "工具 `{name}` 被强制权限策略拒绝；hook approve 无权绕过：{reason}"
@@ -4231,12 +4234,13 @@ impl Agent {
                     }
                 }
                 HookOutcome::Passthrough | HookOutcome::Continue { .. } => {
-                    if !ctx.is_allowed(&name, &input) {
+                    let declared_read_only = !t.needs_permission(&input);
+                    if !ctx.is_allowed_for_tool(&name, &input, declared_read_only) {
                         // 带具体原因：hard_deny 与 Plan 白名单是两种完全不同的
                         // 失败，「换个模式就好」和「这条命令永远不行」必须能区分，
                         // 否则模型会对着一条硬禁止规则反复换写法重试。
                         let reason = ctx
-                            .denial_reason(&name, &input)
+                            .denial_reason_for_tool(&name, &input, declared_read_only)
                             .unwrap_or_else(|| format!("工具 `{name}` 在当前模式下不被允许"));
                         let msg = format!("工具 `{name}` 被强制权限策略拒绝：{reason}");
                         (msg.clone(), ToolResultContent::Text(msg), true)

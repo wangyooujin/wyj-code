@@ -196,12 +196,22 @@ impl ToolCtx {
     /// 与 `is_allowed` / `confirm_tool` 共用同一份 `evaluate` 输入，避免两处各拼
     /// 一次 `PermissionRequest` 后字段漂移。
     fn evaluate_tool(&self, name: &str, input: &Value) -> PermissionVerdict {
+        self.evaluate_tool_with(name, input, false)
+    }
+
+    fn evaluate_tool_with(
+        &self,
+        name: &str,
+        input: &Value,
+        declared_read_only: bool,
+    ) -> PermissionVerdict {
         let request = PermissionRequest {
             mode: self.permission_mode.read().unwrap().clone(),
             surface: *self.execution_surface.read().unwrap(),
             tool_name: name.to_string(),
             input: input.clone(),
             cwd: self.cwd.clone(),
+            declared_read_only,
         };
         self.permission_policy.read().unwrap().evaluate(&request)
     }
@@ -287,11 +297,25 @@ impl ToolContext for ToolCtx {
     }
 
     fn is_allowed(&self, name: &str, input: &Value) -> bool {
-        self.denial_reason(name, input).is_none()
+        self.is_allowed_for_tool(name, input, false)
     }
 
     fn denial_reason(&self, name: &str, input: &Value) -> Option<String> {
-        match self.evaluate_tool(name, input) {
+        self.denial_reason_for_tool(name, input, false)
+    }
+
+    fn is_allowed_for_tool(&self, name: &str, input: &Value, declared_read_only: bool) -> bool {
+        self.denial_reason_for_tool(name, input, declared_read_only)
+            .is_none()
+    }
+
+    fn denial_reason_for_tool(
+        &self,
+        name: &str,
+        input: &Value,
+        declared_read_only: bool,
+    ) -> Option<String> {
+        match self.evaluate_tool_with(name, input, declared_read_only) {
             // Ask 不是拒绝：`is_allowed` 放行后由 `confirm_tool` 弹窗授权单文档。
             PermissionVerdict::Allow | PermissionVerdict::Ask(_) => None,
             PermissionVerdict::Deny(reason) => {
