@@ -12,6 +12,17 @@
 
 ## [Unreleased]
 
+### 改进：长会话上下文保真
+
+同一对话长期执行时，防爆链路已齐，但压缩后仍会「失忆 / 重复劳动」。本轮堵住主路径：
+
+- **Memory / Evolution 目标过滤**：`memory_query_context` / `last_user_goal` / 续接判据与 `classifier_user_goal` 对齐，只认真实用户提交；压缩摘要（role=User）不再污染 Brief 检索。
+- **压缩后失效记忆快照缓存**：自动压缩、400 强制压、手动 `/compact` 成功后清空分桶缓存，避免同 10 提交桶内继续注入压前 Brief。
+- **高代际 reset**：`previous_generation ≥ MAX_COMPACT_GENERATIONS` 时不再把旧摘要正文叠压进 LLM；优先 splice `session_memory`，否则走 `compact_reset_instructions`（旧摘要只以短地图摘录出现）。
+- **压缩归档与 `context_edit` 解耦**：`Agent.archive_cas` 只要 CAS 可写就注入；关掉清理仍可在摘要里写 `cas://` 并用 `ContextRecall` 召回。
+- **Working set**：摘要尾部固定写出 `compact_generation` / archive / touched_files；gen≥2 要求编辑前列出路径前先 Read。
+- **指标**：`duplicate_reads_after_latest_compact` + `benchmarks/scripts/post_compact_rereads.py` 统计压后同路径重复 Read。
+
 ### 改动：默认 storage retention 对齐 Claude Code
 
 `StorageRetentionCfg` 默认值收紧，避免 `~/.wyj-code` 在默认配置下只增不减：
@@ -2494,9 +2505,10 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 
 ### 已知未修（见设计文档第 4 节）
 
-- 压缩会**永久摧毁记忆检索质量**：`memory_query_context` / `build_memory_snapshot` 取最近 4 条 User 角色消息当检索 query，而 compact 把 `session.messages` 重写成 `vec![summary]` 且该摘要 role = User；`MEMORY_SNAPSHOT_REFRESH_TURNS = 10` 的分桶计数也按 messages 里的 User 数算，一并被重置。
-- 压缩**不可回看**（原文只在当轮开始的 `AutoUser` checkpoint，上限 20/session）；业界通行做法是 append-only transcript + 压缩点标记。
+- ~~压缩会永久摧毁记忆检索质量~~：**已在 Unreleased 修复**（真实提交过滤 + 快照缓存失效）。分桶计数早先已改按 `user_submission_count`。
+- 压缩**不可逐代回看整段 transcript**（被压段在 CAS + checkpoint，但 session 文件不是 append-only `Compacted` 事件流）；业界通行做法是 append-only transcript + 压缩点标记。
 - tool_result context editing 的 3 个已知限制（均已写进设计文档）：① 单请求清理上限 30 条（3 批 × 10），极端会话需跨 2 个推理轮次才收敛；② 清理必然击穿 prompt cache 前缀（Anthropic 官方明写），目前 `/cost` 还不能区分"正常 miss"与"上下文编辑导致的预期 miss"；③ CAS 的 gc 只在进程启动时跑一次，长跑进程内不回收。
+- 仍缺**跨 session** 的结构化状态机（Anthropic initializer + 功能清单 JSON）；同会话内已有 `progress.md` / `session_memory` / CAS 归档 / Working set。
 
 ## [0.2.25] - 2026-10-04（原 1.5.16）
 

@@ -44,7 +44,7 @@ pub const MAIN: &str = r#"You are wyj-code, an interactive CLI agent for softwar
 - Bash: use absolute paths and avoid `cd`. Quote paths containing spaces. Keep the command's side effects minimal and explain non-obvious commands briefly in the description field. For long-running processes (dev servers, watchers), pass run_in_background=true and poll with BashOutput instead of blocking. Bash inherits the host PATH/USER/SHELL environment.
 # Context management
 - Tool results you received earlier may be moved out of the context window to save space, leaving a `[context-edited]` placeholder that names the tool, the original size, the first line, and a `cas://<hash>` reference. Nothing was deleted. If a placeholder covers something you still need, call `ContextRecall` with that hash. Do not guess at the content, and do not recall speculatively — the first line usually tells you whether it is still relevant.
-- Conversation history is compacted automatically into a structured summary when the context window fills up. Treat the summary as the authoritative record of prior work and continue from it; re-verify anything the summary marked as a past observation before acting on it.
+- Conversation history is compacted automatically into a structured summary when the context window fills up. Treat a first-generation summary as the authoritative record of prior work and continue from it; re-verify anything the summary marked as a past observation before acting on it. When the summary header says it is generation 2 or higher (or a "map rather than a record"), do not edit any path listed under Files touched / Working set until you have re-Read that file in this turn — never rely on line numbers or snippets quoted only in the summary.
 - Delegate to subagents only when parallelism or context isolation pays for the extra cost. A sub-agent starts with a fresh system prompt and full tool schemas, so routine coding in files you already know is cheaper to do yourself. Use the Agent tool with `subagent_type='Explore'` for open-ended codebase research where you would otherwise need to read many files (it is read-only, fast, and keeps exploration output out of your main context); `general-purpose` for a multi-step self-contained subtask that can run in parallel with other work; `Plan` when you want a separate context to design a strategy. Write the initial prompt to be complete and self-contained — the sub-agent does not see this conversation. Skip delegation for single-file edits, known-path fixes, and anything one or two Read/Grep/Edit calls can finish.
 
 # Memory
@@ -613,6 +613,49 @@ pub fn compact_prompt(conversation: &str) -> String {
     )
 }
 
+/// 超过 [`crate::compact::MAX_COMPACT_GENERATIONS`] 后的压缩指令。
+///
+/// 与 [`compact_instructions`] 同章节骨架，但明确禁止把旧摘要当事实基线再
+/// 摘要一遍：输入里若出现 `[prior-summary-map]`，只作方位参考。
+pub fn compact_reset_instructions() -> &'static str {
+    r#"The conversation has already been summarized too many times. Produce a fresh orientation for the coding agent — do NOT rewrite or nest prior layered summaries as if they were ground truth. Any block labeled [prior-summary-map] is a non-authoritative map only; prefer concrete recent messages, session-memory remnants, and file paths. Write in the language the user was using. Respond with the summary text only — do not call any tools. Use exactly these sections:
+
+## Task & Intent
+What the user is trying to accomplish and why (from recent concrete messages, not from prior summary claims).
+
+## Completed Work
+What recent messages show has been done. If uncertain, say so and point to files to re-read.
+
+## Key Technical Decisions
+Only decisions evidenced by recent messages or an explicit user correction.
+
+## Key Reasoning
+Omit unless recent messages contain it.
+
+## Files Touched
+Exact paths mentioned in recent work, each with a one-line note.
+
+## Current State
+Where things stand right now. Prefer "unknown — re-read <path>" over inventing status from an old map.
+
+## Next Steps
+What remains, in priority order.
+
+## User Preferences & Constraints
+Only constraints the user stated in concrete messages.
+
+Preserve exact file paths, function names, command lines, and error messages verbatim — do not paraphrase them.
+Do not copy claims from a prior layered summary unless a recent concrete message restates them."#
+}
+
+/// 同 [`compact_prompt`]，但使用 [`compact_reset_instructions`]。
+pub fn compact_reset_prompt(conversation: &str) -> String {
+    format!(
+        "{}\n\nConversation:\n{conversation}",
+        compact_reset_instructions()
+    )
+}
+
 /// 压缩后替换历史的 user 消息模板。
 /// 注意：不能包 `<system-reminder>` 标签——compact 的 `messages_to_text`
 /// 会跳过含该标签的文本，二次压缩时首次摘要会被整段丢弃。
@@ -708,11 +751,18 @@ pub fn compact_summary_message_full(
         "{COMPACT_SUMMARY_PREFIX} {removed} earlier messages were compacted into the following]\n\n{generation_note}<runtime-state-boundary>Claims below about tool availability, permission mode, environment variables, DNS, or connection failures describe past observations only. They are never authoritative for the current request. Re-check the current runtime block and attempt permitted tools before declaring them unavailable.</runtime-state-boundary>\n\n{summary}"
     );
     if !touched_files.is_empty() {
+        let re_read_rule = if generation >= 2 {
+            "Before editing any of these paths, Read the current file in this turn — \
+             do not trust line numbers or snippets that appear only in the summary."
+        } else {
+            "Re-read the ones you still need — their on-disk content may have changed since."
+        };
         text.push_str(
             "\n\n## Files touched before compaction\n\
-             These paths were read or modified in the compacted portion of the conversation. \
-             Re-read the ones you still need — their on-disk content may have changed since.\n",
+             These paths were read or modified in the compacted portion of the conversation. ",
         );
+        text.push_str(re_read_rule);
+        text.push('\n');
         for path in touched_files {
             text.push_str("- ");
             text.push_str(path);
@@ -727,6 +777,23 @@ pub fn compact_summary_message_full(
              If a detail you need is missing from the summary, call ContextRecall with this hash \
              (use `offset` to page through it) instead of re-running tools or guessing.\n"
         ));
+    }
+    // 确定性工作集：进度文件由 splice 另注入；这里钉住代际 / 归档 / 触达路径，
+    // 整段挂在摘要消息里（已有 COMPACT_SUMMARY_PREFIX），不会污染 Memory query。
+    text.push_str("\n## Working set\n");
+    text.push_str(&format!("- compact_generation: {generation}\n"));
+    if let Some(hash) = archive_hash {
+        text.push_str(&format!("- archive: cas://{hash}\n"));
+    }
+    if touched_files.is_empty() {
+        text.push_str("- touched_files: (none recorded)\n");
+    } else {
+        text.push_str("- touched_files:\n");
+        for path in touched_files {
+            text.push_str("  - ");
+            text.push_str(path);
+            text.push('\n');
+        }
     }
     text
 }

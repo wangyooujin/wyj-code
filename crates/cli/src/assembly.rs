@@ -168,6 +168,9 @@ pub struct SharedAgentConfig<'a> {
     /// 已经装配好的 context editing 配置。调用方负责构造（它需要 `cfg` 与
     /// 进程级累计器），这里只负责挂上，避免两条路径各算一次而参数不同。
     pub context_edit: Option<wyj_core::context_edit::ContextEditCfg>,
+    /// 压缩归档 CAS。与 `context_edit` 可共用同一 `Arc`，但在
+    /// `[context_edit] enabled = false` 时仍要注入，否则压缩不归档。
+    pub archive_cas: Option<std::sync::Arc<wyj_core::workspace_cas::WorkspaceCas>>,
     pub plugin_output_style: Option<String>,
     /// 辅助 LLM 往返（标题 / Auto 分类器 / 记忆提取 / 演化）的统一用量累加器。
     ///
@@ -202,6 +205,7 @@ impl SharedAgentConfig<'_> {
         agent = agent
             .with_persist_cap(Some(cfg.persist_cap.clone()))
             .with_context_edit(self.context_edit)
+            .with_archive_cas(self.archive_cas)
             // 项目在 `.wyj-code/settings.json` 声明了 `verify.command` 才生效，
             // 没声明则挂 None —— 零配置项目零成本。
             .with_verify(wyj_core::verify::load_verify_cfg(self.cwd))

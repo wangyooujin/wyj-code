@@ -535,6 +535,10 @@ pub struct Agent {
     /// tool-result context editing 的装配：`None` = 关闭（不清理旧工具输出）。
     /// 见 `crate::context_edit` 与 `doc/plan/v0.2.26-context-management-plan.md`。
     context_edit: Option<crate::context_edit::ContextEditCfg>,
+    /// 压缩归档专用 CAS。可与 context_edit 共用同一池，但**不依赖**
+    /// `[context_edit] enabled`——关掉清理时仍要把被压段原文 intern 进 CAS，
+    /// 否则摘要里的 `cas://` 是死链，ContextRecall 救不回细节。
+    archive_cas: Option<std::sync::Arc<crate::workspace_cas::WorkspaceCas>>,
     /// 辅助 LLM 往返（标题 / Auto 分类器 / 记忆提取 / 演化）的共享用量累加器。
     ///
     /// 这五类调用都拿不到 `&mut Session`，各自在自己的调用点 `record()`，
@@ -710,6 +714,7 @@ impl Agent {
             title_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             persist_cap: None,
             context_edit: None,
+            archive_cas: None,
             aux_usage: None,
         }
     }
@@ -747,6 +752,18 @@ impl Agent {
     /// 完全不参与，历史只走整段摘要（v0.2.25 及更早的行为）。
     pub fn with_context_edit(mut self, cfg: Option<crate::context_edit::ContextEditCfg>) -> Self {
         self.context_edit = cfg.filter(|c| c.enabled);
+        self
+    }
+
+    /// 装配压缩归档 CAS。`None` = 压缩不归档（退回「压完原文只剩摘要」）。
+    ///
+    /// 与 [`Self::with_context_edit`] 独立：清理关闭时仍应注入可写 CAS，
+    /// 让高代际 / 长会话能 `ContextRecall` 回读被压段。
+    pub fn with_archive_cas(
+        mut self,
+        cas: Option<std::sync::Arc<crate::workspace_cas::WorkspaceCas>>,
+    ) -> Self {
+        self.archive_cas = cas;
         self
     }
 
@@ -1137,6 +1154,19 @@ impl Agent {
             return;
         };
         crate::progress::splice_into_latest_summary(&mut session.messages, root);
+    }
+
+    /// 压缩改写了历史构成后，强制下一轮重算 Memory 快照。
+    ///
+    /// 快照按「用户提交数 / 10」分桶缓存；同桶内压完若不失效，会继续注入
+    /// **压前** Brief（query 已变、摘要挡在末尾），长会话里这是静默失忆。
+    fn invalidate_memory_snapshot(&self) {
+        let mut cache = match self.memory_snapshot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        cache.bucket = None;
+        cache.text.clear();
     }
 
     pub fn memory_v3_ref(&self) -> Option<&Arc<MemoryV3Store>> {
@@ -2594,6 +2624,7 @@ impl Agent {
                         // 重新注入，避免「摘要把进度洗成一句话」。必须在重算
                         // audit 之前，否则 `/context` 会漏掉这块。
                         self.splice_progress_after_compact(session);
+                        self.invalidate_memory_snapshot();
                         if outcome.passes > 1 {
                             tracing::warn!(
                                 "上下文压缩连续跑了 {} 轮,最终估算 {} tokens (阈值 {}); \
@@ -2773,6 +2804,7 @@ impl Agent {
                                             ],
                                         ));
                                         self.splice_progress_after_compact(session);
+                                        self.invalidate_memory_snapshot();
                                     }
                                     Err(compact_error) => {
                                         tracing::warn!(
@@ -3977,16 +4009,17 @@ impl Agent {
         Ok(())
     }
 
-    /// 压缩归档用的 CAS 池（取自 context editing 的配置）。
+    /// 压缩归档用的 CAS 池。
     ///
-    /// 与 context editing 共用同一个池是有意的：两者的 blob 都记进
-    /// `Session.elided_blobs`，共用池意味着共用同一套引用计数与 `gc` 回收，
-    /// 不会出现「压缩归档的 blob 没有回收者」这种分裂。
+    /// 优先用独立注入的 [`Self::archive_cas`]；若未注入但开了 context editing，
+    /// 回退到后者的池（两者 blob 都进 `Session.elided_blobs`，共用 ref_count/gc）。
     ///
-    /// `None`（未启用 context editing，或 CAS 目录不可写）= 不归档，
-    /// 压缩行为退回旧版（直接丢弃被压缩段）。
+    /// `None`（CAS 目录不可写且两边都没装）= 不归档，压缩退回「直接丢弃被压段」。
     fn compact_archive_cas(&self) -> Option<&crate::workspace_cas::WorkspaceCas> {
-        self.context_edit.as_ref().map(|cfg| cfg.cas.as_ref())
+        self.archive_cas
+            .as_ref()
+            .map(|cas| cas.as_ref())
+            .or_else(|| self.context_edit.as_ref().map(|cfg| cfg.cas.as_ref()))
     }
 
     /// 本次用户提交内该工具是否已拿到授权。
@@ -4493,6 +4526,7 @@ impl Agent {
         .await;
         if result.is_ok() {
             self.splice_progress_after_compact(session);
+            self.invalidate_memory_snapshot();
         }
         result
     }

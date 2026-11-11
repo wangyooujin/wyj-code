@@ -45,7 +45,7 @@
 |---|---|---|---|
 | G1 | 无闭合验证回路（模型说「做完了」无人验） | §3.1 H2→H3 增益来源；§3.3 自评不可信 | **高** |
 | G2 | 无 harness 评测基线（无法回答「这次改动让模型更强还是更弱」） | §3.3 AHE +7.3pp 可迁移；§2.4 「被评测的是配置不是模型」 | **高** |
-| G3 | 长程状态靠压缩硬扛（无跨 context window 的文件化进度载体） | §3.3「compaction 并不足够」 | 中高 |
+| G3 | 长程状态：同会话已有 progress/session_memory/CAS；缺跨 session 状态机 | §3.3「compaction 并不足够」 | 中（部分缓解） |
 | G4 | 常驻工具 20 个偏多 + 工具描述是超长单行 | §3.4a / §3.4b | 中 |
 | G5 | 「默认委派子 agent」对编码类任务可能是负收益；且无 harness 组件台账 | §3.4d 多 agent 的负面条件；§4.4 元原则 | 中 |
 | G6 | 无「完成门禁」，也无 oracle 感知的采样分配 | §3.3 硬阈值 criterion；§4.1 弱验证下加宽候选无用 | 中 |
@@ -548,28 +548,31 @@ wyj-code 的开发节奏是「改一个点 → 跑 `cargo test` → 提交」，
 
 **可回退的改法**：见 §8 的完整规格（20 个任务的小规模集）。
 
-### G3 长程状态靠压缩硬扛 —— 严重度：中高
+### G3 长程状态靠压缩硬扛 —— 严重度：中（部分缓解）
 
-**现象**
+**现象（历史）**
 - §5.6 的四个状态载体里，唯一穿透压缩的 TodoWrite 实测「100% 独占一个 LLM 往返、59% 未收尾」
-- 压缩把历史替换成**模型自写摘要**（`crates/core/src/compact.rs:497`），进度信息随之退化为摘要里的一句话
-- 保留预算上限 128K 仍是「摘要 + 一小段原文」，`compact.rs:22-27` 记录的 18:1 压缩比实测会让模型「重新 grep 刚 grep 过的目录」
+- 压缩把历史替换成**模型自写摘要**，进度信息随之退化为摘要里的一句话
+- 保留预算上限 128K 仍是「摘要 + 一小段原文」，18:1 压缩比实测会让模型「重新 grep 刚 grep 过的目录」
+
+**已落地（同会话）**
+- `.wyj-code/progress.md` + 压缩后 `splice_into_latest_summary`（TodoWrite 双写）
+- `session_memory` 滚动文档（覆盖段可 splice，避免叠压）
+- CAS 压缩归档 + `ContextRecall`；归档 CAS 与 `context_edit.enabled` 解耦
+- 高代际 reset（禁止旧摘要叠压）+ Working set（generation / archive / touched_files）
+- 指标：`duplicate_reads_after_latest_compact` / `benchmarks/scripts/post_compact_rereads.py`
+
+**仍缺**
+- **跨 session** 的 initializer + 结构化功能清单 JSON（Anthropic §3.3 全案）
+- append-only transcript 上的压缩点回看 UI
 
 **外部证据**
-- §3.3 Anthropic：**「compaction 并不足够」**——Opus 4.5 循环跑只给高层 prompt，仍做不出生产级 web app；解法是 initializer + `claude-progress.txt` + **200+ 条功能清单 JSON** + 每 session 结束前 git commit + 写进度
-- §4.6 原则 11：长程任务必须有**持久化的、可寻址的**状态载体（file-backed state 在 OSWorld +5.5pp / SWE +1.6pp）
-- §3.4c：summary-based compaction 在中等预算下**不优于 FIFO 截断**，且会削弱近期交互的影响、增加 blocked actions 与重复探索
+- §3.3 Anthropic：**「compaction 并不足够」**——解法是 initializer + progress 文件 + 功能清单 JSON + 每 session 结束前提交
+- §4.6 原则 11：长程任务必须有**持久化的、可寻址的**状态载体
+- §3.4c：summary-based compaction 在中等预算下不优于 FIFO，且增加重复探索
 
-**根因**
-wyj-code 的上下文管理是**「把历史压小」**的思路，而 Anthropic 的思路是**「把状态外置」**。前者是连续量优化，后者是拓扑改变。
-
-**影响面**
-长任务（跨十几个文件、几十轮工具、中途被压缩打断）——这恰恰是 wyj-code 自己在 `crates/core/CLAUDE.md:116` 声明要服务的场景。§5.7 的第 3 条实测数据（压缩后模型失忆、重复劳动）就是这一缺口的直接症状。
-
-**可回退的改法**
-- 新增**文件化进度载体**（如 `.wyj-code/progress.md` 或 JSON）：模型可写、框架可在压缩时**优先保留**（不依赖摘要）、跨 session 保留
-- 格式用 JSON 而非 Markdown（Anthropic 明确观察：「模型不太会不当修改或覆盖 JSON 文件」——弱证据但具体）
-- 压缩时把该文件内容**作为独立消息保留**，不进摘要
+**根因（剩余部分）**
+同会话外置状态已接上；跨会话 / 跨仓库的拓扑级状态机仍未做。
 
 ### G4 常驻工具偏多 + 工具描述质量 —— 严重度：中
 
@@ -659,7 +662,7 @@ TodoWrite 被设计成**给用户看的进度面板**（这是它的原始定位
 
 | ID | 名称 | 改动面 | 开关 | 验证方式 |
 |---|---|---|---|---|
-| P1-1 | **文件化进度载体**：`.wyj-code/progress.md`（或 JSON），压缩时作为独立消息保留、跨 session 保留 | `crates/core/src/compact.rs` + 新增读写工具 | `[harness].progress_file = false` | 长程任务（>50 轮）的中途压缩后重复劳动率 |
+| P1-1 | **文件化进度载体**：`.wyj-code/progress.md`，压缩后 splice；同会话已落地。跨 session 结构化清单仍缺 | `crates/core/src/progress.rs` + TodoWrite | 随 `tools.todo_enabled` | `duplicate_reads_after_latest_compact` / `post_compact_rereads.py` |
 | P1-2 | **常驻工具逐条复审**：20 → 目标 ≤12，每条记录移除后的可发现性判据 | `crates/core/src/agent.rs:162-193` | `[harness].lazy_core_tools` 白名单（默认 = 现行 20 项） | 工具选择准确率（§3.4b 的口径）+ 各工具实际调用率 |
 | P1-3 | **委派策略可选化**：把「默认委派」改为按可并行性判定的措辞 | `crates/core/src/prompts.rs:48` + `descriptions.rs:29` | `[harness].delegation_policy = "default"`（可选 `"parallel-aware"`） | 编码类任务的成功率 / token 成本对比 |
 | P1-4 | **oracle 感知的采样分配**：仅在有真 oracle 时启用 best-of-N | `crates/core/src/agent.rs` | `[harness].best_of_n = 0`（默认关） | 有 oracle 任务的 Pass@k 曲线（§3.4e 口径） |

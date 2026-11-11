@@ -4256,6 +4256,83 @@ fn classifier_goal_uses_only_the_latest_concrete_request() {
     assert_eq!(classifier_user_goal(&session), "改成打开备忘录");
 }
 
+/// 压缩摘要是 role=User，但绝不能进 Memory 检索 query / Evolution 目标。
+#[test]
+fn memory_and_goal_helpers_ignore_compact_summary_messages() {
+    use wyj_api::types::{ContentBlock, Message, Role};
+
+    let mut session = crate::session::Session::default();
+    push_user_text(&mut session, "修复登录态过期后的跳转");
+    session.messages.push(Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: "先读 auth.rs".to_string(),
+        }],
+    });
+    let summary = format!(
+        "{}\n\n摘要声称用户在改支付模块，且否定了登录修复。",
+        crate::prompts::COMPACT_SUMMARY_PREFIX
+    );
+    push_user_text(&mut session, &summary);
+
+    let query = memory_query_context(&session);
+    assert!(
+        query.contains("修复登录态过期后的跳转"),
+        "压后检索应保留真实目标: {query}"
+    );
+    assert!(
+        !query.contains(crate::prompts::COMPACT_SUMMARY_PREFIX),
+        "检索 query 不得含摘要前缀: {query}"
+    );
+    assert!(
+        !query.contains("支付模块"),
+        "检索 query 不得吃进摘要正文: {query}"
+    );
+
+    let goal = last_user_goal(&session);
+    assert_eq!(goal, "修复登录态过期后的跳转");
+    assert!(!goal.contains(crate::prompts::COMPACT_SUMMARY_PREFIX));
+}
+
+/// 摘要挡在末尾时，「继续」仍应命中续接注入，而不是被摘要全文挡住。
+#[test]
+fn build_memory_snapshot_continues_after_compact_summary() {
+    let base = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let store = crate::MemoryV3Store::new(base.path(), project.path()).unwrap();
+    seed_task(
+        &store,
+        "修复登录态过期后的跳转",
+        TaskStatus::InProgress,
+        None,
+    );
+
+    let mut session = crate::session::Session::default();
+    push_user_text(&mut session, "修复登录态过期后的跳转");
+    let summary = format!(
+        "{}\n\nold work on payments",
+        crate::prompts::COMPACT_SUMMARY_PREFIX
+    );
+    push_user_text(&mut session, &summary);
+    push_user_text(&mut session, "继续");
+
+    let snapshot = build_memory_snapshot(&store, &session);
+    assert!(
+        snapshot.contains("Resuming task"),
+        "压后「继续」应触发续接注入: {snapshot}"
+    );
+    assert!(
+        snapshot.contains("修复登录态过期后的跳转"),
+        "续接任务名应来自真实进度: {snapshot}"
+    );
+    let query = memory_query_context(&session);
+    assert!(
+        query.contains("修复登录态过期后的跳转"),
+        "Brief 检索仍应带着压前主题: {query}"
+    );
+    assert!(!query.contains(crate::prompts::COMPACT_SUMMARY_PREFIX));
+}
+
 #[test]
 fn continuation_suffix_resumes_in_progress_task_with_next_step() {
     let base = tempfile::tempdir().unwrap();

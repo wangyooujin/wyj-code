@@ -276,23 +276,14 @@ fn is_framework_user_text(text: &str) -> bool {
         || text.starts_with("<todo-resume>")
 }
 
+/// 最近一次**真实用户提交**的目标文本。
+///
+/// 与 [`classifier_user_goal`] 同源过滤：跳过工具结果、压缩摘要与框架提醒。
+/// 压缩后会话末尾往往是摘要消息（role=User），旧实现按裸 Role 取值会把整段
+/// 摘要当「用户目标」喂给 Evolution / 记忆检索——那是长会话失忆的放大器。
 pub(super) fn last_user_goal(session: &Session) -> String {
-    session
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == wyj_api::types::Role::User)
-        .map(|message| {
-            let text = message
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.trim()),
-                    _ => None,
-                })
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
+    latest_user_submission(session)
+        .map(|text| {
             if text.is_empty() {
                 "attachment-only user goal".to_string()
             } else {
@@ -300,6 +291,15 @@ pub(super) fn last_user_goal(session: &Session) -> String {
             }
         })
         .unwrap_or_else(|| "unknown user goal".to_string())
+}
+
+fn latest_user_submission(session: &Session) -> Option<String> {
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| is_user_submission(message))
+        .map(submission_text)
 }
 
 /// 分类器看到的用户目标。
@@ -360,27 +360,27 @@ fn submission_text(message: &wyj_api::types::Message) -> String {
 
 /// Memory v3 检索不能只看最后一句。把最近几个真实 user task 合并后，像“继续”
 /// “再分析一下”这样的续接请求仍然携带上一个主题，同时不把 assistant 推断当查询。
+///
+/// 过滤口径与 [`classifier_user_goal`] 相同（[`is_user_submission`]）：压缩摘要
+/// 是 role=User，绝不能进检索 query，否则 Brief 建在「摘要的摘要」上。
 pub(super) fn memory_query_context(session: &Session) -> String {
-    let mut goals = session
-        .messages
-        .iter()
-        .rev()
-        .filter(|message| message.role == wyj_api::types::Role::User)
-        .filter_map(|message| {
-            let text = message
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.trim()),
-                    _ => None,
-                })
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
-            (!text.is_empty()).then_some(text)
-        })
-        .take(4)
-        .collect::<Vec<_>>();
+    const RECENT: usize = 4;
+    let mut goals = Vec::new();
+    for message in session.messages.iter().rev() {
+        if !is_user_submission(message) {
+            continue;
+        }
+        let text = submission_text(message);
+        let text = if text.is_empty() {
+            "attachment-only user goal".to_string()
+        } else {
+            text
+        };
+        goals.push(text);
+        if goals.len() == RECENT {
+            break;
+        }
+    }
     goals.reverse();
     if goals.is_empty() {
         "unknown user goal".to_string()
@@ -433,23 +433,9 @@ pub(super) fn build_memory_snapshot(memory: &crate::MemoryV3Store, session: &Ses
     let query_context = memory_query_context(session);
     let brief = memory.project_brief(&query_context);
 
-    let last_query = session
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == wyj_api::types::Role::User)
-        .map(|message| {
-            message
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
+    // 续接判据必须看真实提交：压缩摘要挡在末尾时，旧实现会把摘要全文当
+    // last_query，「继续」注入永久失效，Brief 还被摘要词污染。
+    let last_query = last_user_goal(session);
 
     let mut out = brief;
     if is_continuation_request(&last_query) {

@@ -40,9 +40,12 @@ const COMPACT_MIN_MESSAGES: usize = 3;
 /// `MAX_COMPACT_PASSES` 只挡单次请求内的重复压缩，挡不住跨回合、
 /// 跨小时的长会话累积。
 ///
-/// 超过这个代际后不再做「就地再压」，而是走 `compact_reset_note`：
-/// 摘要消息里显式声明「本次是第 N 代」，让模型知道该去 CAS 归档里核原文，
-/// 而不是把一份 N 代摘要当成事实基线继续推理。
+/// 摘要叠压的软上限。
+///
+/// 超过后**仍允许压缩**（拒压会结构性撞穿窗口），但不再把旧摘要正文喂进
+/// 「摘要的摘要」主路径：优先 splice 滚动文档；否则走
+/// [`crate::prompts::compact_reset_instructions`]，输入以非摘要消息为主，
+/// 旧摘要只以短地图摘录出现。摘要头仍声明代际，并指向 CAS 归档。
 pub const MAX_COMPACT_GENERATIONS: u32 = 4;
 
 /// `compact_session` 的两种「已无可压缩」信号。
@@ -809,6 +812,7 @@ async fn compact_session_full(
         .max()
         .unwrap_or(0);
     let generation = previous_generation + 1;
+    let past_generation_cap = previous_generation >= MAX_COMPACT_GENERATIONS;
 
     // 摘要 token 上限：取上下文窗口的 1/10，但不超过 16000
     let summary_max_tokens = (context_window / 10).min(16_000);
@@ -824,6 +828,9 @@ async fn compact_session_full(
     //
     // 不复用时如实记录原因，而不是静默退化——「开了但没生效」和「没开」
     // 在 `/context` 上必须是两种不同的结论。
+    //
+    // 高代际时这条路径尤其关键：文档本身不是「摘要的摘要」，splice 它等于
+    // 直接兑现「禁止叠压旧摘要」而不必再付一次 LLM。
     let covered_before = session_memory
         .map(|memory| memory.read_state().covered_messages)
         .unwrap_or(0);
@@ -834,6 +841,7 @@ async fn compact_session_full(
         tracing::debug!(
             keep_from,
             covered = covered_before,
+            past_generation_cap,
             "滚动工作文档未覆盖本次压缩段，退回全量摘要"
         );
     }
@@ -846,6 +854,7 @@ async fn compact_session_full(
             used_rolled_doc = true;
             tracing::debug!(
                 doc_bytes = doc.len(),
+                past_generation_cap,
                 "复用会话滚动工作文档，跳过全量摘要往返"
             );
             // 记账口径必须与真实往返区分开：这里**没有**发生 LLM 调用，
@@ -861,55 +870,118 @@ async fn compact_session_full(
                 reasoning_tokens: 0,
             }
         }
-        None => match prefix {
-            Some(prefix) => {
-                // ── 前缀复用路径 ──
-                // 请求 = 「主对话前缀」+ 尾部一条指令。前缀逐字节等于本轮真实请求
-                // 的开头，因此 provider 的前缀缓存能命中到指令之前；指令本身按
-                // 全价计，但它只有几百 token。
-                //
-                // 两个必须守住的点：
-                //   1. `messages` 直接用 `session.messages[..keep_from]` 的切片，
-                //      不重新序列化、不做任何改写——任何一处改写都会让前缀失配。
-                //   2. 尾部指令走一条**新的 user 消息**，不合并进最后一条已有消息。
-                //      合并会改写前缀的最后一个元素，缓存命中点随之后退到它之前。
-                //
-                // `reset_entire_session` 时前缀为空（`keep_from == 0`），复用没有
-                // 意义但也没有害处：请求退化成「一条 user 指令」，与旧路径等价。
-                let mut req: Vec<Message> = to_compact.clone();
-                req.push(Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text {
-                        text: crate::prompts::compact_instructions().to_string(),
-                    }],
-                });
-                provider
-                    .complete(
-                        &prefix.system,
-                        &req,
-                        prefix.tools,
-                        &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
-                    )
-                    .await?
+        None => {
+            // 高代际：从 LLM 输入里剥掉旧摘要正文，只留非摘要消息 + 可选短地图。
+            // 归档仍用完整 `to_compact`（见下方 intern）。
+            let (llm_source, instruction_text, independent_prompt) = if past_generation_cap {
+                let mut source = strip_summary_messages(&to_compact);
+                if let Some(map) = prior_summary_map_excerpt(&to_compact) {
+                    source.insert(
+                        0,
+                        Message {
+                            role: Role::User,
+                            content: vec![ContentBlock::Text {
+                                text: format!("[prior-summary-map — non-authoritative]\n{map}"),
+                            }],
+                        },
+                    );
+                }
+                // 文档未覆盖 keep_from 时仍可读残片作方位（不满足覆盖度不能
+                // 单独当摘要，但可以作为 reset 输入的一部分）。
+                if let Some(remnant) = session_memory
+                    .filter(|memory| !memory.covers(keep_from))
+                    .and_then(|memory| memory.summary_text())
+                {
+                    source.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: format!("[session-memory remnant]\n{remnant}"),
+                        }],
+                    });
+                }
+                if source.is_empty() {
+                    source.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: "[prior-summary-map — non-authoritative]\n(no recoverable concrete messages; rebuild orientation from the archive and workspace)".to_string(),
+                        }],
+                    });
+                }
+                tracing::info!(
+                    previous_generation,
+                    generation,
+                    source_msgs = source.len(),
+                    "高代际压缩：走 reset 路径，不把旧摘要正文再喂进叠压"
+                );
+                (
+                    source,
+                    crate::prompts::compact_reset_instructions().to_string(),
+                    true,
+                )
+            } else {
+                (
+                    to_compact.clone(),
+                    crate::prompts::compact_instructions().to_string(),
+                    false,
+                )
+            };
+
+            match prefix {
+                // 高代际 reset 故意改写了 messages（剥摘要），前缀与主对话不再
+                // 逐字节相等——复用只会浪费整段历史的 cache write。改走独立请求。
+                Some(prefix) if !independent_prompt => {
+                    // ── 前缀复用路径 ──
+                    // 请求 = 「主对话前缀」+ 尾部一条指令。前缀逐字节等于本轮真实请求
+                    // 的开头，因此 provider 的前缀缓存能命中到指令之前；指令本身按
+                    // 全价计，但它只有几百 token。
+                    //
+                    // 两个必须守住的点：
+                    //   1. `messages` 直接用 `session.messages[..keep_from]` 的切片，
+                    //      不重新序列化、不做任何改写——任何一处改写都会让前缀失配。
+                    //   2. 尾部指令走一条**新的 user 消息**，不合并进最后一条已有消息。
+                    //      合并会改写前缀的最后一个元素，缓存命中点随之后退到它之前。
+                    //
+                    // `reset_entire_session` 时前缀为空（`keep_from == 0`），复用没有
+                    // 意义但也没有害处：请求退化成「一条 user 指令」，与旧路径等价。
+                    let mut req: Vec<Message> = llm_source;
+                    req.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: instruction_text,
+                        }],
+                    });
+                    provider
+                        .complete(
+                            &prefix.system,
+                            &req,
+                            prefix.tools,
+                            &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
+                        )
+                        .await?
+                }
+                _ => {
+                    // ── 独立请求路径（无前缀可复用，或高代际故意不用前缀） ──
+                    let conv_text = messages_to_text(&llm_source);
+                    let prompt = if past_generation_cap {
+                        crate::prompts::compact_reset_prompt(&conv_text)
+                    } else {
+                        crate::prompts::compact_prompt(&conv_text)
+                    };
+                    let req = vec![Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text { text: prompt }],
+                    }];
+                    provider
+                        .complete(
+                            &wyj_api::SystemPrompt::stable_only(crate::prompts::COMPACT_SYSTEM),
+                            &req,
+                            &[],
+                            &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
+                        )
+                        .await?
+                }
             }
-            None => {
-                // ── 独立请求路径（无前缀可复用） ──
-                let conv_text = messages_to_text(&to_compact);
-                let prompt = crate::prompts::compact_prompt(&conv_text);
-                let req = vec![Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text { text: prompt }],
-                }];
-                provider
-                    .complete(
-                        &wyj_api::SystemPrompt::stable_only(crate::prompts::COMPACT_SYSTEM),
-                        &req,
-                        &[],
-                        &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
-                    )
-                    .await?
-            }
-        },
+        }
     };
 
     // 压缩本身是一次真实的 LLM 往返，必须计入用量。旧实现直接丢弃
@@ -1418,6 +1490,75 @@ fn collect_touched_files(messages: &[Message]) -> Vec<String> {
     out
 }
 
+/// 压缩后重复劳动指标：自**最近一条**摘要消息起，对同一 `file_path` 的
+/// `Read` 调用里，第二次及以后算作重复（返回重复次数之和）。
+///
+/// 用于长会话保真验收（harness T4）：压后若模型仍把摘要里列过的路径整份
+/// 再读一遍，这个数字会抬高。没有摘要消息时返回 0。
+pub fn duplicate_reads_after_latest_compact(messages: &[Message]) -> u32 {
+    let Some(start) = messages
+        .iter()
+        .rposition(|message| crate::prompts::summary_generation(message).is_some())
+    else {
+        return 0;
+    };
+    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut dupes = 0u32;
+    for message in &messages[start + 1..] {
+        for block in &message.content {
+            let ContentBlock::ToolUse { name, input, .. } = block else {
+                continue;
+            };
+            if name != "Read" {
+                continue;
+            }
+            let Some(path) = input
+                .get("file_path")
+                .or_else(|| input.get("path"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            else {
+                continue;
+            };
+            let count = seen.entry(path.to_string()).or_insert(0);
+            *count += 1;
+            if *count >= 2 {
+                dupes += 1;
+            }
+        }
+    }
+    dupes
+}
+
+/// 从压缩段里去掉既有摘要消息，供高代际 reset 路径使用。
+fn strip_summary_messages(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .filter(|message| crate::prompts::summary_generation(message).is_none())
+        .cloned()
+        .collect()
+}
+
+/// 旧摘要的短摘录（非权威地图）。只取正文前几百字，避免又把整份摘要喂回去。
+fn prior_summary_map_excerpt(messages: &[Message]) -> Option<String> {
+    let latest = messages
+        .iter()
+        .rev()
+        .find(|message| crate::prompts::summary_generation(message).is_some())?;
+    let text = latest.content.iter().find_map(|block| match block {
+        ContentBlock::Text { text } => Some(text.as_str()),
+        _ => None,
+    })?;
+    // 跳过头部元数据，取摘要正文开头。
+    let body = text
+        .split_once("</runtime-state-boundary>")
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or(text);
+    let excerpt = crate::textutil::truncate_chars(body, 800, true);
+    (!excerpt.is_empty()).then_some(excerpt)
+}
+
 fn messages_to_text(messages: &[Message]) -> String {
     messages
         .iter()
@@ -1796,16 +1937,21 @@ mod tests {
     }
 
     /// 超过代际上限后措辞要更强：从「可能漂移」升级成「当地图用」。
+    /// 同时钉住：旧摘要正文不得再整段喂进叠压（canary 放在 800 字截断之外）。
     #[tokio::test]
     async fn past_the_generation_cap_the_wording_gets_stronger() {
-        let mut session = Session::new();
+        let canary = "UNIQUE_NESTED_SUMMARY_CANARY_SHOULD_NOT_REACH_LLM";
+        let mut deep_body = "第四代摘要\n".to_string();
+        deep_body.push_str(&"pad ".repeat(300));
+        deep_body.push_str(canary);
         let deep = crate::prompts::compact_summary_message_full(
             99,
-            "第四代摘要",
+            &deep_body,
             &[],
             None,
             MAX_COMPACT_GENERATIONS,
         );
+        let mut session = Session::new();
         session.messages.push(user_text(&deep));
         for i in 0..6 {
             session
@@ -1818,7 +1964,8 @@ mod tests {
                 }],
             });
         }
-        let result = compact_session(&mut session, &StaticSummaryProvider, 200_000, None)
+        let provider = RecordingSummaryProvider::default();
+        let result = compact_session(&mut session, &provider, 200_000, None)
             .await
             .expect("应能压缩");
         assert_eq!(result.generation, MAX_COMPACT_GENERATIONS + 1);
@@ -1827,6 +1974,161 @@ mod tests {
             text.contains("past the point where"),
             "超过上限后应换成更强的措辞: {text}"
         );
+        assert!(
+            text.contains("## Working set"),
+            "压后摘要必须带工作集块: {text}"
+        );
+        let fed = provider.last_prompt.lock().unwrap().clone();
+        assert!(
+            fed.contains("do NOT rewrite or nest prior layered summaries")
+                || fed.contains("[prior-summary-map"),
+            "高代际必须走 reset 指令: {fed}"
+        );
+        assert!(
+            !fed.contains(canary),
+            "旧摘要截断之外的 canary 不得进入 LLM 输入: {fed}"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingSummaryProvider {
+        last_prompt: std::sync::Mutex<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RecordingSummaryProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<wyj_api::provider::EventStream> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn complete(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<wyj_api::types::CompletionResult> {
+            let blob = messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            *self.last_prompt.lock().unwrap() = blob;
+            Ok(wyj_api::types::CompletionResult {
+                content: vec![ContentBlock::Text {
+                    text: "## Task & Intent\n继续完成当前任务。".to_string(),
+                }],
+                stop_reason: wyj_api::types::StopReason::EndTurn,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                reasoning_tokens: 0,
+            })
+        }
+    }
+
+    /// 有 CAS 时压缩必须归档，摘要里写出可召回的 cas://——与 context_edit
+    /// 是否开启无关（本测试只调 compact API，不经 Agent.context_edit）。
+    #[tokio::test]
+    async fn compact_with_cas_writes_archive_uri_into_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = crate::workspace_cas::WorkspaceCas::open(dir.path(), 0).expect("cas");
+        let mut session = Session::new();
+        for i in 0..6 {
+            session
+                .messages
+                .push(user_text(&format!("任务 {i}: {}", "x".repeat(2_000))));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "已记录".to_string(),
+                }],
+            });
+        }
+        let result = compact_session_with_archive(
+            &mut session,
+            &StaticSummaryProvider,
+            200_000,
+            None,
+            Some(&cas),
+        )
+        .await
+        .expect("应能压缩");
+        let hash = result.archived_hash.expect("必须归档");
+        let text = session.messages[0].text();
+        assert!(
+            text.contains(&format!("cas://{hash}")),
+            "摘要必须带归档 URI: {text}"
+        );
+        assert!(text.contains("## Working set"), "摘要必须带工作集: {text}");
+        let bytes = cas.get(&hash).expect("可读回归档");
+        assert!(!bytes.is_empty(), "CAS 里必须能取回被压段");
+    }
+
+    /// 压后对同一路径的第二次 Read 计入重复劳动指标。
+    #[test]
+    fn duplicate_reads_metric_counts_repeats_after_summary() {
+        let summary =
+            crate::prompts::compact_summary_message_full(2, "body", &["src/a.rs".into()], None, 1);
+        let messages = vec![
+            user_text(&summary),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "r1".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({ "file_path": "src/a.rs" }),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "r2".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({ "file_path": "src/a.rs" }),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "r3".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({ "file_path": "src/b.rs" }),
+                }],
+            },
+        ];
+        assert_eq!(duplicate_reads_after_latest_compact(&messages), 1);
+        assert_eq!(duplicate_reads_after_latest_compact(&messages[..1]), 0);
+    }
+
+    /// gen≥2 的 Files touched 段必须要求「编辑前先 Read」。
+    #[test]
+    fn generation_two_summary_requires_reread_before_edit() {
+        let text = crate::prompts::compact_summary_message_full(
+            3,
+            "body",
+            &["src/main.rs".into()],
+            Some("abcd"),
+            2,
+        );
+        assert!(
+            text.contains("Before editing any of these paths, Read the current file"),
+            "{text}"
+        );
+        assert!(text.contains("## Working set"), "{text}");
+        assert!(text.contains("compact_generation: 2"), "{text}");
+        assert!(text.contains("cas://abcd"), "{text}");
     }
 
     /// `summary_generation` 只认摘要前缀：普通用户消息不该被误判成摘要。

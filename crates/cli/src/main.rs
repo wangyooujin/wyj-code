@@ -2663,6 +2663,9 @@ async fn main() -> Result<()> {
             workspace_cas.clone(),
             context_edit_totals.clone(),
         ),
+        // 压缩归档与清理解耦：关掉 context_edit 时仍注入同一 CAS，
+        // 否则被压段原文无处可召回。
+        archive_cas: workspace_cas.clone(),
         // 已在上面按首建顺序追加过（Plan / computer-use / TodoWrite 三段），
         // 这里传 None 避免二次 append。
         plugin_output_style: None,
@@ -2949,6 +2952,7 @@ async fn main() -> Result<()> {
                 workspace_cas_for_rebuild.clone(),
                 context_edit_totals_for_rebuild.clone(),
             ),
+            archive_cas: workspace_cas_for_rebuild.clone(),
             plugin_output_style: plugin_output_style_for_rebuild.clone(),
             aux_usage: Some(aux_usage_for_rebuild.clone()),
             session_memory: session_memory_for_rebuild.clone(),
