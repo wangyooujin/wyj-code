@@ -56,8 +56,15 @@ impl AppState {
         let is_new_round = is_new_todo_round(self.current_todos.as_deref(), &items);
         // 仅「刚全部完成」自动收成一行；新一轮默认展开。同轮 TodoUpdate
         // 不改 `todo_panel_expanded`，避免冲掉用户 Ctrl+T 的手动折叠。
+        //
+        // 收成摘要时必须同时离开 Todos 焦点：三层展开改动后，已聚焦时
+        // Ctrl+T 只切步骤、不再置 `todo_panel_expanded`。若焦点还停在已折叠
+        // 的整表上，用户按 Ctrl+T 会以为「展开坏了」。
         if new_all_done && !old_all_done {
             self.todo_panel_expanded = false;
+            if matches!(self.ui_focus, UiFocus::Todos | UiFocus::TodoDetail) {
+                let _ = self.leave_content_focus();
+            }
         } else if is_new_round {
             self.todo_panel_expanded = true;
         }
@@ -490,11 +497,12 @@ impl AppState {
 
     /// Ctrl+T — 展开/折叠任务列表面板，并把内容焦点交给它。
     ///
-    /// Ctrl+T：未聚焦时展开整表并聚焦选中任务；已聚焦 Todos/TodoDetail 时
-    /// 只切换**选中任务**的步骤摘要层（`todo_steps_expanded`）。
+    /// - 整表折叠（含全部完成后的一行摘要）→ 展开整表并聚焦；
+    /// - 已聚焦且整表已展开 → 只切换选中任务的步骤摘要层；
+    /// - 未聚焦 → 展开整表并聚焦。
     ///
-    /// 全部完成时整表默认收成一行摘要；第一次 Ctrl+T 仍可展开整表复盘。
-    /// 已聚焦后再次 Ctrl+T **不再**翻转折叠整表。
+    /// 已聚焦但整表已折叠时绝不能只切步骤：那正是「Ctrl+T 按了没反应」的成因
+    /// （`apply_todo_snapshot` 全部完成时会收面板，焦点却可能还停在 Todos）。
     pub(super) fn toggle_todo_panel(&mut self) {
         let Some(items) = self.current_todos.as_deref() else {
             return;
@@ -503,7 +511,7 @@ impl AppState {
             return;
         }
         let focused_on_todo = matches!(self.ui_focus, UiFocus::Todos | UiFocus::TodoDetail);
-        if focused_on_todo {
+        if focused_on_todo && self.todo_panel_expanded {
             if let Some(id) = self.selected_todo_id.clone() {
                 if self.todo_steps_expanded.contains(&id) {
                     self.todo_steps_expanded.remove(&id);

@@ -12431,6 +12431,45 @@ mod todo_stats_tests {
         assert!(!state.todo_resume_pending, "没有未完成项时不该续跑");
     }
 
+    /// 桌面「回合完成」通知的门控输入：截断、或正常结束但仍有 pending，都不得
+    /// 报完成。InProgress 在正常结束时已收口，因此这里钉的是 Pending 残留。
+    #[test]
+    fn turn_finished_notify_gate_matches_truncated_and_pending_todos() {
+        let mut truncated = make_state();
+        truncated.apply_agent_event(AgentEvent::TodoUpdate(vec![todo(
+            "a",
+            TodoStatus::InProgress,
+        )]));
+        truncated.apply_agent_event(AgentEvent::TurnDone { truncated: true });
+        assert!(!wyj_core::notify::should_emit_turn_finished(
+            true,
+            !truncated.unfinished_todos().is_empty(),
+        ));
+
+        let mut pending_left = make_state();
+        pending_left.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("a", TodoStatus::Completed),
+            todo("b", TodoStatus::Pending),
+        ]));
+        pending_left.apply_agent_event(AgentEvent::TurnDone { truncated: false });
+        assert!(!wyj_core::notify::should_emit_turn_finished(
+            false,
+            !pending_left.unfinished_todos().is_empty(),
+        ));
+        assert_eq!(pending_left.unfinished_todos().len(), 1);
+
+        let mut done = make_state();
+        done.apply_agent_event(AgentEvent::TodoUpdate(vec![todo(
+            "a",
+            TodoStatus::Completed,
+        )]));
+        done.apply_agent_event(AgentEvent::TurnDone { truncated: false });
+        assert!(wyj_core::notify::should_emit_turn_finished(
+            false,
+            !done.unfinished_todos().is_empty(),
+        ));
+    }
+
     /// 续跑次数触顶后不再自动续跑。
     ///
     /// 防的是「模型每轮都撞顶、清单每轮都不更新」：没有这道闸，每个
@@ -12850,6 +12889,37 @@ mod todo_stats_tests {
         );
         assert_eq!(state.ui_focus, UiFocus::Todos);
         assert_eq!(state.selected_todo_id.as_deref(), Some("a"));
+    }
+
+    /// 回归：全部完成自动折叠时若焦点仍停在 Todos，旧逻辑把 Ctrl+T 当成
+    /// 「切步骤」直接 return，整表永远展不开。
+    #[test]
+    fn ctrl_t_reexpands_when_focused_but_panel_was_auto_collapsed() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("a", TodoStatus::Completed),
+            todo("b", TodoStatus::InProgress),
+        ]));
+        state.toggle_todo_panel();
+        assert!(state.todo_panel_expanded);
+        assert_eq!(state.ui_focus, UiFocus::Todos);
+
+        // 模型把最后一项标完成 → 自动收成摘要；焦点可能因时序仍在 Todos
+        // （即便 leave_content_focus 跑了，也用手动置位模拟漏清焦点）。
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("a", TodoStatus::Completed),
+            todo("b", TodoStatus::Completed),
+        ]));
+        assert!(!state.todo_panel_expanded, "全部完成应自动折叠");
+        state.ui_focus = UiFocus::Todos;
+        state.selected_todo_id = Some("a".into());
+
+        state.toggle_todo_panel();
+        assert!(
+            state.todo_panel_expanded,
+            "已聚焦但整表折叠时 Ctrl+T 必须先展开整表，不能只切步骤"
+        );
+        assert_eq!(state.ui_focus, UiFocus::Todos);
     }
 
     #[test]

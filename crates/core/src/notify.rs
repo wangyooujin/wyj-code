@@ -311,6 +311,17 @@ fn debug_sink_failure_once(sink_name: &str, err: &str) {
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
+/// 「回合完成」桌面通知是否该发。
+///
+/// 通知文案是「wyj-code 回合完成」，用户读成任务做完了。因此：
+/// - 预算截断（`truncated`）后常会自动续跑——此时发完成通知是假完成；
+/// - 清单仍有未完成项（含 `pending`）——模型只是停了工具循环，任务没交卷。
+///
+/// 两边都为 false 才发。TUI / CLI 共用这一判据，避免入口各写一套。
+pub fn should_emit_turn_finished(truncated: bool, has_unfinished_todos: bool) -> bool {
+    !truncated && !has_unfinished_todos
+}
+
 /// 初始化全局 dispatcher。`cfg` 内含 master / 通道 / 事件 / rate-limit 配置。
 /// 多次调用安全（first-wins：`DISPATCHER` 已 set 时 no-op）。
 pub fn init(cfg: &NotifyCfg) {
@@ -927,5 +938,19 @@ mod tests {
         // OSC 777 的标题里出现分号会把它劈成两个字段。
         let seq = osc_notification_sequence(TerminalNotify::Osc777, "a;b", "body").unwrap();
         assert_eq!(seq, "\x1b]777;notify;a b;body\x07");
+    }
+
+    #[test]
+    fn turn_finished_notify_skips_truncated_and_open_todos() {
+        assert!(should_emit_turn_finished(false, false));
+        assert!(
+            !should_emit_turn_finished(true, false),
+            "预算截断后续跑时不能报完成"
+        );
+        assert!(
+            !should_emit_turn_finished(false, true),
+            "清单还有未完成项时不能报完成"
+        );
+        assert!(!should_emit_turn_finished(true, true));
     }
 }

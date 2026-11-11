@@ -3987,20 +3987,26 @@ async fn run_one_turn(
         turn_result.as_ref().err().map(ToString::to_string),
     )
     .await;
-    // 统一通知：单轮回合完成 / 错误
+    // 统一通知：单轮回合完成 / 错误。截断（预算关闸）时不发「回合完成」——
+    // 与 TUI 同一套 `should_emit_turn_finished`；headless 无面板态，未完成
+    // todo 只靠 `turn_truncated` 覆盖「任务没完就报完成」的主路径。
     match &turn_result {
-        Ok(()) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnFinished {
-            duration_ms: started.elapsed().as_millis() as u64,
-            // token 走 `humanize::fmt_tokens`：与 TUI 状态栏同一套口径（上万压成
-            // `12.3k`），否则通知正文里的六位数会把摘要挤成噪音。
-            summary: format!(
-                "{} · {}↑ {}↓",
-                env.entry_label,
-                wyj_core::humanize::fmt_tokens(session.total_input_tokens as u64),
-                wyj_core::humanize::fmt_tokens(session.total_output_tokens as u64),
-            ),
-            session_id: Some(env.session_id.clone()),
-        }),
+        Ok(()) => {
+            if wyj_core::notify::should_emit_turn_finished(session.turn_truncated, false) {
+                wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnFinished {
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    // token 走 `humanize::fmt_tokens`：与 TUI 状态栏同一套口径（上万压成
+                    // `12.3k`），否则通知正文里的六位数会把摘要挤成噪音。
+                    summary: format!(
+                        "{} · {}↑ {}↓",
+                        env.entry_label,
+                        wyj_core::humanize::fmt_tokens(session.total_input_tokens as u64),
+                        wyj_core::humanize::fmt_tokens(session.total_output_tokens as u64),
+                    ),
+                    session_id: Some(env.session_id.clone()),
+                });
+            }
+        }
         Err(e) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnError {
             error: e.to_string(),
             session_id: Some(env.session_id.clone()),
@@ -4779,17 +4785,22 @@ async fn repl(
             run_result.as_ref().err().map(ToString::to_string),
         )
         .await;
-        // 统一通知：headless REPL 回合完成 / 错误
+        // 统一通知：headless REPL 回合完成 / 错误。截断时不发完成通知，
+        // 与 TUI / `-p` 共用 `should_emit_turn_finished`。
         match &run_result {
-            Ok(()) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnFinished {
-                duration_ms: started.elapsed().as_millis() as u64,
-                summary: format!(
-                    "repl (turn {turns}) · {}↑ {}↓",
-                    wyj_core::humanize::fmt_tokens(session.total_input_tokens as u64),
-                    wyj_core::humanize::fmt_tokens(session.total_output_tokens as u64),
-                ),
-                session_id: Some(session_id.clone()),
-            }),
+            Ok(()) => {
+                if wyj_core::notify::should_emit_turn_finished(session.turn_truncated, false) {
+                    wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnFinished {
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        summary: format!(
+                            "repl (turn {turns}) · {}↑ {}↓",
+                            wyj_core::humanize::fmt_tokens(session.total_input_tokens as u64),
+                            wyj_core::humanize::fmt_tokens(session.total_output_tokens as u64),
+                        ),
+                        session_id: Some(session_id.clone()),
+                    });
+                }
+            }
             Err(e) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnError {
                 error: e.to_string(),
                 session_id: Some(session_id.clone()),

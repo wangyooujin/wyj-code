@@ -242,19 +242,25 @@ impl AppState {
                     self.last_turn_input_tokens = d_in;
                     self.last_turn_output_tokens = d_out;
                     self.push_tracked_message(ChatMessage::turn_summary(elapsed, d_in, d_out));
-                    // 统一通知：主回合正常完成。token 走 `fmt_tokens`（与状态栏
-                    // 同一套口径）：上万后压成 `12.3k`，避免长会话把通知正文顶爆。
-                    let summary = format!("{}↑ {}↓", fmt_tokens(d_in), fmt_tokens(d_out));
-                    let summary = truncate_notify_body(&summary);
-                    notify_emit(NotificationEvent::TurnFinished {
-                        duration_ms: (elapsed * 1000.0) as u64,
-                        summary,
-                        session_id: if self.current_session_id.is_empty() {
-                            None
-                        } else {
-                            Some(self.current_session_id.clone())
-                        },
-                    });
+                    // 「回合完成」≠「任务完成」：截断后续跑、或清单仍有 pending
+                    // 时发桌面完成通知会让用户以为活干完了。判据见
+                    // `notify::should_emit_turn_finished`。
+                    let has_unfinished = !self.unfinished_todos().is_empty();
+                    if wyj_core::notify::should_emit_turn_finished(truncated, has_unfinished) {
+                        // token 走 `fmt_tokens`（与状态栏同一套口径）：上万后压成
+                        // `12.3k`，避免长会话把通知正文顶爆。
+                        let summary = format!("{}↑ {}↓", fmt_tokens(d_in), fmt_tokens(d_out));
+                        let summary = truncate_notify_body(&summary);
+                        notify_emit(NotificationEvent::TurnFinished {
+                            duration_ms: (elapsed * 1000.0) as u64,
+                            summary,
+                            session_id: if self.current_session_id.is_empty() {
+                                None
+                            } else {
+                                Some(self.current_session_id.clone())
+                            },
+                        });
+                    }
                 }
             }
 

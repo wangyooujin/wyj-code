@@ -33,6 +33,13 @@ const OSC8_OPEN: &str = "\x1b]8;;";
 const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
 const OSC_TERMINATOR: &str = "\x1b\\";
 
+/// 聊天区正文相对 `area.width` 右侧留白列数。
+///
+/// 必须与 [`crate::render::chat_content_width`] 的扣减一致：markdown 按
+/// `width - CHAT_CONTENT_GUTTER` 预折行，视觉行永远到不了 `area.right()`。
+/// soft-join 若仍按右边界判定，跨行 URL/路径会被 `\n` 拆碎。
+pub(crate) const CHAT_CONTENT_GUTTER: u16 = 2;
+
 /// 屏幕坐标到安全 URI 的当前帧映射。Backend 与事件循环共享同一份快照：
 /// 终端支持 OSC 8 时由终端原生处理 Command/Ctrl+点击；终端把修饰键点击继续上报
 /// 给应用时，事件循环也可以用同一目标兜底打开。
@@ -213,8 +220,11 @@ struct DetectedLink {
 }
 
 /// 扫描最终聊天区 Buffer，给 URL 和已存在的本地文件/目录建立可点击坐标。
-/// 连续两行中，前一行占满区域宽度时视为 Paragraph 自动换行，不插入逻辑换行，
-/// 因而超长 URL / 路径跨视觉行后仍共享完整目标。
+///
+/// 连续两行中，前一行占满**内容宽度**（`area.width - CHAT_CONTENT_GUTTER`）时
+/// 视为预折行续行，不插入逻辑换行，并剥掉续行的悬挂缩进，因而超长 URL / 路径
+/// 跨视觉行后仍共享完整目标。不能用 `area.right()`：markdown 按内容宽度折行，
+/// 行末永远够不到区域右边界。
 pub(crate) fn linkify_buffer(
     buffer: &mut Buffer,
     area: Rect,
@@ -227,7 +237,7 @@ pub(crate) fn linkify_buffer(
         return;
     }
 
-    let (text, visible_cells) = visible_text(buffer, area);
+    let (text, visible_cells) = visible_text(buffer, area, CHAT_CONTENT_GUTTER);
     let links = detect_links(&text, cwd);
     let mut targets = HashMap::new();
     let link_style = Theme::hint().add_modifier(Modifier::UNDERLINED);
@@ -257,16 +267,19 @@ pub(crate) fn linkify_buffer(
     registry.replace(targets);
 }
 
-fn visible_text(buffer: &Buffer, area: Rect) -> (String, Vec<VisibleCell>) {
+fn visible_text(buffer: &Buffer, area: Rect, content_gutter: u16) -> (String, Vec<VisibleCell>) {
     let mut text = String::new();
     let mut visible_cells = Vec::new();
+    let content_right = area.right().saturating_sub(content_gutter);
+    // 上一行占满内容宽度 → 本行是预折续行，拼接前剥悬挂缩进，且不插入 `\n`。
+    let mut soft_join = false;
 
     for y in area.top()..area.bottom() {
         let mut row = String::new();
         let mut row_cells = Vec::new();
         let mut x = area.left();
         let mut last_non_blank = 0usize;
-        let mut reaches_right = false;
+        let mut reaches_content_right = false;
 
         while x < area.right() {
             let symbol = buffer[(x, y)].symbol();
@@ -277,7 +290,8 @@ fn visible_text(buffer: &Buffer, area: Rect) -> (String, Vec<VisibleCell>) {
             row_cells.push((x, start..end));
             if !symbol.chars().all(char::is_whitespace) {
                 last_non_blank = row_cells.len();
-                reaches_right = x.saturating_add(width) >= area.right();
+                // 内容宽度右界，不是 area.right()——见 CHAT_CONTENT_GUTTER。
+                reaches_content_right = x.saturating_add(width) >= content_right;
             }
             x = x.saturating_add(width.max(1));
         }
@@ -285,6 +299,18 @@ fn visible_text(buffer: &Buffer, area: Rect) -> (String, Vec<VisibleCell>) {
         row_cells.truncate(last_non_blank);
         let keep_bytes = row_cells.last().map(|(_, bytes)| bytes.end).unwrap_or(0);
         row.truncate(keep_bytes);
+
+        if soft_join {
+            let strip = leading_hanging_indent_bytes(&row);
+            if strip > 0 {
+                row = row[strip..].to_string();
+                row_cells.retain(|(_, bytes)| bytes.start >= strip);
+                for (_, bytes) in &mut row_cells {
+                    *bytes = (bytes.start - strip)..(bytes.end - strip);
+                }
+            }
+        }
+
         let row_offset = text.len();
         text.push_str(&row);
         visible_cells.extend(row_cells.into_iter().map(|(x, bytes)| VisibleCell {
@@ -293,12 +319,29 @@ fn visible_text(buffer: &Buffer, area: Rect) -> (String, Vec<VisibleCell>) {
             bytes: (bytes.start + row_offset)..(bytes.end + row_offset),
         }));
 
-        if !reaches_right {
+        soft_join = reaches_content_right;
+        if !soft_join {
             text.push('\n');
         }
     }
 
     (text, visible_cells)
+}
+
+/// 预折续行前缀：markdown `block_prefix` 的 cont（引用竖线 + 等宽空白）。
+/// soft-join 时必须剥掉，否则空格/`│ ` 会嵌进 URL/路径中间。
+fn leading_hanging_indent_bytes(row: &str) -> usize {
+    let mut i = 0usize;
+    while row[i..].starts_with('│') {
+        let after = i + '│'.len_utf8();
+        if row[after..].starts_with(' ') {
+            i = after + 1;
+        } else {
+            break;
+        }
+    }
+    let spaces = row[i..].chars().take_while(|ch| *ch == ' ').count();
+    i + spaces
 }
 
 fn detect_links(text: &str, cwd: &Path) -> Vec<DetectedLink> {
@@ -854,6 +897,7 @@ mod tests {
 
     #[test]
     fn wrapped_web_link_keeps_one_complete_target() {
+        // 旧形态：次行无悬挂缩进、首行刚好铺满 area（gutter=0 等价）。
         let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 2));
         buffer.set_string(0, 0, "  https://ex", Style::default());
         buffer.set_string(0, 1, "ample.com", Style::default());
@@ -874,6 +918,63 @@ mod tests {
             registry.target_at(0, 1).as_deref(),
             Some("https://example.com")
         );
+    }
+
+    /// 生产形态：正文按 `width - CHAT_CONTENT_GUTTER` 预折，续行带 2 空格悬挂缩进。
+    /// soft-join 必须按内容右界判定并剥缩进，否则 URL 被拆成两截、目标截断。
+    #[test]
+    fn production_wrapped_url_with_hanging_indent_stays_one_target() {
+        // area=14 → content_right=12。首行 12 列非空白占满内容宽；右侧留 2 列 gutter。
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 2));
+        buffer.set_string(0, 0, "  https://exa", Style::default()); // 12 cols
+        buffer.set_string(0, 1, "  mple.com/x", Style::default()); // hanging indent + rest
+        let registry = HyperlinkRegistry::default();
+
+        linkify_buffer(
+            &mut buffer,
+            Rect::new(0, 0, 14, 2),
+            Path::new("/tmp"),
+            &registry,
+        );
+
+        assert_eq!(
+            registry.target_at(2, 0).as_deref(),
+            Some("https://example.com/x"),
+            "首行片段应挂完整 URL"
+        );
+        assert_eq!(
+            registry.target_at(2, 1).as_deref(),
+            Some("https://example.com/x"),
+            "续行剥缩进后应挂同一完整 URL"
+        );
+    }
+
+    /// 同上形态下的本地路径：拆碎后 exists 失败会整条消失，这是「路径点不了」的主因。
+    #[test]
+    fn production_wrapped_path_with_hanging_indent_stays_clickable() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("crates").join("tui").join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("hyperlink.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        // `crates/tui/src/hyperlink.rs` 拆到两行，续行带悬挂缩进。
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 22, 2));
+        // content_right = 20。铺满 20 列：
+        buffer.set_string(0, 0, "  crates/tui/src/hype", Style::default()); // 20
+        buffer.set_string(0, 1, "  rlink.rs", Style::default());
+        let registry = HyperlinkRegistry::default();
+
+        linkify_buffer(&mut buffer, Rect::new(0, 0, 22, 2), dir.path(), &registry);
+
+        let target = registry
+            .target_at(2, 0)
+            .expect("跨行路径必须可点，不能因 soft-join 失败而消失");
+        assert!(
+            target.ends_with("/crates/tui/src/hyperlink.rs"),
+            "got {target}"
+        );
+        assert_eq!(registry.target_at(2, 1).as_deref(), Some(target.as_str()));
     }
 
     #[test]

@@ -3072,7 +3072,8 @@ fn push_render_gap(lines: &mut Vec<Line<'static>>) {
 /// `/cost` 这类按宽度排版的命令会算得比实际可渲染的宽，表格就被换行拆散。
 /// 抽成函数就是为了让这种漂移变成编译期可见（`draw_chat` 也走这里）。
 pub fn chat_content_width(frame_width: u16) -> usize {
-    frame_width.saturating_sub(2) as usize
+    // 与 hyperlink soft-join 共用同一 gutter，避免预折宽与「占满内容宽」判定漂移。
+    frame_width.saturating_sub(crate::hyperlink::CHAT_CONTENT_GUTTER) as usize
 }
 
 /// 一条逻辑行在 `width` 列下占几行物理行。
