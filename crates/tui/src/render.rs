@@ -3169,9 +3169,13 @@ fn draw_scrollbar(
         width: 1,
         height: area.height,
     };
-    let mut state = ScrollbarState::new(max_scroll + viewport)
-        .position(position.min(max_scroll))
-        .viewport_content_length(viewport.max(1));
+    // `content_length` 必须是**最大滚动偏移**（ratatui 示例同款），不是
+    // `max_scroll + viewport`。后者会让贴底时滑块停在轨道中部偏下，和输入框
+    // 之间空出一截 track——用户看到的就是「滚不到底」。
+    // `viewport_content_length` 保持默认 0：内部改用轨道高度当视口，贴底时
+    // thumb 才能贴齐轨道下沿。
+    let mut state =
+        ScrollbarState::new(max_scroll).position(position.min(max_scroll));
     f.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .thumb_symbol("┃")
@@ -3183,14 +3187,20 @@ fn draw_scrollbar(
         track,
         &mut state,
     );
-    // 滑块几何与 ratatui 内部的 `part_lengths` 同源：轨道长 `h`、视口 `v`、
-    // 内容长 `max_scroll + v`，滑块起点 = pos * h / (max_scroll + v)。
-    let content = max_scroll + viewport.max(1);
-    let thumb_top =
-        (position.min(max_scroll) * track.height as usize + content / 2) / content.max(1);
-    let thumb_top = thumb_top.min(track.height.saturating_sub(1) as usize);
-    let thumb_len =
-        ((viewport.max(1) * track.height as usize + content / 2) / content.max(1)).max(1);
+    // 拖动换算用的几何：滑块长度按「视口 / 总内容」比例；行程 `h - thumb_len`
+    // 线性映射到 `0..=max_scroll`，保证 position==max_scroll 时滑块贴底。
+    let track_h = track.height as usize;
+    let total = max_scroll + viewport.max(1);
+    let thumb_len = ((viewport.max(1) * track_h + total / 2) / total.max(1))
+        .max(1)
+        .min(track_h);
+    let travel = track_h.saturating_sub(thumb_len);
+    let pos = position.min(max_scroll);
+    let thumb_top = if max_scroll == 0 || travel == 0 {
+        0
+    } else {
+        (pos * travel + max_scroll / 2) / max_scroll
+    };
     Some(crate::app::ScrollbarMetrics {
         area: track,
         thumb_top,
@@ -3215,8 +3225,8 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
         .collect();
     let total_height: usize = heights.iter().map(|h| *h as usize).sum();
 
-    let content_height = total_height.min(area.height as usize).max(1);
-    let max_scroll = total_height.saturating_sub(content_height);
+    let mut content_height = total_height.min(area.height as usize).max(1);
+    let mut max_scroll = total_height.saturating_sub(content_height);
     state.chat_view_height = content_height;
     state.chat_max_scroll = max_scroll;
     if state.chat_follow_tail {
@@ -3225,43 +3235,62 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
         state.chat_scroll = state.chat_scroll.min(max_scroll);
     }
 
+    // 逻辑高度认为「装得下」时，用与绘制相同的 `Paragraph`+`WordWrapper` 核实。
+    // `logical_line_height` 的 `Line::width` 快路径一旦低估，会出现 max_scroll=0、
+    // 尾部被裁、滚轮也无法下滚——最大化窗口最容易中招。此时内容短，全量
+    // `line_count` 可接受；长历史本来就不会进这条（max_scroll > 0）。
+    // 欢迎页例外：自带 `TOP_BLANK_LINES`，再贴底会把整页压到窗口下半部。
+    if max_scroll == 0 && !should_show_welcome(state) && area.height > 0 && !lines.is_empty() {
+        let measured = Paragraph::new(Text::from(lines.clone()))
+            .wrap(Wrap { trim: false })
+            .line_count(area.width.max(1))
+            .max(1);
+        if measured > area.height as usize {
+            // false-fit：抬高滚动上限，整段交给 Paragraph::scroll（内容短，安全）。
+            content_height = area.height as usize;
+            max_scroll = measured - content_height;
+            state.chat_view_height = content_height;
+            state.chat_max_scroll = max_scroll;
+            if state.chat_follow_tail {
+                state.chat_scroll = max_scroll;
+            } else {
+                state.chat_scroll = state.chat_scroll.min(max_scroll);
+            }
+            let para = Paragraph::new(Text::from(lines))
+                .wrap(Wrap { trim: false })
+                .scroll((state.chat_scroll.min(u16::MAX as usize) as u16, 0));
+            f.render_widget(para, area);
+            state.content_scrollbar = if state.show_scrollbar {
+                draw_scrollbar(f, area, state.chat_scroll, max_scroll, content_height)
+            } else {
+                None
+            };
+            draw_unseen_messages_hint(f, state, area);
+            return;
+        }
+        // 真的装得下：顶部垫空行贴底。用未 cap 的 measured，避免把溢出糊成 pad=0。
+        let pad = area.height.saturating_sub(measured as u16);
+        let mut display = lines;
+        if pad > 0 {
+            let mut padded = Vec::with_capacity(pad as usize + display.len());
+            padded.extend((0..pad).map(|_| Line::from("")));
+            padded.append(&mut display);
+            display = padded;
+        }
+        let para = Paragraph::new(Text::from(display)).wrap(Wrap { trim: false });
+        f.render_widget(para, area);
+        state.content_scrollbar = None;
+        draw_unseen_messages_hint(f, state, area);
+        return;
+    }
+
     // 只把覆盖视口的那几条逻辑行交给 `Paragraph`：预折行已经把每行的高度算好，
     // 这里按累积高度定位首行，再把 `scroll` 换算成行内偏移。渲染成本从
     // O(全部历史) 降到 O(视口行数)，且 `scroll` 始终小于一屏，不会再在大历史
-    // 里撞上 `u16` 上限。
+    // 里撞上 `u16` 上限。欢迎页 / 空内容的 max_scroll==0 也走这里（不贴底）。
     let (first, intra) = locate_scroll_start(&heights, state.chat_scroll);
     let visible = visible_chat_lines(lines, &heights, first, intra + area.height as usize);
-    // 内容不足一屏时**贴底**绘制。聊天区矩形被 `Constraint::Min(3)` 撑到输入框
-    // 上方，若一律从第 0 行画起，剩余高度就整块堆在内容之下；而 Todo 面板是挂在
-    // **聊天流尾部**的（`push_inline_todo_lines`），贴底后聊天流紧贴输入框。
-    //
-    // 实现要点（相对旧的「收缩 content_area.height」）：
-    // 1. 用与绘制相同的 `Paragraph`+`WordWrapper` 量一遍可见块真实高度，避免
-    //    `logical_line_height` 快路径一旦低估就把尾部任务裁掉——最大化（高视口、
-    //    内容「装得下」走贴底）时最容易中招，缩小窗口后改走滚动反而全看见。
-    // 2. 在**完整** `area` 顶部垫空行，而不是把 widget 高度收成测量值：即便测量
-    //    仍有 1 行误差，多出来的折行也先吃顶部垫片，不裁内容尾部。
-    //
-    // 欢迎页例外：它自带 `TOP_BLANK_LINES`，再贴底会把整页压到窗口下半部。
-    let mut display = visible;
-    let pad = if should_show_welcome(state) || max_scroll > 0 || area.height == 0 {
-        0
-    } else {
-        let actual = Paragraph::new(Text::from(display.clone()))
-            .wrap(Wrap { trim: false })
-            .scroll((intra.min(u16::MAX as usize) as u16, 0))
-            .line_count(area.width.max(1))
-            .max(1)
-            .min(area.height as usize) as u16;
-        area.height.saturating_sub(actual)
-    };
-    if pad > 0 {
-        let mut padded = Vec::with_capacity(pad as usize + display.len());
-        padded.extend((0..pad).map(|_| Line::from("")));
-        padded.append(&mut display);
-        display = padded;
-    }
-    let para = Paragraph::new(Text::from(display))
+    let para = Paragraph::new(Text::from(visible))
         .wrap(Wrap { trim: false })
         .scroll((intra.min(u16::MAX as usize) as u16, 0));
     f.render_widget(para, area);
@@ -3270,23 +3299,27 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     } else {
         None
     };
+    draw_unseen_messages_hint(f, state, area);
+}
 
-    if state.unseen_messages {
-        let hint = Paragraph::new(Line::from(Span::styled(
-            " new messages below · cmd+down ",
-            Style::default()
-                .fg(Theme::info_color())
-                .add_modifier(Modifier::BOLD),
-        )));
-        let w = 30.min(area.width);
-        let hint_area = Rect {
-            x: area.x + area.width.saturating_sub(w),
-            y: area.y + area.height.saturating_sub(1),
-            width: w,
-            height: 1,
-        };
-        f.render_widget(hint, hint_area);
+fn draw_unseen_messages_hint(f: &mut Frame, state: &AppState, area: Rect) {
+    if !state.unseen_messages {
+        return;
     }
+    let hint = Paragraph::new(Line::from(Span::styled(
+        " new messages below · cmd+down ",
+        Style::default()
+            .fg(Theme::info_color())
+            .add_modifier(Modifier::BOLD),
+    )));
+    let w = 30.min(area.width);
+    let hint_area = Rect {
+        x: area.x + area.width.saturating_sub(w),
+        y: area.y + area.height.saturating_sub(1),
+        width: w,
+        height: 1,
+    };
+    f.render_widget(hint, hint_area);
 }
 
 /// 详情面板滚动偏移的收敛，返回真正喂给 `Paragraph::scroll` 的行偏移。
@@ -8880,7 +8913,7 @@ mod chat_viewport_tests {
         );
     }
 
-    /// 右侧滚动条：内容装不下时出现，随滚动位置移动。
+    /// 右侧滚动条：内容装不下时出现，随滚动位置移动；贴底时滑块贴齐轨道下沿。
     #[test]
     fn scrollbar_appears_only_when_content_overflows_and_tracks_scroll() {
         let mut state = history_state(200);
@@ -8905,6 +8938,22 @@ mod chat_viewport_tests {
             top_first.ends_with('┃'),
             bottom_first.ends_with('┃'),
             "滚动位置变化时滑块位置必须跟随:\n top={top_first:?}\nbottom={bottom_first:?}"
+        );
+        // 贴底时滑块必须贴齐轨道最后一行——旧实现把 content_length 设成
+        // max_scroll+viewport，滑块停在轨道中下部，和输入框之间空出一截 │。
+        let bottom_last = bottom.lines().last().unwrap_or_default();
+        assert!(
+            bottom_last.ends_with('┃'),
+            "滚到底后滑块应贴齐轨道下沿，不能留一截 track:\n last={bottom_last:?}\n{bottom}"
+        );
+        let metrics = state.content_scrollbar.expect("溢出时应有滚动条几何");
+        assert_eq!(
+            metrics.thumb_top + metrics.thumb_len,
+            metrics.area.height as usize,
+            "拖动几何也必须贴底: thumb_top={} thumb_len={} track={}",
+            metrics.thumb_top,
+            metrics.thumb_len,
+            metrics.area.height
         );
     }
 
@@ -8966,6 +9015,50 @@ mod chat_viewport_tests {
                 "矮视口应看到任务 {i}，实际:\n{short}"
             );
         }
+    }
+
+    /// 任务列表超出视口时：看不见的条目只能来自顶部（follow_tail），且
+    /// `chat_max_scroll` 必须 > 0——否则就是 false-fit 裁切后滚不动。
+    #[test]
+    fn overflowing_todo_list_keeps_max_scroll_positive() {
+        let mut state = make_state();
+        state.welcome_frozen = true;
+        state.todo_panel_expanded = true;
+        state.chat_follow_tail = true;
+        state.messages.push(message(MessageRole::User, "do many things"));
+        const N: usize = 50;
+        state.current_todos = Some(
+            (1..=N)
+                .map(|i| wyj_tools::todo::TodoItem {
+                    id: format!("t{i}"),
+                    content: format!("UNIQUE_TASK_{i}_MARKER"),
+                    status: wyj_tools::todo::TodoStatus::Pending,
+                    active_form: None,
+                })
+                .collect(),
+        );
+        let text = render_to_text(|f| draw(f, &mut state, &InputBox::new()), 100, 40);
+        let missing: Vec<usize> = (1..=N)
+            .filter(|i| !text.contains(&format!("UNIQUE_TASK_{i}_MARKER")))
+            .collect();
+        assert!(
+            !missing.is_empty(),
+            "50 条任务在中等视口下应有部分滚出视野，否则测不到溢出路径:\n{text}"
+        );
+        assert!(
+            state.chat_max_scroll > 0,
+            "有任务看不见时必须能滚，否则是 false-fit 裁切: missing={missing:?}"
+        );
+        // follow_tail：缺失必须是从 1 起的连续前缀，尾部任务仍可见。
+        let first_visible = (1..=N).find(|i| !missing.contains(i)).expect("至少一条可见");
+        assert!(
+            missing.iter().all(|&i| i < first_visible),
+            "follow_tail 时缺失应来自列表顶部，missing={missing:?} first_visible={first_visible}"
+        );
+        assert!(
+            text.contains(&format!("UNIQUE_TASK_{N}_MARKER")),
+            "贴底时应看到最后一条任务:\n{text}"
+        );
     }
 
     /// 内容不足一屏时聊天流必须**贴底**，不能从视口顶部开始排。
