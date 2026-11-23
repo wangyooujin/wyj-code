@@ -3022,6 +3022,9 @@ impl AppState {
         }
         self.reconcile_sub_agent_selection();
         self.stream_rate.reset();
+        // 回合已停，进行中任务的秒表必须定格。否则 UI 已是「已中断」，
+        // tasklist 上的 ⏱ 却还在涨——滚轮误触 Esc/Ctrl+C 时尤其扎眼。
+        self.freeze_todo_runtime_clocks();
         if self.is_thinking {
             if self.streaming_buf.is_empty() {
                 self.streaming_buf = "[已中断]".to_string();
@@ -3054,6 +3057,18 @@ impl AppState {
         }
     }
 
+    /// 把所有仍在走字的 todo 秒表定格（`started_at → elapsed_secs`）。
+    ///
+    /// 不改 `TodoItem.status`：中断/异常收尾后清单仍是 in_progress，方便续跑；
+    /// 只是时间不能再涨。与 `TodoUpdate` / `TurnDone` 收口同一套累加。
+    fn freeze_todo_runtime_clocks(&mut self) {
+        for s in self.todo_stats.values_mut() {
+            if let Some(start) = s.started_at.take() {
+                s.elapsed_secs += start.elapsed().as_secs_f64();
+            }
+        }
+    }
+
     /// 回合 task 看门狗：task 已经死了、UI 却还以为它在思考时，补一个终止事件
     /// 把状态收回来。返回 true 表示本帧做了兜底。
     ///
@@ -3079,6 +3094,7 @@ impl AppState {
         self.current_op = None;
         self.current_tool_name = None;
         self.current_op_started = None;
+        self.freeze_todo_runtime_clocks();
         let message = wyj_i18n::tr("agent.turn_task_lost");
         self.push_tracked_message(ChatMessage::assistant_err(message.clone()));
         notify_emit(NotificationEvent::TurnError {
@@ -5455,6 +5471,11 @@ async fn tui_main(
     let mut last_spinner_advance = Instant::now();
     let mut ghostty_arrow_router = GhosttyArrowRouter::default();
     let mut classified_arrow_keys = VecDeque::<KeyEvent>::new();
+    // Ghostty 在增强键盘 + 鼠标报告并存时，偶发把 SGR 滚轮序列的 ESC 前缀
+    // 拆成一次裸 `KeyCode::Esc`（紧挨着 Scroll 事件）。那次 Esc 会走中断路径，
+    // 表现为「滚一下内容，回合就被中断，tasklist 秒表却还在走」。
+    // 滚轮后短暂吞掉无修饰 Esc，真实按 Esc 中断只需等这一窗（远短于按键）。
+    let mut ignore_bare_esc_until: Option<Instant> = None;
     // 外部资源（agent 定义 / MCP server）的 reconcile 指纹，初值 `None`
     // 表示「还没算过」——必须让第一帧真的跑一次，否则启动时已连接的 MCP 工具
     // 永远进不了 Agent。
@@ -5910,6 +5931,8 @@ async fn tui_main(
                     let routed = ghostty_arrow_router.route(*key);
                     if routed.scroll_lines != 0 {
                         state.scroll_focus_lines(routed.scroll_lines);
+                        ignore_bare_esc_until =
+                            Some(Instant::now() + Duration::from_millis(150));
                     }
                     match routed.action {
                         ArrowRoutingAction::Pass => {}
@@ -6020,6 +6043,8 @@ async fn tui_main(
                     // 指针落在输入框上时滚输入框自己的视口（内容装得下才回落到
                     // 聊天区），否则滚当前焦点区。
                     MouseEventKind::ScrollUp => {
+                        ignore_bare_esc_until =
+                            Some(Instant::now() + Duration::from_millis(150));
                         let on_composer = state
                             .composer_area
                             .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
@@ -6028,6 +6053,8 @@ async fn tui_main(
                         }
                     }
                     MouseEventKind::ScrollDown => {
+                        ignore_bare_esc_until =
+                            Some(Instant::now() + Duration::from_millis(150));
                         let on_composer = state
                             .composer_area
                             .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
@@ -9310,6 +9337,13 @@ async fn tui_main(
 
                     // ESC → 中断 Agent / 空闲时一次清空当前输入草稿（文字 + 附件）
                     if key.code == KeyCode::Esc {
+                        if ignore_bare_esc_until.is_some_and(|until| Instant::now() < until)
+                            && key.modifiers.is_empty()
+                        {
+                            // 见主循环里 `ignore_bare_esc_until` 的注释：滚轮
+                            // 序列拆出的伪 Esc，不能当成用户中断。
+                            continue;
+                        }
                         if state.close_panel_focus() {
                             continue;
                         }
@@ -12313,6 +12347,40 @@ mod todo_stats_tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         let still = state.todo_stats.get("a").unwrap().elapsed_secs();
         assert_eq!(frozen, still);
+    }
+
+    #[test]
+    fn interrupt_freezes_in_progress_todo_clocks() {
+        let mut state = make_state();
+        state.is_thinking = true;
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![todo(
+            "a",
+            TodoStatus::InProgress,
+        )]));
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        state.interrupt();
+        let frozen = state.todo_stats.get("a").unwrap().elapsed_secs();
+        assert!(frozen > 0.0, "中断前应已累加耗时");
+        assert!(
+            state
+                .todo_stats
+                .get("a")
+                .unwrap()
+                .started_at
+                .is_none(),
+            "中断必须清掉 started_at，否则秒表继续走"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        assert_eq!(
+            frozen,
+            state.todo_stats.get("a").unwrap().elapsed_secs(),
+            "中断后耗时必须定格"
+        );
+        // 状态仍是 in_progress，方便后续续跑；只是钟停了。
+        assert_eq!(
+            state.current_todos.as_ref().unwrap()[0].status,
+            TodoStatus::InProgress
+        );
     }
 
     #[test]

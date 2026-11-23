@@ -3231,30 +3231,40 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     // 里撞上 `u16` 上限。
     let (first, intra) = locate_scroll_start(&heights, state.chat_scroll);
     let visible = visible_chat_lines(lines, &heights, first, intra + area.height as usize);
-    let para = Paragraph::new(Text::from(visible))
-        .wrap(Wrap { trim: false })
-        .scroll((intra.min(u16::MAX as usize) as u16, 0));
     // 内容不足一屏时**贴底**绘制。聊天区矩形被 `Constraint::Min(3)` 撑到输入框
     // 上方，若一律从第 0 行画起，剩余高度就整块堆在内容之下；而 Todo 面板是挂在
-    // **聊天流尾部**的（`push_inline_todo_lines`），agents 面板又是贴在底部的固定
-    // 面板（`BottomPanel::SubAgents`），用户看到的就是「tasklist 与 agents 之间
-    // 空出一大段」——空白不属于任何一方，却是两者夹出来的。贴底后聊天流紧贴输入
-    // 框，与 Claude Code 的观感一致；内容超过一屏时 `pad` 恒为 0，滚动语义不变。
+    // **聊天流尾部**的（`push_inline_todo_lines`），贴底后聊天流紧贴输入框。
     //
-    // 欢迎页例外：它是空会话的落地画面，`render_welcome` 自己排了
-    // `TOP_BLANK_LINES` 让 logo 落在上 1/3，再贴底会把整页压到窗口下半部。
-    let pad = if should_show_welcome(state) {
+    // 实现要点（相对旧的「收缩 content_area.height」）：
+    // 1. 用与绘制相同的 `Paragraph`+`WordWrapper` 量一遍可见块真实高度，避免
+    //    `logical_line_height` 快路径一旦低估就把尾部任务裁掉——最大化（高视口、
+    //    内容「装得下」走贴底）时最容易中招，缩小窗口后改走滚动反而全看见。
+    // 2. 在**完整** `area` 顶部垫空行，而不是把 widget 高度收成测量值：即便测量
+    //    仍有 1 行误差，多出来的折行也先吃顶部垫片，不裁内容尾部。
+    //
+    // 欢迎页例外：它自带 `TOP_BLANK_LINES`，再贴底会把整页压到窗口下半部。
+    let mut display = visible;
+    let pad = if should_show_welcome(state) || max_scroll > 0 || area.height == 0 {
         0
     } else {
-        area.height
-            .saturating_sub(total_height.min(u16::MAX as usize) as u16)
+        let actual = Paragraph::new(Text::from(display.clone()))
+            .wrap(Wrap { trim: false })
+            .scroll((intra.min(u16::MAX as usize) as u16, 0))
+            .line_count(area.width.max(1))
+            .max(1)
+            .min(area.height as usize) as u16;
+        area.height.saturating_sub(actual)
     };
-    let content_area = Rect {
-        y: area.y + pad,
-        height: area.height - pad,
-        ..area
-    };
-    f.render_widget(para, content_area);
+    if pad > 0 {
+        let mut padded = Vec::with_capacity(pad as usize + display.len());
+        padded.extend((0..pad).map(|_| Line::from("")));
+        padded.append(&mut display);
+        display = padded;
+    }
+    let para = Paragraph::new(Text::from(display))
+        .wrap(Wrap { trim: false })
+        .scroll((intra.min(u16::MAX as usize) as u16, 0));
+    f.render_widget(para, area);
     state.content_scrollbar = if state.show_scrollbar {
         draw_scrollbar(f, area, state.chat_scroll, max_scroll, content_height)
     } else {
@@ -8765,8 +8775,8 @@ mod cost_panel_render_tests {
 #[cfg(test)]
 mod chat_viewport_tests {
     use super::*;
-    use crate::app::ChatMessage;
-    use crate::test_support::{make_state, render_to_text};
+    use crate::app::{ChatMessage, MessageRole};
+    use crate::test_support::{make_state, message, render_to_text};
 
     #[test]
     fn logical_line_height_counts_wrapped_physical_rows() {
@@ -8911,6 +8921,51 @@ mod chat_viewport_tests {
             !text.contains('┃') && !text.contains('│'),
             "短内容不应出现滚动条:\n{text}"
         );
+    }
+
+
+    #[test]
+    fn tall_viewport_shows_all_todo_items_when_content_fits() {
+        // 回归：最大化窗口（高视口）下任务列表被贴底裁切，只露出部分条目；
+        // 缩小窗口后因改走 follow_tail 反而能看到全部。根因是贴底时按测量高度
+        // 收缩 content_area，测量一旦低估就会裁掉尾部条目。
+        let mut state = make_state();
+        state.welcome_frozen = true;
+        state.todo_panel_expanded = true;
+        state.chat_follow_tail = true;
+        state.messages.push(message(MessageRole::User, "do five things"));
+        state.current_todos = Some(
+            (1..=5)
+                .map(|i| wyj_tools::todo::TodoItem {
+                    id: format!("t{i}"),
+                    content: format!("UNIQUE_TASK_{i}_MARKER"),
+                    status: if i == 3 {
+                        wyj_tools::todo::TodoStatus::InProgress
+                    } else if i < 3 {
+                        wyj_tools::todo::TodoStatus::Completed
+                    } else {
+                        wyj_tools::todo::TodoStatus::Pending
+                    },
+                    active_form: None,
+                })
+                .collect(),
+        );
+        // 高视口（模拟最大化）：内容应全部可见
+        let tall = render_to_text(|f| draw(f, &mut state, &InputBox::new()), 100, 60);
+        for i in 1..=5 {
+            assert!(
+                tall.contains(&format!("UNIQUE_TASK_{i}_MARKER")),
+                "高视口应看到任务 {i}，实际:\n{tall}"
+            );
+        }
+        // 矮视口对照：同样应能通过滚动/贴底看到任务（内容短时仍全可见）
+        let short = render_to_text(|f| draw(f, &mut state, &InputBox::new()), 100, 24);
+        for i in 1..=5 {
+            assert!(
+                short.contains(&format!("UNIQUE_TASK_{i}_MARKER")),
+                "矮视口应看到任务 {i}，实际:\n{short}"
+            );
+        }
     }
 
     /// 内容不足一屏时聊天流必须**贴底**，不能从视口顶部开始排。
